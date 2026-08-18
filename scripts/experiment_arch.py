@@ -22,28 +22,34 @@ from arch_ref import f32, llama_forward, qwen_forward
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.environ.get("P2W_BIN", ROOT)
-K = 4
+K = 16
 
 LLAMA = [
-    {"tag": "", "sid": 0, "d": 8, "nh": 2, "nkv": 1, "ff": 16, "vocab": 16, "nl": 1, "seq": 4},
-    {"tag": "", "sid": 0, "d": 8, "nh": 2, "nkv": 1, "ff": 16, "vocab": 16, "nl": 2, "seq": 4},
-    {"tag": "d16", "sid": 1, "d": 16, "nh": 4, "nkv": 2, "ff": 32, "vocab": 16, "nl": 1, "seq": 4},
-    {"tag": "t8", "sid": 2, "d": 8, "nh": 2, "nkv": 1, "ff": 16, "vocab": 16, "nl": 1, "seq": 8},
-    {"tag": "v32", "sid": 3, "d": 8, "nh": 2, "nkv": 1, "ff": 16, "vocab": 32, "nl": 1, "seq": 4},
+    {"tag": "", "sid": 0, "d": 8, "nh": 2, "nkv": 1, "ff": 32, "vocab": 16, "nl": 1, "seq": 8},
+    {"tag": "", "sid": 0, "d": 8, "nh": 2, "nkv": 1, "ff": 32, "vocab": 16, "nl": 2, "seq": 8},
+    {"tag": "", "sid": 0, "d": 8, "nh": 2, "nkv": 1, "ff": 32, "vocab": 16, "nl": 4, "seq": 8},
+    {"tag": "d16", "sid": 1, "d": 16, "nh": 4, "nkv": 2, "ff": 64, "vocab": 16, "nl": 2, "seq": 8},
+    {"tag": "d32", "sid": 2, "d": 32, "nh": 8, "nkv": 4, "ff": 128, "vocab": 16, "nl": 2, "seq": 8},
+    {"tag": "t16", "sid": 3, "d": 8, "nh": 2, "nkv": 1, "ff": 32, "vocab": 16, "nl": 2, "seq": 16},
+    {"tag": "v64", "sid": 4, "d": 8, "nh": 2, "nkv": 1, "ff": 32, "vocab": 64, "nl": 2, "seq": 8},
 ]
 
 QWEN = [
-    {"tag": "", "sid": 0, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 16,
-     "vocab": 16, "nl": 1, "lnh": 1, "lhd": 4, "ck": 2, "seq": 4, "kinds": ["delta"]},
-    {"tag": "attn", "sid": 1, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 16,
-     "vocab": 16, "nl": 1, "lnh": 1, "lhd": 4, "ck": 2, "seq": 4, "kinds": ["attn"]},
-    {"tag": "mixed", "sid": 2, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 16,
-     "vocab": 16, "nl": 2, "lnh": 1, "lhd": 4, "ck": 2, "seq": 4,
-     "kinds": ["delta", "attn"]},
-    {"tag": "t8", "sid": 3, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 16,
+    {"tag": "", "sid": 0, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 32,
      "vocab": 16, "nl": 1, "lnh": 1, "lhd": 4, "ck": 2, "seq": 8, "kinds": ["delta"]},
-    {"tag": "d16", "sid": 4, "d": 16, "nh": 2, "nkv": 1, "hd": 8, "rd": 4, "ff": 32,
-     "vocab": 16, "nl": 1, "lnh": 2, "lhd": 4, "ck": 3, "seq": 4, "kinds": ["delta"]},
+    {"tag": "attn", "sid": 1, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 32,
+     "vocab": 16, "nl": 1, "lnh": 1, "lhd": 4, "ck": 2, "seq": 8, "kinds": ["attn"]},
+    {"tag": "mixed", "sid": 2, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 32,
+     "vocab": 16, "nl": 4, "lnh": 1, "lhd": 4, "ck": 2, "seq": 8,
+     "kinds": ["delta", "delta", "delta", "attn"]},
+    {"tag": "t16", "sid": 3, "d": 8, "nh": 2, "nkv": 1, "hd": 4, "rd": 2, "ff": 32,
+     "vocab": 16, "nl": 1, "lnh": 1, "lhd": 4, "ck": 2, "seq": 16, "kinds": ["delta"]},
+    {"tag": "d16", "sid": 4, "d": 16, "nh": 2, "nkv": 1, "hd": 8, "rd": 4, "ff": 64,
+     "vocab": 16, "nl": 2, "lnh": 2, "lhd": 4, "ck": 3, "seq": 8,
+     "kinds": ["delta", "attn"]},
+    {"tag": "d32", "sid": 5, "d": 32, "nh": 4, "nkv": 2, "hd": 8, "rd": 4, "ff": 128,
+     "vocab": 16, "nl": 2, "lnh": 4, "lhd": 4, "ck": 3, "seq": 8,
+     "kinds": ["delta", "attn"]},
 ]
 
 
