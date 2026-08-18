@@ -254,55 +254,14 @@ Qed.
 Definition f32_delta_state0 (dk dv : nat) : list (list binary32) :=
   List.repeat (f32_zeros dv) dk.
 
-(** * Partial rotary embedding
-
-    Only the first [rd] entries of a head are rotated; the rest pass through.
-    [cos] and [sin] are supplied with [rd] entries, as the caller computes
-    them. *)
-
-Definition f32_partial_rope (rd : nat) (cosv sinv : list binary32)
-                            (x : list binary32) : list binary32 :=
-  let half := Nat.div rd 2 in
-  let rot := List.firstn rd x in
-  let pass := List.skipn rd x in
-  let lo := List.firstn half rot in
-  let hi := List.skipn half rot in
-  let rotated := List.map (fun z => f32_neg z) hi ++ lo in
-  let out := List.map (fun '(xi, (ri, (ci, si))) =>
-                 f32_plus (f32_mult xi ci) (f32_mult ri si))
-               (List.combine rot (List.combine rotated (List.combine cosv sinv))) in
-  out ++ pass.
-
-Lemma f32_partial_rope_length : forall rd cosv sinv x,
-  (rd <= List.length x)%nat ->
-  List.length cosv = rd -> List.length sinv = rd ->
-  List.length (f32_partial_rope rd cosv sinv x) = List.length x.
-Proof.
-  intros rd cosv sinv x Hrd Hc Hs. unfold f32_partial_rope.
-  rewrite List.length_app, List.length_map, List.length_skipn.
-  rewrite !List.length_combine, List.length_firstn.
-  rewrite List.length_app, List.length_map, !List.length_skipn,
-          !List.length_firstn, Hc, Hs.
-  lia.
-Qed.
+(** Partial rotary embedding, Euclidean slicing and SwiGLU are shared with the
+    Llama path and live in Llama.v; Qwen uses them with a rotary width shorter
+    than the head. *)
 
 (** * Layer pieces
 
     The runner drives the per-head and per-token loops, as it does for the
     Llama path; these are the pieces it composes. *)
-
-(** SwiGLU feed-forward: [down (silu (gate x) * up x)]. *)
-Definition f32_swiglu (wg wu wd : list (list binary32)) (x : list binary32)
-                      : list binary32 :=
-  let g := f32_silu_vec (f32_mat_vec_mul wg x) in
-  let u := f32_mat_vec_mul wu x in
-  f32_mat_vec_mul wd (f32_vec_mult g u).
-
-Lemma f32_swiglu_length : forall wg wu wd x,
-  List.length (f32_swiglu wg wu wd x) = List.length wd.
-Proof.
-  intros. unfold f32_swiglu, f32_mat_vec_mul. apply List.length_map.
-Qed.
 
 (** The output gate the full-attention layers apply: multiply elementwise by
     [sigmoid] of a gate vector. *)
@@ -345,16 +304,6 @@ Qed.
     attention layer normalises the per-head query and key, rotates a prefix of
     each, attends causally, gates the output and projects back. Both sit inside
     the same residual pair with a SwiGLU feed-forward. *)
-
-Definition f32_slice (off len : nat) (r : list binary32) : list binary32 :=
-  List.firstn len (List.skipn off r).
-
-Lemma f32_slice_length : forall off len r,
-  (off + len <= List.length r)%nat -> List.length (f32_slice off len r) = len.
-Proof.
-  intros off len r H. unfold f32_slice.
-  rewrite List.length_firstn, List.length_skipn. lia.
-Qed.
 
 Record qwen_delta_weights := mk_qwen_delta_weights {
   qd_in_qkv : list (list binary32);

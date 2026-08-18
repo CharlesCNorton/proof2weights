@@ -11,6 +11,7 @@
 
 From Stdlib Require Import ZArith.
 From Stdlib Require Import List.
+From Stdlib Require Import Lia.
 From Flocq Require Import IEEE754.BinarySingleNaN.
 Require Import Phases1_15_complete.
 
@@ -101,3 +102,149 @@ Definition f32_cos (x : binary32) : binary32 :=
         (f32_div r6 f32_fac6))
       (f32_div r8 f32_fac8))
     (f32_div r10 f32_fac10).
+
+(** * Shared layer primitives
+
+    Slicing a head out of a fused projection, rotary embedding over a prefix of
+    a head, and the SwiGLU feed-forward. Llama rotates the whole head, which is
+    the [rd = head_dim] case; Qwen3.5 rotates a quarter of it. *)
+
+Definition f32_slice (off len : nat) (r : list binary32) : list binary32 :=
+  List.firstn len (List.skipn off r).
+
+Lemma f32_slice_length : forall off len r,
+  (off + len <= List.length r)%nat -> List.length (f32_slice off len r) = len.
+Proof.
+  intros off len r H. unfold f32_slice.
+  rewrite List.length_firstn, List.length_skipn. lia.
+Qed.
+
+Definition f32_partial_rope (rd : nat) (cosv sinv : list binary32)
+                            (x : list binary32) : list binary32 :=
+  let half := Nat.div rd 2 in
+  let rot := List.firstn rd x in
+  let pass := List.skipn rd x in
+  let lo := List.firstn half rot in
+  let hi := List.skipn half rot in
+  let rotated := List.map (fun z => f32_neg z) hi ++ lo in
+  let out := List.map (fun '(xi, (ri, (ci, si))) =>
+                 f32_plus (f32_mult xi ci) (f32_mult ri si))
+               (List.combine rot (List.combine rotated (List.combine cosv sinv))) in
+  out ++ pass.
+
+Lemma f32_partial_rope_length : forall rd cosv sinv x,
+  (rd <= List.length x)%nat ->
+  List.length cosv = rd -> List.length sinv = rd ->
+  List.length (f32_partial_rope rd cosv sinv x) = List.length x.
+Proof.
+  intros rd cosv sinv x Hrd Hc Hs. unfold f32_partial_rope.
+  rewrite List.length_app, List.length_map, List.length_skipn.
+  rewrite !List.length_combine, List.length_firstn.
+  rewrite List.length_app, List.length_map, !List.length_skipn,
+          !List.length_firstn, Hc, Hs.
+  lia.
+Qed.
+
+(** SwiGLU feed-forward: [down (silu (gate x) * up x)]. *)
+Definition f32_swiglu (wg wu wd : list (list binary32)) (x : list binary32)
+                      : list binary32 :=
+  let g := f32_silu_vec (f32_mat_vec_mul wg x) in
+  let u := f32_mat_vec_mul wu x in
+  f32_mat_vec_mul wd (f32_vec_mult g u).
+
+Lemma f32_swiglu_length : forall wg wu wd x,
+  List.length (f32_swiglu wg wu wd x) = List.length wd.
+Proof.
+  intros. unfold f32_swiglu, f32_mat_vec_mul. apply List.length_map.
+Qed.
+
+(** * The Llama layer, assembled
+
+    RMSNorm, the query/key/value projections, rotary embedding on the per-head
+    query and key, grouped-query causal attention, the output projection, and
+    the SwiGLU block, each inside its residual. This is the composition the
+    runner performs; naming it in Rocq is what lets the forward be stated and
+    executed as one function. *)
+
+Record llama_attn_weights := mk_llama_attn_weights {
+  la_q : list (list binary32);
+  la_k : list (list binary32);
+  la_v : list (list binary32);
+  la_o : list (list binary32)
+}.
+
+Record llama_mlp_weights := mk_llama_mlp_weights {
+  lm_gate : list (list binary32);
+  lm_up : list (list binary32);
+  lm_down : list (list binary32)
+}.
+
+Definition f32_llama_attn (nh nkv hd : nat) (w : llama_attn_weights)
+    (cosv sinv : list (list binary32)) (hn : list (list binary32))
+    : list (list binary32) :=
+  let q := List.map (fun h => f32_mat_vec_mul (la_q w) h) hn in
+  let k := List.map (fun h => f32_mat_vec_mul (la_k w) h) hn in
+  let v := List.map (fun h => f32_mat_vec_mul (la_v w) h) hn in
+  let group := Nat.div nh nkv in
+  let rope_rows (m : list (list binary32)) (c : nat) :=
+    List.map (fun p => let '(pos, r) := p in
+                f32_partial_rope hd (List.nth pos cosv []) (List.nth pos sinv [])
+                  (f32_slice (c * hd) hd r))
+             (List.combine (List.seq 0 (List.length m)) m) in
+  let qs := List.map (fun hh => rope_rows q hh) (List.seq 0 nh) in
+  let ks := List.map (fun c => rope_rows k c) (List.seq 0 nkv) in
+  let vs := List.map (fun c => List.map (fun r => f32_slice (c * hd) hd r) v)
+                     (List.seq 0 nkv) in
+  let heads := List.map (fun hh =>
+      f32_causal_attention (List.nth hh qs [])
+        (List.nth (Nat.div hh group) ks []) (List.nth (Nat.div hh group) vs []) hd)
+      (List.seq 0 nh) in
+  List.map (fun r => f32_mat_vec_mul (la_o w) r) (f32_concat_heads heads).
+
+Definition f32_llama_layer (nh nkv hd : nat) (eps : binary32)
+    (ln1 ln2 : list binary32) (aw : llama_attn_weights) (mw : llama_mlp_weights)
+    (cosv sinv : list (list binary32)) (h : list (list binary32))
+    : list (list binary32) :=
+  let hn := List.map (fun row => f32_rmsnorm ln1 eps row) h in
+  let attn := f32_llama_attn nh nkv hd aw cosv sinv hn in
+  let hidden2 := List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+                          (List.combine h attn) in
+  let h2 := List.map (fun row => f32_rmsnorm ln2 eps row) hidden2 in
+  List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+    (List.combine hidden2
+       (List.map (fun row => f32_swiglu (lm_gate mw) (lm_up mw) (lm_down mw) row)
+                 h2)).
+
+Fixpoint f32_llama_stack (fs : list (list (list binary32) -> list (list binary32)))
+                         (h : list (list binary32)) : list (list binary32) :=
+  match fs with
+  | [] => h
+  | f :: rest => f32_llama_stack rest (f h)
+  end.
+
+Definition f32_llama_forward (eps : binary32) (normw : list binary32)
+    (fs : list (list (list binary32) -> list (list binary32)))
+    (emb : list (list binary32)) (ids : list nat) : list (list binary32) :=
+  List.map (fun row => f32_rmsnorm normw eps row)
+           (f32_llama_stack fs (f32_embed_tokens emb ids)).
+
+Definition f32_llama_logits (emb : list (list binary32))
+    (h : list (list binary32)) : list (list binary32) :=
+  List.map (fun hrow => List.map (fun wrow => f32_dot hrow wrow) emb) h.
+
+Lemma f32_llama_logits_rows : forall emb h,
+  List.length (f32_llama_logits emb h) = List.length h.
+Proof. intros. unfold f32_llama_logits. apply List.length_map. Qed.
+
+Lemma f32_llama_logits_row_width : forall emb h row,
+  In row (f32_llama_logits emb h) -> List.length row = List.length emb.
+Proof.
+  intros emb h row Hin. unfold f32_llama_logits in Hin.
+  apply List.in_map_iff in Hin. destruct Hin as [hr [Heq _]]. subst row.
+  apply List.length_map.
+Qed.
+
+Lemma f32_llama_forward_rows : forall eps normw fs emb ids,
+  List.length (f32_llama_forward eps normw fs emb ids)
+  = List.length (f32_llama_stack fs (f32_embed_tokens emb ids)).
+Proof. intros. unfold f32_llama_forward. apply List.length_map. Qed.

@@ -5531,3 +5531,597 @@ Proof.
   - eapply okm_weaken; [exact Hwo | apply errN_mono; auto; lia].
   - unfold Rgate_sigmoid. eapply ok_gate_sigmoid with (m := m); eassumption.
 Qed.
+
+(** * The Llama primitives
+
+    [f32_rmsnorm] is the gated variant's normalisation without the gate, so it
+    shares the scale factor and [rmsg_entry]. *)
+
+Definition Rrmsnorm (rw : list R) (reps : R) (n : nat) (rx : list R) : list R :=
+  List.map (fun '(wi, xi) => wi * (xi * Rrms_scale reps n rx)) (List.combine rw rx).
+
+Lemma f32_rmsnorm_stages : forall w epsv x,
+  f32_rmsnorm w epsv x
+  = List.map (fun '(wi, xi) => f32_mult wi (f32_mult xi (f32_rms_scale epsv x)))
+             (List.combine w x).
+Proof.
+  intros w epsv x. unfold f32_rmsnorm. cbv zeta. unfold f32_rms_scale. reflexivity.
+Qed.
+
+Lemma ok_rmsnorm : forall M m L k w rw epsv reps x rx,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  okv (errN M L k) w rw -> okv (errN M L k) x rx -> ok (errN M L k) epsv reps ->
+  rms_reg M m epsv x rx ->
+  Rabs (Rsq_sum rx) <= M ->
+  m <= Rsq_sum rx / B2R (f32_of_Z (Z.of_nat (List.length x))) + reps ->
+  m <= Rabs (sqrt (Rsq_sum rx / B2R (f32_of_Z (Z.of_nat (List.length x))) + reps)) ->
+  Forall2 (fun p q => rmsg_entry M (f32_rms_scale epsv x)
+                        (Rrms_scale reps (List.length x) rx)
+                        (fst p) (snd p) (fst q) (snd q))
+          (List.combine w x) (List.combine rw rx) ->
+  okv (errN M L (k + List.length x + 7)) (f32_rmsnorm w epsv x)
+      (Rrmsnorm rw reps (List.length x) rx).
+Proof.
+  intros M m L k w rw epsv reps x rx HM Hamp Hw Hx Heps Hreg Hbss Hlo Hlor Hent.
+  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
+  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  assert (HRS : ok (errN M L (k + List.length x + 5)) (f32_rms_scale epsv x)
+                   (Rrms_scale reps (List.length x) rx))
+    by (eapply ok_rms_scale_c; eassumption).
+  rewrite f32_rmsnorm_stages. unfold Rrmsnorm, okv.
+  pose proof (Forall2_combine _ _ _ _ _ _ _ _ _ _ Hw Hx) as Hpairs.
+  pose proof (Forall2_conj _ _ _ _ _ _ Hpairs Hent) as Hall.
+  eapply Forall2_map2; [exact Hall|].
+  intros p q [[Hwi Hxi] He].
+  destruct p as [wi xi]. destruct q as [rwi rxi].
+  cbn [fst snd] in Hwi, Hxi, He.
+  unfold rmsg_entry in He.
+  destruct He as (Hbx & Hbrs & Hz2 & Hbw & Hbprod & Hz3).
+  replace (k + List.length x + 7)%nat
+    with (S (S (k + List.length x + 5)))%nat by lia.
+  eapply ok_mult_S with (m := m); try eassumption.
+  - eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hwi].
+  - eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hxi].
+Qed.
+
+(** * Sine and cosine
+
+    The argument reduction rounds by adding and subtracting a magic constant.
+    In exact real arithmetic that pair of operations is the identity, while in
+    binary32 it is what selects the nearest multiple of two pi, so the reduction
+    is not something the propagation relation can carry across: the two
+    evaluations deliberately disagree. The bounds below are therefore stated on
+    the reduced argument, with whatever real value the reduction settled on
+    supplied by the caller, and they carry the Taylor polynomial from there.
+    This is the same treatment the exponential's saturation gets, where the
+    premise is that the float and the real evaluation follow one path. *)
+
+Definition s_r2  (r : binary32) : binary32 := f32_mult r r.
+Definition s_r3  (r : binary32) : binary32 := f32_mult (s_r2 r) r.
+Definition s_r5  (r : binary32) : binary32 := f32_mult (s_r3 r) (s_r2 r).
+Definition s_r7  (r : binary32) : binary32 := f32_mult (s_r5 r) (s_r2 r).
+Definition s_r9  (r : binary32) : binary32 := f32_mult (s_r7 r) (s_r2 r).
+Definition s_r11 (r : binary32) : binary32 := f32_mult (s_r9 r) (s_r2 r).
+
+Definition s_d3  (r : binary32) : binary32 := f32_div (s_r3 r) f32_fac3.
+Definition s_d5  (r : binary32) : binary32 := f32_div (s_r5 r) f32_fac5.
+Definition s_d7  (r : binary32) : binary32 := f32_div (s_r7 r) f32_fac7.
+Definition s_d9  (r : binary32) : binary32 := f32_div (s_r9 r) f32_fac9.
+Definition s_d11 (r : binary32) : binary32 := f32_div (s_r11 r) f32_fac11.
+
+Definition s_t1 (r : binary32) : binary32 := f32_minus r (s_d3 r).
+Definition s_t2 (r : binary32) : binary32 := f32_plus (s_t1 r) (s_d5 r).
+Definition s_t3 (r : binary32) : binary32 := f32_minus (s_t2 r) (s_d7 r).
+Definition s_t4 (r : binary32) : binary32 := f32_plus (s_t3 r) (s_d9 r).
+Definition s_poly (r : binary32) : binary32 := f32_minus (s_t4 r) (s_d11 r).
+
+Lemma f32_sin_stages : forall x, f32_sin x = s_poly (f32_reduce_2pi x).
+Proof.
+  intros x. unfold f32_sin. cbv zeta.
+  unfold s_poly, s_t4, s_t3, s_t2, s_t1,
+         s_d11, s_d9, s_d7, s_d5, s_d3,
+         s_r11, s_r9, s_r7, s_r5, s_r3, s_r2.
+  reflexivity.
+Qed.
+
+Definition Rs_r2  (rr : R) : R := rr * rr.
+Definition Rs_r3  (rr : R) : R := Rs_r2 rr * rr.
+Definition Rs_r5  (rr : R) : R := Rs_r3 rr * Rs_r2 rr.
+Definition Rs_r7  (rr : R) : R := Rs_r5 rr * Rs_r2 rr.
+Definition Rs_r9  (rr : R) : R := Rs_r7 rr * Rs_r2 rr.
+Definition Rs_r11 (rr : R) : R := Rs_r9 rr * Rs_r2 rr.
+
+Definition Rs_d3  (rr : R) : R := Rs_r3 rr / B2R f32_fac3.
+Definition Rs_d5  (rr : R) : R := Rs_r5 rr / B2R f32_fac5.
+Definition Rs_d7  (rr : R) : R := Rs_r7 rr / B2R f32_fac7.
+Definition Rs_d9  (rr : R) : R := Rs_r9 rr / B2R f32_fac9.
+Definition Rs_d11 (rr : R) : R := Rs_r11 rr / B2R f32_fac11.
+
+Definition Rs_t1 (rr : R) : R := rr - Rs_d3 rr.
+Definition Rs_t2 (rr : R) : R := Rs_t1 rr + Rs_d5 rr.
+Definition Rs_t3 (rr : R) : R := Rs_t2 rr - Rs_d7 rr.
+Definition Rs_t4 (rr : R) : R := Rs_t3 rr + Rs_d9 rr.
+Definition Rs_poly (rr : R) : R := Rs_t4 rr - Rs_d11 rr.
+
+Record sin_reg (M m : R) (r : binary32) (rr : R) : Prop := {
+  snr_fin3 : is_finite f32_fac3 = true;
+  snr_fin5 : is_finite f32_fac5 = true;
+  snr_fin7 : is_finite f32_fac7 = true;
+  snr_fin9 : is_finite f32_fac9 = true;
+  snr_fin11 : is_finite f32_fac11 = true;
+  snr_m3 : m <= Rabs (B2R f32_fac3);
+  snr_m5 : m <= Rabs (B2R f32_fac5);
+  snr_m7 : m <= Rabs (B2R f32_fac7);
+  snr_m9 : m <= Rabs (B2R f32_fac9);
+  snr_m11 : m <= Rabs (B2R f32_fac11);
+  snr_br : Rabs (B2R r) <= M;
+  snr_brr : Rabs rr <= M;
+  snr_z2 : regz M (B2R r * B2R r);
+  snr_b2 : Rabs (B2R (s_r2 r)) <= M;
+  snr_b2r : Rabs (Rs_r2 rr) <= M;
+  snr_z3 : regz M (B2R (s_r2 r) * B2R r);
+  snr_b3 : Rabs (B2R (s_r3 r)) <= M;
+  snr_b3r : Rabs (Rs_r3 rr) <= M;
+  snr_z5 : regz M (B2R (s_r3 r) * B2R (s_r2 r));
+  snr_b5 : Rabs (B2R (s_r5 r)) <= M;
+  snr_b5r : Rabs (Rs_r5 rr) <= M;
+  snr_z7 : regz M (B2R (s_r5 r) * B2R (s_r2 r));
+  snr_b7 : Rabs (B2R (s_r7 r)) <= M;
+  snr_b7r : Rabs (Rs_r7 rr) <= M;
+  snr_z9 : regz M (B2R (s_r7 r) * B2R (s_r2 r));
+  snr_b9 : Rabs (B2R (s_r9 r)) <= M;
+  snr_b9r : Rabs (Rs_r9 rr) <= M;
+  snr_z11 : regz M (B2R (s_r9 r) * B2R (s_r2 r));
+  snr_b11r : Rabs (Rs_r11 rr) <= M;
+  snr_zd3 : regz M (B2R (s_r3 r) / B2R f32_fac3);
+  snr_zd5 : regz M (B2R (s_r5 r) / B2R f32_fac5);
+  snr_zd7 : regz M (B2R (s_r7 r) / B2R f32_fac7);
+  snr_zd9 : regz M (B2R (s_r9 r) / B2R f32_fac9);
+  snr_zd11 : regz M (B2R (s_r11 r) / B2R f32_fac11);
+  snr_zt1 : regz M (B2R r + B2R (f32_neg (s_d3 r)));
+  snr_zt2 : regz M (B2R (s_t1 r) + B2R (s_d5 r));
+  snr_zt3 : regz M (B2R (s_t2 r) + B2R (f32_neg (s_d7 r)));
+  snr_zt4 : regz M (B2R (s_t3 r) + B2R (s_d9 r));
+  snr_zt5 : regz M (B2R (s_t4 r) + B2R (f32_neg (s_d11 r)))
+}.
+
+Lemma ok_sin_poly : forall M m L k r rr,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  ok (errN M L k) r rr ->
+  sin_reg M m r rr ->
+  ok (errN M L (k + 12)) (s_poly r) (Rs_poly rr).
+Proof.
+  intros M m L k r rr HM Hamp Hr Hreg.
+  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
+  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  destruct Hreg as [Ef3 Ef5 Ef7 Ef9 Ef11 Em3 Em5 Em7 Em9 Em11
+                    Ebr Ebrr Ez2 Eb2 Eb2r Ez3 Eb3 Eb3r Ez5 Eb5 Eb5r
+                    Ez7 Eb7 Eb7r Ez9 Eb9 Eb9r Ez11 Eb11r
+                    Ezd3 Ezd5 Ezd7 Ezd9 Ezd11 Ezt1 Ezt2 Ezt3 Ezt4 Ezt5].
+  assert (H2 : ok (errN M L (k + 1)) (s_r2 r) (Rs_r2 rr)).
+  { unfold s_r2, Rs_r2. replace (k + 1)%nat with (S k)%nat by lia.
+    eapply ok_mult_S with (m := m); eassumption. }
+  assert (H3 : ok (errN M L (k + 2)) (s_r3 r) (Rs_r3 rr)).
+  { unfold s_r3, Rs_r3. replace (k + 2)%nat with (S (k + 1))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hr]. }
+  assert (H5 : ok (errN M L (k + 3)) (s_r5 r) (Rs_r5 rr)).
+  { unfold s_r5, Rs_r5. replace (k + 3)%nat with (S (k + 2))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 1)%nat);
+      [exact HM0 | exact HL1 | lia | exact H2]. }
+  assert (H7 : ok (errN M L (k + 4)) (s_r7 r) (Rs_r7 rr)).
+  { unfold s_r7, Rs_r7. replace (k + 4)%nat with (S (k + 3))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 1)%nat);
+      [exact HM0 | exact HL1 | lia | exact H2]. }
+  assert (H9 : ok (errN M L (k + 5)) (s_r9 r) (Rs_r9 rr)).
+  { unfold s_r9, Rs_r9. replace (k + 5)%nat with (S (k + 4))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 1)%nat);
+      [exact HM0 | exact HL1 | lia | exact H2]. }
+  assert (H11 : ok (errN M L (k + 6)) (s_r11 r) (Rs_r11 rr)).
+  { unfold s_r11, Rs_r11. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 1)%nat);
+      [exact HM0 | exact HL1 | lia | exact H2]. }
+  assert (D3 : ok (errN M L (k + 7)) (s_d3 r) (Rs_d3 rr)).
+  { unfold s_d3, Rs_d3. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 2)%nat);
+        [exact HM0 | exact HL1 | lia | exact H3].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef3]. }
+  assert (D5 : ok (errN M L (k + 7)) (s_d5 r) (Rs_d5 rr)).
+  { unfold s_d5, Rs_d5. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 3)%nat);
+        [exact HM0 | exact HL1 | lia | exact H5].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef5]. }
+  assert (D7 : ok (errN M L (k + 7)) (s_d7 r) (Rs_d7 rr)).
+  { unfold s_d7, Rs_d7. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 4)%nat);
+        [exact HM0 | exact HL1 | lia | exact H7].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef7]. }
+  assert (D9 : ok (errN M L (k + 7)) (s_d9 r) (Rs_d9 rr)).
+  { unfold s_d9, Rs_d9. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 5)%nat);
+        [exact HM0 | exact HL1 | lia | exact H9].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef9]. }
+  assert (D11 : ok (errN M L (k + 7)) (s_d11 r) (Rs_d11 rr)).
+  { unfold s_d11, Rs_d11. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    apply ok_const; [exact HM0 | exact HL1 | exact Ef11]. }
+  assert (T1 : ok (errN M L (k + 8)) (s_t1 r) (Rs_t1 rr)).
+  { unfold s_t1, Rs_t1. replace (k + 8)%nat with (S (k + 7))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hr]. }
+  assert (T2 : ok (errN M L (k + 9)) (s_t2 r) (Rs_t2 rr)).
+  { unfold s_t2, Rs_t2. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 7)%nat);
+      [exact HM0 | exact HL1 | lia | exact D5]. }
+  assert (T3 : ok (errN M L (k + 10)) (s_t3 r) (Rs_t3 rr)).
+  { unfold s_t3, Rs_t3. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 7)%nat);
+      [exact HM0 | exact HL1 | lia | exact D7]. }
+  assert (T4 : ok (errN M L (k + 11)) (s_t4 r) (Rs_t4 rr)).
+  { unfold s_t4, Rs_t4. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 7)%nat);
+      [exact HM0 | exact HL1 | lia | exact D9]. }
+  unfold s_poly, Rs_poly. replace (k + 12)%nat with (S (k + 11))%nat by lia.
+  eapply ok_minus_S with (m := m); try eassumption.
+  eapply ok_errN_mono with (n := (k + 7)%nat);
+    [exact HM0 | exact HL1 | lia | exact D11].
+Qed.
+
+(** The bound on [f32_sin] itself, at whatever real value the reduction chose. *)
+Corollary ok_sin : forall M m L k x rr,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  ok (errN M L k) (f32_reduce_2pi x) rr ->
+  sin_reg M m (f32_reduce_2pi x) rr ->
+  ok (errN M L (k + 12)) (f32_sin x) (Rs_poly rr).
+Proof.
+  intros M m L k x rr HM Hamp Hr Hreg.
+  rewrite f32_sin_stages. eapply ok_sin_poly with (m := m); eassumption.
+Qed.
+
+(** The cosine, on the same footing. *)
+
+Definition c_r2  (r : binary32) : binary32 := f32_mult r r.
+Definition c_r4  (r : binary32) : binary32 := f32_mult (c_r2 r) (c_r2 r).
+Definition c_r6  (r : binary32) : binary32 := f32_mult (c_r4 r) (c_r2 r).
+Definition c_r8  (r : binary32) : binary32 := f32_mult (c_r6 r) (c_r2 r).
+Definition c_r10 (r : binary32) : binary32 := f32_mult (c_r8 r) (c_r2 r).
+
+Definition c_d2  (r : binary32) : binary32 := f32_div (c_r2 r) f32_fac2.
+Definition c_d4  (r : binary32) : binary32 := f32_div (c_r4 r) f32_fac4.
+Definition c_d6  (r : binary32) : binary32 := f32_div (c_r6 r) f32_fac6.
+Definition c_d8  (r : binary32) : binary32 := f32_div (c_r8 r) f32_fac8.
+Definition c_d10 (r : binary32) : binary32 := f32_div (c_r10 r) f32_fac10.
+
+Definition c_t1 (r : binary32) : binary32 := f32_minus f32_one (c_d2 r).
+Definition c_t2 (r : binary32) : binary32 := f32_plus (c_t1 r) (c_d4 r).
+Definition c_t3 (r : binary32) : binary32 := f32_minus (c_t2 r) (c_d6 r).
+Definition c_t4 (r : binary32) : binary32 := f32_plus (c_t3 r) (c_d8 r).
+Definition c_poly (r : binary32) : binary32 := f32_minus (c_t4 r) (c_d10 r).
+
+Lemma f32_cos_stages : forall x, f32_cos x = c_poly (f32_reduce_2pi x).
+Proof.
+  intros x. unfold f32_cos. cbv zeta.
+  unfold c_poly, c_t4, c_t3, c_t2, c_t1,
+         c_d10, c_d8, c_d6, c_d4, c_d2,
+         c_r10, c_r8, c_r6, c_r4, c_r2.
+  reflexivity.
+Qed.
+
+Definition Rc_r2  (rr : R) : R := rr * rr.
+Definition Rc_r4  (rr : R) : R := Rc_r2 rr * Rc_r2 rr.
+Definition Rc_r6  (rr : R) : R := Rc_r4 rr * Rc_r2 rr.
+Definition Rc_r8  (rr : R) : R := Rc_r6 rr * Rc_r2 rr.
+Definition Rc_r10 (rr : R) : R := Rc_r8 rr * Rc_r2 rr.
+
+Definition Rc_d2  (rr : R) : R := Rc_r2 rr / B2R f32_fac2.
+Definition Rc_d4  (rr : R) : R := Rc_r4 rr / B2R f32_fac4.
+Definition Rc_d6  (rr : R) : R := Rc_r6 rr / B2R f32_fac6.
+Definition Rc_d8  (rr : R) : R := Rc_r8 rr / B2R f32_fac8.
+Definition Rc_d10 (rr : R) : R := Rc_r10 rr / B2R f32_fac10.
+
+Definition Rc_t1 (rr : R) : R := 1 - Rc_d2 rr.
+Definition Rc_t2 (rr : R) : R := Rc_t1 rr + Rc_d4 rr.
+Definition Rc_t3 (rr : R) : R := Rc_t2 rr - Rc_d6 rr.
+Definition Rc_t4 (rr : R) : R := Rc_t3 rr + Rc_d8 rr.
+Definition Rc_poly (rr : R) : R := Rc_t4 rr - Rc_d10 rr.
+
+Record cos_reg (M m : R) (r : binary32) (rr : R) : Prop := {
+  csr_fin2 : is_finite f32_fac2 = true;
+  csr_fin4 : is_finite f32_fac4 = true;
+  csr_fin6 : is_finite f32_fac6 = true;
+  csr_fin8 : is_finite f32_fac8 = true;
+  csr_fin10 : is_finite f32_fac10 = true;
+  csr_m2 : m <= Rabs (B2R f32_fac2);
+  csr_m4 : m <= Rabs (B2R f32_fac4);
+  csr_m6 : m <= Rabs (B2R f32_fac6);
+  csr_m8 : m <= Rabs (B2R f32_fac8);
+  csr_m10 : m <= Rabs (B2R f32_fac10);
+  csr_br : Rabs (B2R r) <= M;
+  csr_brr : Rabs rr <= M;
+  csr_z2 : regz M (B2R r * B2R r);
+  csr_b2 : Rabs (B2R (c_r2 r)) <= M;
+  csr_b2r : Rabs (Rc_r2 rr) <= M;
+  csr_z4 : regz M (B2R (c_r2 r) * B2R (c_r2 r));
+  csr_b4 : Rabs (B2R (c_r4 r)) <= M;
+  csr_b4r : Rabs (Rc_r4 rr) <= M;
+  csr_z6 : regz M (B2R (c_r4 r) * B2R (c_r2 r));
+  csr_b6 : Rabs (B2R (c_r6 r)) <= M;
+  csr_b6r : Rabs (Rc_r6 rr) <= M;
+  csr_z8 : regz M (B2R (c_r6 r) * B2R (c_r2 r));
+  csr_b8 : Rabs (B2R (c_r8 r)) <= M;
+  csr_b8r : Rabs (Rc_r8 rr) <= M;
+  csr_z10 : regz M (B2R (c_r8 r) * B2R (c_r2 r));
+  csr_b10r : Rabs (Rc_r10 rr) <= M;
+  csr_zd2 : regz M (B2R (c_r2 r) / B2R f32_fac2);
+  csr_zd4 : regz M (B2R (c_r4 r) / B2R f32_fac4);
+  csr_zd6 : regz M (B2R (c_r6 r) / B2R f32_fac6);
+  csr_zd8 : regz M (B2R (c_r8 r) / B2R f32_fac8);
+  csr_zd10 : regz M (B2R (c_r10 r) / B2R f32_fac10);
+  csr_zt1 : regz M (B2R f32_one + B2R (f32_neg (c_d2 r)));
+  csr_zt2 : regz M (B2R (c_t1 r) + B2R (c_d4 r));
+  csr_zt3 : regz M (B2R (c_t2 r) + B2R (f32_neg (c_d6 r)));
+  csr_zt4 : regz M (B2R (c_t3 r) + B2R (c_d8 r));
+  csr_zt5 : regz M (B2R (c_t4 r) + B2R (f32_neg (c_d10 r)))
+}.
+
+Lemma ok_cos_poly : forall M m L k r rr,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  ok (errN M L k) r rr ->
+  cos_reg M m r rr ->
+  ok (errN M L (k + 11)) (c_poly r) (Rc_poly rr).
+Proof.
+  intros M m L k r rr HM Hamp Hr Hreg.
+  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
+  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  assert (Hone : forall j, ok (errN M L j) f32_one 1).
+  { intros j. replace 1 with (B2R f32_one) by apply f32_one_correct.
+    apply ok_const; [exact HM0 | exact HL1 | exact f32_one_finite]. }
+  destruct Hreg as [Ef2 Ef4 Ef6 Ef8 Ef10 Em2 Em4 Em6 Em8 Em10
+                    Ebr Ebrr Ez2 Eb2 Eb2r Ez4 Eb4 Eb4r Ez6 Eb6 Eb6r
+                    Ez8 Eb8 Eb8r Ez10 Eb10r
+                    Ezd2 Ezd4 Ezd6 Ezd8 Ezd10 Ezt1 Ezt2 Ezt3 Ezt4 Ezt5].
+  assert (H2 : ok (errN M L (k + 1)) (c_r2 r) (Rc_r2 rr)).
+  { unfold c_r2, Rc_r2. replace (k + 1)%nat with (S k)%nat by lia.
+    eapply ok_mult_S with (m := m); eassumption. }
+  assert (H4 : ok (errN M L (k + 2)) (c_r4 r) (Rc_r4 rr)).
+  { unfold c_r4, Rc_r4. replace (k + 2)%nat with (S (k + 1))%nat by lia.
+    eapply ok_mult_S with (m := m); eassumption. }
+  assert (H6 : ok (errN M L (k + 3)) (c_r6 r) (Rc_r6 rr)).
+  { unfold c_r6, Rc_r6. replace (k + 3)%nat with (S (k + 2))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 1)%nat);
+      [exact HM0 | exact HL1 | lia | exact H2]. }
+  assert (H8 : ok (errN M L (k + 4)) (c_r8 r) (Rc_r8 rr)).
+  { unfold c_r8, Rc_r8. replace (k + 4)%nat with (S (k + 3))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 1)%nat);
+      [exact HM0 | exact HL1 | lia | exact H2]. }
+  assert (H10 : ok (errN M L (k + 5)) (c_r10 r) (Rc_r10 rr)).
+  { unfold c_r10, Rc_r10. replace (k + 5)%nat with (S (k + 4))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 1)%nat);
+      [exact HM0 | exact HL1 | lia | exact H2]. }
+  assert (D2 : ok (errN M L (k + 6)) (c_d2 r) (Rc_d2 rr)).
+  { unfold c_d2, Rc_d2. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef2]. }
+  assert (D4 : ok (errN M L (k + 6)) (c_d4 r) (Rc_d4 rr)).
+  { unfold c_d4, Rc_d4. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 2)%nat);
+        [exact HM0 | exact HL1 | lia | exact H4].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef4]. }
+  assert (D6 : ok (errN M L (k + 6)) (c_d6 r) (Rc_d6 rr)).
+  { unfold c_d6, Rc_d6. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 3)%nat);
+        [exact HM0 | exact HL1 | lia | exact H6].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef6]. }
+  assert (D8 : ok (errN M L (k + 6)) (c_d8 r) (Rc_d8 rr)).
+  { unfold c_d8, Rc_d8. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 4)%nat);
+        [exact HM0 | exact HL1 | lia | exact H8].
+    - apply ok_const; [exact HM0 | exact HL1 | exact Ef8]. }
+  assert (D10 : ok (errN M L (k + 6)) (c_d10 r) (Rc_d10 rr)).
+  { unfold c_d10, Rc_d10. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    apply ok_const; [exact HM0 | exact HL1 | exact Ef10]. }
+  assert (T1 : ok (errN M L (k + 7)) (c_t1 r) (Rc_t1 rr)).
+  { unfold c_t1, Rc_t1. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption. apply Hone. }
+  assert (T2 : ok (errN M L (k + 8)) (c_t2 r) (Rc_t2 rr)).
+  { unfold c_t2, Rc_t2. replace (k + 8)%nat with (S (k + 7))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 6)%nat);
+      [exact HM0 | exact HL1 | lia | exact D4]. }
+  assert (T3 : ok (errN M L (k + 9)) (c_t3 r) (Rc_t3 rr)).
+  { unfold c_t3, Rc_t3. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 6)%nat);
+      [exact HM0 | exact HL1 | lia | exact D6]. }
+  assert (T4 : ok (errN M L (k + 10)) (c_t4 r) (Rc_t4 rr)).
+  { unfold c_t4, Rc_t4. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 6)%nat);
+      [exact HM0 | exact HL1 | lia | exact D8]. }
+  unfold c_poly, Rc_poly. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+  eapply ok_minus_S with (m := m); try eassumption.
+  eapply ok_errN_mono with (n := (k + 6)%nat);
+    [exact HM0 | exact HL1 | lia | exact D10].
+Qed.
+
+Corollary ok_cos : forall M m L k x rr,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  ok (errN M L k) (f32_reduce_2pi x) rr ->
+  cos_reg M m (f32_reduce_2pi x) rr ->
+  ok (errN M L (k + 11)) (f32_cos x) (Rc_poly rr).
+Proof.
+  intros M m L k x rr HM Hamp Hr Hreg.
+  rewrite f32_cos_stages. eapply ok_cos_poly with (m := m); eassumption.
+Qed.
+
+(** * Backward error for the dot product
+
+    The forward bounds above are absolute and compound with depth. The
+    classical alternative is backward: exhibit the computed result as the exact
+    evaluation of a perturbed expression. For the dot product that reads as
+    follows. The computed value is exactly the real inner product of the same
+    operands with each product scaled by a factor built from the roundoffs the
+    computation actually performed, and every one of those factors is within
+    [(1 + u)^(n+1) - 1] of one, which is about [(n+1) * u]. Nothing here is
+    worst-case in the depth of the surrounding network: the perturbation is
+    relative and its size is set by the length of this one dot product. *)
+
+(** A product of factors, each within [u] of one, stays within
+    [(1 + u)^k - 1] of one. *)
+Lemma pow1u_ge_1 : forall k, 1 <= (1 + f32_u) ^ k.
+Proof.
+  intros k. apply pow_R1_Rle. pose proof f32_u_pos. lra.
+Qed.
+
+Lemma pert_abs : forall alpha k,
+  Rabs (alpha - 1) <= (1 + f32_u) ^ k - 1 -> Rabs alpha <= (1 + f32_u) ^ k.
+Proof.
+  intros alpha k H.
+  replace alpha with ((alpha - 1) + 1) by ring.
+  eapply Rle_trans; [apply Rabs_triang|]. rewrite Rabs_R1. lra.
+Qed.
+
+Lemma pert_step : forall alpha e k,
+  Rabs (alpha - 1) <= (1 + f32_u) ^ k - 1 -> Rabs e <= f32_u ->
+  Rabs ((1 + e) * alpha - 1) <= (1 + f32_u) ^ (S k) - 1.
+Proof.
+  intros alpha e k Ha He.
+  pose proof f32_u_pos as Hu.
+  pose proof (pert_abs alpha k Ha) as Hab.
+  pose proof (pow1u_ge_1 k) as Hpk.
+  replace ((1 + e) * alpha - 1) with (e * alpha + (alpha - 1)) by ring.
+  eapply Rle_trans; [apply Rabs_triang|].
+  assert (Habs : Rabs (e * alpha) <= f32_u * (1 + f32_u) ^ k).
+  { rewrite Rabs_mult. apply Rmult_le_compat; try apply Rabs_pos; assumption. }
+  simpl. nra.
+Qed.
+
+Lemma Forall_pert_weaken : forall ts k k',
+  (k <= k')%nat ->
+  Forall (fun t => Rabs (t - 1) <= (1 + f32_u) ^ k - 1) ts ->
+  Forall (fun t => Rabs (t - 1) <= (1 + f32_u) ^ k' - 1) ts.
+Proof.
+  intros ts k k' Hle H.
+  assert (Hp : (1 + f32_u) ^ k <= (1 + f32_u) ^ k').
+  { apply Rle_pow; [pose proof f32_u_pos; lra | exact Hle]. }
+  induction H as [|t ts' Ht H IH]; constructor; [lra | exact IH].
+Qed.
+
+(** The perturbed inner product: term [i] carries its own factor. *)
+Fixpoint Rdot_terms (xs ys : list binary32) (ts : list R) : R :=
+  match xs, ys, ts with
+  | x :: xs', y :: ys', t :: ts' =>
+      B2R x * B2R y * t + Rdot_terms xs' ys' ts'
+  | _, _, _ => 0
+  end.
+
+Lemma Rdot_terms_ones : forall xs ts,
+  Rdot_terms xs nil ts = 0.
+Proof. intros xs ts. destruct xs; destruct ts; reflexivity. Qed.
+
+Lemma f32_dot_aux_backward : forall xs ys a,
+  f32_dot_regular xs ys a ->
+  exists alpha ts,
+    Rabs (alpha - 1) <= (1 + f32_u) ^ (List.length xs) - 1
+    /\ List.length ts = List.length xs
+    /\ Forall (fun t => Rabs (t - 1)
+                        <= (1 + f32_u) ^ (S (List.length xs)) - 1) ts
+    /\ B2R (f32_dot_aux xs ys a) = B2R a * alpha + Rdot_terms xs ys ts.
+Proof.
+  intros xs ys a Hreg.
+  induction Hreg as [ys a | xs a | x xs y ys a Hfa Hfm Hb1 Hb2 Hu1 Hu2 Hreg IH].
+  - exists 1, nil. cbn [f32_dot_aux List.length Rdot_terms].
+    repeat apply conj.
+    + rewrite Rminus_diag_eq by reflexivity. rewrite Rabs_R0. simpl. lra.
+    + reflexivity.
+    + constructor.
+    + ring.
+  - exists 1, (List.repeat 1 (List.length xs)).
+    destruct xs as [|x xs]; cbn [f32_dot_aux].
+    + repeat apply conj.
+      * rewrite Rminus_diag_eq by reflexivity. rewrite Rabs_R0.
+        cbn [List.length]. simpl. lra.
+      * cbn [List.repeat List.length]. reflexivity.
+      * constructor.
+      * cbn [Rdot_terms]. ring.
+    + repeat apply conj.
+      * rewrite Rminus_diag_eq by reflexivity. rewrite Rabs_R0.
+        pose proof (pow1u_ge_1 (List.length (x :: xs))). lra.
+      * apply List.repeat_length.
+      * apply Forall_forall. intros t Ht.
+        apply List.repeat_spec in Ht. subst t.
+        rewrite Rminus_diag_eq by reflexivity. rewrite Rabs_R0.
+        pose proof (pow1u_ge_1 (S (List.length (x :: xs)))). lra.
+      * rewrite Rdot_terms_ones. ring.
+  - destruct IH as [alpha' [ts' (Hal & Hlen & Hts & Heq)]].
+    (* the two roundoffs this step performs *)
+    pose proof (f32_mult_correct x y Hb1) as HM.
+    destruct (f32_round_rel _ Hu1) as [m [Hm Hrm]].
+    destruct (f32_round_rel _ Hu2) as [e [He Hre]].
+    pose proof (f32_plus_correct a (f32_mult x y) Hfa Hfm Hb2) as HP.
+    exists ((1 + e) * alpha'),
+           ((1 + m) * ((1 + e) * alpha') :: ts').
+    cbn [f32_dot_aux List.length Rdot_terms].
+    assert (Hstep : B2R (f32_plus a (f32_mult x y))
+                    = (B2R a + B2R x * B2R y * (1 + m)) * (1 + e)).
+    { rewrite HP, Hre, HM, Hrm. reflexivity. }
+    repeat apply conj.
+    + apply pert_step; assumption.
+    + simpl. f_equal. exact Hlen.
+    + constructor.
+      * apply pert_step; [apply pert_step; assumption | exact Hm].
+      * eapply Forall_pert_weaken; [| exact Hts]. lia.
+    + rewrite Heq, Hstep. ring.
+Qed.
+
+(** The computed dot product is the exact inner product of its operands with
+    each product perturbed by a relative factor of at most [(1+u)^(n+1) - 1]. *)
+Theorem f32_dot_backward : forall xs ys,
+  f32_dot_regular xs ys f32_zero ->
+  exists ts,
+    List.length ts = List.length xs
+    /\ Forall (fun t => Rabs (t - 1)
+                        <= (1 + f32_u) ^ (S (List.length xs)) - 1) ts
+    /\ B2R (f32_dot xs ys) = Rdot_terms xs ys ts.
+Proof.
+  intros xs ys Hreg.
+  destruct (f32_dot_aux_backward xs ys f32_zero Hreg)
+    as [alpha [ts (Hal & Hlen & Hts & Heq)]].
+  exists ts. repeat apply conj; try assumption.
+  unfold f32_dot. rewrite Heq, B2R_f32_zero. ring.
+Qed.
+
+(** The premise is the same one the running bound uses, and the same witness
+    satisfies it, so this statement is not vacuous either. *)
+Corollary f32_dot_backward_ones :
+  exists ts,
+    List.length ts = 1%nat
+    /\ Forall (fun t => Rabs (t - 1) <= (1 + f32_u) ^ 2 - 1) ts
+    /\ B2R (f32_dot (f32_one :: nil) (f32_one :: nil))
+       = Rdot_terms (f32_one :: nil) (f32_one :: nil) ts.
+Proof.
+  destruct (f32_dot_backward (f32_one :: nil) (f32_one :: nil)
+              f32_dot_regular_ones) as [ts (Hlen & Hts & Heq)].
+  exists ts. repeat apply conj; assumption.
+Qed.

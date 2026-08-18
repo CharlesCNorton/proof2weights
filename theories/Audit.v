@@ -48,6 +48,16 @@ Print Assumptions f32_mac_step_error.
 Print Assumptions f32_dot_error.
 Print Assumptions f32_dot_regular_ones.
 
+(** The backward-error form of the same computation. *)
+Print Assumptions f32_dot_backward.
+Print Assumptions f32_dot_backward_ones.
+
+(** The Llama primitives. *)
+Print Assumptions ok_rmsnorm.
+Print Assumptions ok_silu_vec.
+Print Assumptions ok_sin.
+Print Assumptions ok_cos.
+
 (** The forward-pass bound, stage by stage up to the logits. *)
 Print Assumptions ok_plus.
 Print Assumptions ok_mult.
