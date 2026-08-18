@@ -1,0 +1,49 @@
+*.vo
+*.vok
+*.vos
+*.glob
+*.aux
+*.cmi
+*.cmo
+*.cmx
+*.o
+*.exe
+__pycache__/
+tmpclaude-*
+.lia.cache
+.nia.cache
+.nra.cache
+nul
+*.safetensors
+
+# Extraction output. It lands beside the source that produced it, so the rules
+# name theories/ and the repository root.
+/theories/*.mli
+/theories/phases1_15_complete.ml
+/theories/phases1_15_native.ml
+/theories/llama_native.ml
+/theories/qwen_native.ml
+/*.mli
+/phases1_15_complete.ml
+/phases1_15_native.ml
+/llama_native.ml
+/qwen_native.ml
+
+# Earlier per-component development, kept locally.
+/old/
+
+# Oracles and receipts written by the setup and receipt scripts.
+/gpt2_prompt.json
+/smollm*_prompt.json
+/receipt.json
+/qwen_prompt.json
+
+# Differential-testing harness output.
+/expbatch/
+/coq_out.txt
+
+# Fixtures and binaries the demo scripts build in place.
+/tiny_gpt2_ref_logits.txt
+/ref_logits
+/float_smoke
+/float_load_run
