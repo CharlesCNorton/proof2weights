@@ -19,11 +19,18 @@
    embedding is never held: rows are decoded on demand for the lookup and
    streamed for the logit projection.
 
+   In serve mode the weights stay on disk and the process answers queries from
+   stdin (one per line: "<comma ids> <max_new>"), streaming "TOK <id>" per token
+   and "END <comma gen ids>" per query, after announcing the weight checksum a
+   receipt binds to. Each query starts from an empty cache.
+
    usage:
      qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck <tok,...>
        -> top-10 next-token logits
      qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck <tok,...> <max_new> <eos>
-       -> greedy continuation, one token id per line *)
+       -> greedy continuation, one token id per line
+     qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck serve <eos>
+       -> persistent server *)
 
 open Qwen_native
 
@@ -63,9 +70,16 @@ let () =
   let lnh   = int_of_string Sys.argv.(10) in   (* deltanet heads         *)
   let lhd   = int_of_string Sys.argv.(11) in   (* deltanet head dim      *)
   let ck    = int_of_string Sys.argv.(12) in   (* conv kernel            *)
-  let prompt = List.map int_of_string (String.split_on_char ',' Sys.argv.(13)) in
-  let max_new = if Array.length Sys.argv > 14 then int_of_string Sys.argv.(14) else 0 in
-  let eos = if Array.length Sys.argv > 15 then int_of_string Sys.argv.(15) else -1 in
+  let toks_arg = Sys.argv.(13) in
+  let serve = (toks_arg = "serve") in
+  let prompt =
+    if serve then [] else List.map int_of_string (String.split_on_char ',' toks_arg) in
+  let max_new =
+    if serve then 0
+    else (if Array.length Sys.argv > 14 then int_of_string Sys.argv.(14) else 0) in
+  let eos =
+    if serve then (if Array.length Sys.argv > 14 then int_of_string Sys.argv.(14) else -1)
+    else (if Array.length Sys.argv > 15 then int_of_string Sys.argv.(15) else -1) in
 
   let group = nh / nkv in
   let kvd = nkv * hd in
@@ -74,6 +88,12 @@ let () =
   let zerov n = List.init n (fun _ -> f32_zero) in
 
   let b = read_file path in
+  (* The weight checksum a receipt binds its answer to, over the whole file. *)
+  let cksum =
+    let r = ref 0 and n = Bytes.length b in
+    for i = 0 to n - 1 do r := (!r * 31 + Char.code (Bytes.get b i)) mod 4294967296 done;
+    !r in
+  Printf.eprintf "checksum %d\n%!" cksum;
   let hlen = u64_le b 0 in
   let base = 8 + hlen in
   let header = coqstr (Bytes.sub_string b 8 hlen) in
@@ -106,9 +126,14 @@ let () =
   let vc = Array.make_matrix nl nkv [] in
   let dstate = Array.init nl (fun _ -> Array.make lnh []) in
   let dconv = Array.make nl [] in
-  for i = 0 to nl - 1 do
-    dstate.(i) <- Array.init lnh (fun _ -> f32_delta_state0 lhd lhd)
-  done;
+  (* Every query starts from an empty cache and a zero recurrent state. *)
+  let reset_caches () =
+    for i = 0 to nl - 1 do
+      for c = 0 to nkv - 1 do kc.(i).(c) <- []; vc.(i).(c) <- [] done;
+      dstate.(i) <- Array.init lnh (fun _ -> f32_delta_state0 lhd lhd);
+      dconv.(i) <- []
+    done in
+  reset_caches ();
 
   (* Run a batch of (position, token) through the whole stack, layer by layer,
      advancing every cache. Returns the final normalised hidden state of each
@@ -205,27 +230,54 @@ let () =
     for j = 1 to Array.length a - 1 do if a.(j) > a.(!bi) then bi := j done; !bi in
   let rec last = function [] -> failwith "empty" | [x] -> x | _ :: r -> last r in
 
-  Printf.eprintf "prefill over %d tokens...\n%!" (List.length prompt);
-  let finals = run (List.mapi (fun p t -> (p, t)) prompt) in
-  Printf.eprintf "projecting %d logits...\n%!" vocab;
-  let logits0 = logits_of (last finals) in
+  (* One query against a fresh cache. Returns (first-position logits, generated
+     ids); streams "TOK <id>" per token when asked. *)
+  let run_query toks mx stream =
+    reset_caches ();
+    Printf.eprintf "prefill over %d tokens...\n%!" (List.length toks);
+    let finals = run (List.mapi (fun p t -> (p, t)) toks) in
+    Printf.eprintf "projecting %d logits...\n%!" vocab;
+    let logits0 = logits_of (last finals) in
+    let gen = ref [] in
+    if mx > 0 then begin
+      let cur = ref (argmax logits0) in
+      let pos = ref (List.length toks) in
+      (try
+        for n = 1 to mx do
+          if !cur = eos then raise Exit;
+          gen := !cur :: !gen;
+          if stream then Printf.printf "TOK %d\n%!" !cur
+          else Printf.printf "%d\n%!" !cur;
+          if n < mx then begin
+            Printf.eprintf "decode %d/%d\n%!" n mx;
+            let f = run [(!pos, !cur)] in
+            incr pos;
+            cur := argmax (logits_of (last f))
+          end
+        done
+      with Exit -> ())
+    end;
+    (logits0, List.rev !gen) in
 
-  if max_new > 0 then begin
-    let cur = ref (argmax logits0) in
-    let pos = ref (List.length prompt) in
+  if serve then begin
+    Printf.printf "CKSUM %d\nREADY\n%!" cksum;
     (try
-      for n = 1 to max_new do
-        if !cur = eos then raise Exit;
-        Printf.printf "%d\n%!" !cur;
-        if n < max_new then begin
-          Printf.eprintf "decode %d/%d\n%!" n max_new;
-          let f = run [(!pos, !cur)] in
-          incr pos;
-          cur := argmax (logits_of (last f))
+      while true do
+        let line = String.trim (input_line stdin) in
+        if line <> "" then begin
+          match String.split_on_char ' ' line with
+          | ids_csv :: mn :: _ ->
+              let qtoks = List.map int_of_string (String.split_on_char ',' ids_csv) in
+              let (_, g) = run_query qtoks (int_of_string mn) true in
+              Printf.printf "END %s\n%!" (String.concat "," (List.map string_of_int g))
+          | _ -> Printf.printf "END \n%!"
         end
       done
-    with Exit -> ())
-  end else begin
+    with End_of_file -> ())
+  end
+  else if max_new > 0 then ignore (run_query prompt max_new false)
+  else begin
+    let (logits0, _) = run_query prompt 0 false in
     let idx = Array.init vocab (fun i -> i) in
     Array.sort (fun i j -> compare logits0.(j) logits0.(i)) idx;
     Printf.printf "top-10 next-token logits:\n";
