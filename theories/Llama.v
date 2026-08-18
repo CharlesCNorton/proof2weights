@@ -179,41 +179,57 @@ Record llama_mlp_weights := mk_llama_mlp_weights {
   lm_down : list (list binary32)
 }.
 
-Definition f32_llama_attn (nh nkv hd : nat) (w : llama_attn_weights)
+(** One head's stream, sliced out of a projection and rotated at its position. *)
+Definition f32_llama_rope_rows (hd : nat) (cosv sinv : list (list binary32))
+    (c : nat) (m : list (list binary32)) : list (list binary32) :=
+  List.map (fun p => let '(pos, r) := p in
+              f32_partial_rope hd (List.nth pos cosv []) (List.nth pos sinv [])
+                (f32_slice (c * hd) hd r))
+           (List.combine (List.seq 0 (List.length m)) m).
+
+Definition f32_llama_heads (nh nkv hd : nat) (w : llama_attn_weights)
     (cosv sinv : list (list binary32)) (hn : list (list binary32))
-    : list (list binary32) :=
+    : list (list (list binary32)) :=
   let q := List.map (fun h => f32_mat_vec_mul (la_q w) h) hn in
   let k := List.map (fun h => f32_mat_vec_mul (la_k w) h) hn in
   let v := List.map (fun h => f32_mat_vec_mul (la_v w) h) hn in
   let group := Nat.div nh nkv in
-  let rope_rows (m : list (list binary32)) (c : nat) :=
-    List.map (fun p => let '(pos, r) := p in
-                f32_partial_rope hd (List.nth pos cosv []) (List.nth pos sinv [])
-                  (f32_slice (c * hd) hd r))
-             (List.combine (List.seq 0 (List.length m)) m) in
-  let qs := List.map (fun hh => rope_rows q hh) (List.seq 0 nh) in
-  let ks := List.map (fun c => rope_rows k c) (List.seq 0 nkv) in
+  let qs := List.map (fun hh => f32_llama_rope_rows hd cosv sinv hh q)
+                     (List.seq 0 nh) in
+  let ks := List.map (fun c => f32_llama_rope_rows hd cosv sinv c k)
+                     (List.seq 0 nkv) in
   let vs := List.map (fun c => List.map (fun r => f32_slice (c * hd) hd r) v)
                      (List.seq 0 nkv) in
-  let heads := List.map (fun hh =>
+  List.map (fun hh =>
       f32_causal_attention (List.nth hh qs [])
         (List.nth (Nat.div hh group) ks []) (List.nth (Nat.div hh group) vs []) hd)
-      (List.seq 0 nh) in
-  List.map (fun r => f32_mat_vec_mul (la_o w) r) (f32_concat_heads heads).
+    (List.seq 0 nh).
 
-Definition f32_llama_layer (nh nkv hd : nat) (eps : binary32)
-    (ln1 ln2 : list binary32) (aw : llama_attn_weights) (mw : llama_mlp_weights)
-    (cosv sinv : list (list binary32)) (h : list (list binary32))
+Definition f32_llama_attn (nh nkv hd : nat) (w : llama_attn_weights)
+    (cosv sinv : list (list binary32)) (hn : list (list binary32))
     : list (list binary32) :=
+  List.map (fun r => f32_mat_vec_mul (la_o w) r)
+           (f32_concat_heads (f32_llama_heads nh nkv hd w cosv sinv hn)).
+
+(** The residual pair the mixer sits in, as on the Qwen path. *)
+Definition f32_llama_wrap (eps : binary32) (ln1 ln2 : list binary32)
+    (mw : llama_mlp_weights)
+    (mix : list (list binary32) -> list (list binary32))
+    (h : list (list binary32)) : list (list binary32) :=
   let hn := List.map (fun row => f32_rmsnorm ln1 eps row) h in
-  let attn := f32_llama_attn nh nkv hd aw cosv sinv hn in
   let hidden2 := List.map (fun p => let '(a, b) := p in f32_vec_add a b)
-                          (List.combine h attn) in
+                          (List.combine h (mix hn)) in
   let h2 := List.map (fun row => f32_rmsnorm ln2 eps row) hidden2 in
   List.map (fun p => let '(a, b) := p in f32_vec_add a b)
     (List.combine hidden2
        (List.map (fun row => f32_swiglu (lm_gate mw) (lm_up mw) (lm_down mw) row)
                  h2)).
+
+Definition f32_llama_layer (nh nkv hd : nat) (eps : binary32)
+    (ln1 ln2 : list binary32) (aw : llama_attn_weights) (mw : llama_mlp_weights)
+    (cosv sinv : list (list binary32)) (h : list (list binary32))
+    : list (list binary32) :=
+  f32_llama_wrap eps ln1 ln2 mw (f32_llama_attn nh nkv hd aw cosv sinv) h.
 
 Fixpoint f32_llama_stack (fs : list (list (list binary32) -> list (list binary32)))
                          (h : list (list binary32)) : list (list binary32) :=

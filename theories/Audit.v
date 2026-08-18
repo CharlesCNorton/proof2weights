@@ -52,11 +52,28 @@ Print Assumptions f32_dot_regular_ones.
 Print Assumptions f32_dot_backward.
 Print Assumptions f32_dot_backward_ones.
 
-(** The Llama primitives. *)
+(** The Llama primitives, and the same chain up to its logits. *)
 Print Assumptions ok_rmsnorm.
 Print Assumptions ok_silu_vec.
 Print Assumptions ok_sin.
 Print Assumptions ok_cos.
+Print Assumptions ok_llama_attn.
+Print Assumptions ok_llama_wrap.
+Print Assumptions ok_llama_stack.
+Print Assumptions ok_llama_forward.
+Print Assumptions ok_llama_logits_full.
+
+(** The backward error through the linear layers and the logit projection. *)
+Print Assumptions f32_mat_vec_mul_backward.
+Print Assumptions logits_backward.
+Print Assumptions f32_gpt2_logits_backward.
+Print Assumptions f32_qwen_logits_backward.
+Print Assumptions f32_llama_logits_backward.
+
+(** Checking a side condition by computation, and the satisfiable budget. *)
+Print Assumptions Qb_correct.
+Print Assumptions regz_Q.
+Print Assumptions amp_ok_ones.
 
 (** The forward-pass bound, stage by stage up to the logits. *)
 Print Assumptions ok_plus.

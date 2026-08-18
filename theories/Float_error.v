@@ -34,6 +34,9 @@ From Stdlib Require Import Reals.
 From Stdlib Require Import Lra.
 From Stdlib Require Import Lia.
 From Stdlib Require Import List.
+From Stdlib Require Import QArith.
+From Stdlib Require Import Qreals.
+From Stdlib Require Import Qabs.
 From Flocq Require Import Core.
 From Flocq Require Import Relative.
 From Flocq Require Import Double_rounding.
@@ -6124,4 +6127,518 @@ Proof.
   destruct (f32_dot_backward (f32_one :: nil) (f32_one :: nil)
               f32_dot_regular_ones) as [ts (Hlen & Hts & Heq)].
   exists ts. repeat apply conj; assumption.
+Qed.
+
+(** * The Llama layer, the stack, and the logits
+
+    The same chain the Qwen path carries, over the Llama layer: the attention
+    mixer around its per-head outputs, the residual pair the mixer sits in, the
+    stack, and the tied-embedding projection. *)
+
+Lemma ok_rmsnorm_rows : forall M m L k n w rw epsv reps mm rm,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  okv (errN M L k) w rw -> ok (errN M L k) epsv reps ->
+  okm (errN M L k) mm rm ->
+  Forall (fun row => List.length row = n) mm ->
+  Forall2 (fun row rrow =>
+     rms_reg M m epsv row rrow
+     /\ Rabs (Rsq_sum rrow) <= M
+     /\ m <= Rsq_sum rrow / B2R (f32_of_Z (Z.of_nat (List.length row))) + reps
+     /\ m <= Rabs (sqrt (Rsq_sum rrow
+                         / B2R (f32_of_Z (Z.of_nat (List.length row))) + reps))
+     /\ Forall2 (fun p q => rmsg_entry M (f32_rms_scale epsv row)
+                              (Rrms_scale reps (List.length row) rrow)
+                              (fst p) (snd p) (fst q) (snd q))
+                (List.combine w row) (List.combine rw rrow)) mm rm ->
+  okm (errN M L (k + n + 7))
+      (List.map (fun row => f32_rmsnorm w epsv row) mm)
+      (List.map (fun row => Rrmsnorm rw reps n row) rm).
+Proof.
+  intros M m L k n w rw epsv reps mm rm HM Hamp Hw Heps Hmm Hlens Hreg.
+  unfold okm in *.
+  revert Hlens Hmm.
+  induction Hreg as [|row rrow mm' rm' Hr Hreg IH]; intros Hlens Hmm;
+    cbn [List.map]; [constructor|].
+  inversion Hmm as [|a b as' bs' Ha Has]; subst.
+  pose proof (Forall_inv Hlens) as Hl1. pose proof (Forall_inv_tail Hlens) as Hl2.
+  destruct Hr as (Hrms & Hbss & Hlo & Hlor & Hent).
+  constructor.
+  - rewrite <- Hl1. eapply ok_rmsnorm with (m := m); eassumption.
+  - apply IH; assumption.
+Qed.
+
+Definition Rllama_attn_of (rwo : list (list R)) (rheads : list (list (list R)))
+                          : list (list R) :=
+  List.map (fun r => Rmat_vec_mul rwo r) (Rconcat_heads rheads).
+
+Lemma ok_llama_attn : forall M m L k ko nh nkv hd w rwo cosv sinv hn rheads,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  okm (errN M L k) (la_o w) rwo ->
+  Forall2 (okm (errN M L k)) (f32_llama_heads nh nkv hd w cosv sinv hn) rheads ->
+  Forall (fun row => Forall (fun r => Rabs r <= M) row) (Rconcat_heads rheads) ->
+  Forall (fun row => Forall (fun r => dotreg M r row f32_zero
+                                      /\ (List.length r <= ko)%nat) (la_o w))
+         (f32_concat_heads (f32_llama_heads nh nkv hd w cosv sinv hn)) ->
+  okm (errN M L (k + 2 * ko)) (f32_llama_attn nh nkv hd w cosv sinv hn)
+      (Rllama_attn_of rwo rheads).
+Proof.
+  intros M m L k ko nh nkv hd w rwo cosv sinv hn rheads
+         HM Hamp Hwo Hheads Hbnd Hreg.
+  unfold f32_llama_attn, Rllama_attn_of.
+  eapply ok_proj_rows with (m := m); try eassumption.
+  apply ok_concat_heads, Hheads.
+Qed.
+
+Definition Rllama_wrap (reps : R) (rln1 rln2 : list R) (n : nat)
+    (rgate rup rdown : list (list R))
+    (rmix : list (list R) -> list (list R)) (rh : list (list R)) : list (list R) :=
+  let hn := List.map (fun row => Rrmsnorm rln1 reps n row) rh in
+  let hidden2 := List.map (fun p => let '(a, b) := p in Rvec_add a b)
+                          (List.combine rh (rmix hn)) in
+  let h2 := List.map (fun row => Rrmsnorm rln2 reps n row) hidden2 in
+  List.map (fun p => let '(a, b) := p in Rvec_add a b)
+    (List.combine hidden2
+       (List.map (fun row => Rswiglu rgate rup rdown row) h2)).
+
+Definition lwrap_norm_reg (M m : R) (w : list binary32) (rw : list R)
+    (epsv : binary32) (reps : R) (row : list binary32) (rrow : list R) : Prop :=
+  rms_reg M m epsv row rrow
+  /\ Rabs (Rsq_sum rrow) <= M
+  /\ m <= Rsq_sum rrow / B2R (f32_of_Z (Z.of_nat (List.length row))) + reps
+  /\ m <= Rabs (sqrt (Rsq_sum rrow
+                      / B2R (f32_of_Z (Z.of_nat (List.length row))) + reps))
+  /\ Forall2 (fun p q => rmsg_entry M (f32_rms_scale epsv row)
+                           (Rrms_scale reps (List.length row) rrow)
+                           (fst p) (snd p) (fst q) (snd q))
+             (List.combine w row) (List.combine rw rrow).
+
+Lemma ok_llama_wrap :
+  forall M m L k n kg ku kd mixd ln1 rln1 ln2 rln2 epsv reps
+         wg rwg wu rwu wd rwd mix rmix h rh,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  okv (errN M L k) ln1 rln1 -> okv (errN M L k) ln2 rln2 ->
+  ok (errN M L k) epsv reps ->
+  okm (errN M L k) wg rwg -> okm (errN M L k) wu rwu -> okm (errN M L k) wd rwd ->
+  okm (errN M L k) h rh ->
+  Forall (fun row => List.length row = n) h ->
+  Forall2 (lwrap_norm_reg M m ln1 rln1 epsv reps) h rh ->
+  (forall j hh rhh, okm (errN M L j) hh rhh ->
+                    okm (errN M L (mixd j)) (mix hh) (rmix rhh)) ->
+  Forall2 (fun r1 r2 => Forall2 (fun x y => regz M (B2R x + B2R y)) r1 r2)
+          h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h)) ->
+  Forall (fun row => List.length row = n)
+    (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+       (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h)))) ->
+  Forall2 (lwrap_norm_reg M m ln2 rln2 epsv reps)
+    (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+       (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h))))
+    (List.map (fun p => let '(a, b) := p in Rvec_add a b)
+       (List.combine rh (rmix (List.map (fun row => Rrmsnorm rln1 reps n row) rh)))) ->
+  Forall2 (swiglu_row_reg M m kg ku kd wg wu wd rwg rwu rwd)
+    (List.map (fun row => f32_rmsnorm ln2 epsv row)
+       (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+          (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h)))))
+    (List.map (fun row => Rrmsnorm rln2 reps n row)
+       (List.map (fun p => let '(a, b) := p in Rvec_add a b)
+          (List.combine rh (rmix (List.map (fun row => Rrmsnorm rln1 reps n row) rh))))) ->
+  Forall2 (fun r1 r2 => Forall2 (fun x y => regz M (B2R x + B2R y)) r1 r2)
+    (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+       (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h))))
+    (List.map (fun row => f32_swiglu wg wu wd row)
+       (List.map (fun row => f32_rmsnorm ln2 epsv row)
+          (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+             (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h)))))) ->
+  okm (errN M L (wrap_depth k n kg ku kd mixd))
+      (f32_llama_wrap epsv ln1 ln2 (mk_llama_mlp_weights wg wu wd) mix h)
+      (Rllama_wrap reps rln1 rln2 n rwg rwu rwd rmix rh).
+Proof.
+  intros M m L k n kg ku kd mixd ln1 rln1 ln2 rln2 epsv reps
+         wg rwg wu rwu wd rwd mix rmix h rh
+         HM Hamp Hln1 Hln2 Heps Hwg Hwu Hwd Hh
+         Hlen1 Hrms1 Hmix Hres1 Hlen2 Hrms2 Hsw Hres2.
+  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
+  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  unfold f32_llama_wrap, Rllama_wrap, wrap_depth. cbv zeta.
+  cbn [lm_gate lm_up lm_down].
+  set (d1 := (k + n + 7)%nat).
+  assert (A1 : okm (errN M L d1)
+                 (List.map (fun row => f32_rmsnorm ln1 epsv row) h)
+                 (List.map (fun row => Rrmsnorm rln1 reps n row) rh)).
+  { unfold d1. eapply ok_rmsnorm_rows with (m := m); eassumption. }
+  set (d2 := mixd d1).
+  assert (A2 : okm (errN M L d2)
+                 (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h))
+                 (rmix (List.map (fun row => Rrmsnorm rln1 reps n row) rh)))
+    by (unfold d2; apply Hmix, A1).
+  set (d3 := S (Nat.max k d2)).
+  assert (A3 : okm (errN M L d3)
+    (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+       (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h))))
+    (List.map (fun p => let '(a, b) := p in Rvec_add a b)
+       (List.combine rh (rmix (List.map (fun row => Rrmsnorm rln1 reps n row) rh))))).
+  { unfold d3. eapply ok_rows_add with (m := m); try eassumption.
+    - eapply okm_weaken; [exact Hh | apply errN_mono; auto; lia].
+    - eapply okm_weaken; [exact A2 | apply errN_mono; auto; lia]. }
+  set (d4 := (d3 + n + 7)%nat).
+  assert (A4 : okm (errN M L d4)
+    (List.map (fun row => f32_rmsnorm ln2 epsv row)
+       (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+          (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h)))))
+    (List.map (fun row => Rrmsnorm rln2 reps n row)
+       (List.map (fun p => let '(a, b) := p in Rvec_add a b)
+          (List.combine rh (rmix (List.map (fun row => Rrmsnorm rln1 reps n row) rh)))))).
+  { unfold d4. eapply ok_rmsnorm_rows with (m := m); try eassumption.
+    - eapply okv_weaken; [exact Hln2 | apply errN_mono; auto; unfold d3, d1; lia].
+    - eapply ok_errN_mono with (n := k);
+        [exact HM0 | exact HL1 | unfold d3, d1; lia | eassumption]. }
+  set (d5 := swiglu_depth d4 kg ku kd).
+  assert (A5 : okm (errN M L d5)
+    (List.map (fun row => f32_swiglu wg wu wd row)
+       (List.map (fun row => f32_rmsnorm ln2 epsv row)
+          (List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+             (List.combine h (mix (List.map (fun row => f32_rmsnorm ln1 epsv row) h))))))
+    (List.map (fun row => Rswiglu rwg rwu rwd row)
+       (List.map (fun row => Rrmsnorm rln2 reps n row)
+          (List.map (fun p => let '(a, b) := p in Rvec_add a b)
+             (List.combine rh (rmix (List.map (fun row => Rrmsnorm rln1 reps n row) rh))))))).
+  { unfold d5. eapply ok_swiglu_rows with (m := m); try eassumption;
+      eapply okm_weaken; [exact Hwg | | exact Hwu | | exact Hwd |];
+      apply errN_mono; auto; unfold d4, d3, d1; lia. }
+  eapply ok_rows_add with (m := m); try eassumption.
+  - eapply okm_weaken; [exact A3 | apply errN_mono; auto;
+      unfold d5, d4, d3, swiglu_depth; lia].
+  - eapply okm_weaken; [exact A5 | apply errN_mono; auto;
+      unfold d5, d4, d3, swiglu_depth; lia].
+Qed.
+
+(** The stack, and the bound at the logits. *)
+Fixpoint Rllama_stack (rfs : list (list (list R) -> list (list R)))
+                      (rh : list (list R)) : list (list R) :=
+  match rfs with
+  | [] => rh
+  | rf :: rest => Rllama_stack rest (rf rh)
+  end.
+
+Inductive llama_stack_reg (M L : R)
+  : nat -> list (list (list binary32) -> list (list binary32))
+    -> list (list (list R) -> list (list R))
+    -> list (list binary32) -> list (list R) -> nat -> list (list R) -> Prop :=
+| lsreg_nil : forall n h rh,
+    okm (errN M L n) h rh -> llama_stack_reg M L n [] [] h rh n rh
+| lsreg_cons : forall n f fs rf rfs h rh n' nfin rhfin,
+    (n <= n')%nat ->
+    okm (errN M L n') (f h) (rf rh) ->
+    llama_stack_reg M L n' fs rfs (f h) (rf rh) nfin rhfin ->
+    llama_stack_reg M L n (f :: fs) (rf :: rfs) h rh nfin rhfin.
+
+Lemma ok_llama_stack : forall M L n fs rfs h rh nfin rhfin,
+  llama_stack_reg M L n fs rfs h rh nfin rhfin ->
+  okm (errN M L nfin) (f32_llama_stack fs h) rhfin
+  /\ Rllama_stack rfs rh = rhfin.
+Proof.
+  intros M L n fs rfs h rh nfin rhfin Hreg.
+  induction Hreg as [n0 h0 rh0 Hh | n0 f fs0 rf rfs0 h0 rh0 n' nfin0 rhfin0
+                     Hle Hstep Hreg IH];
+    cbn [f32_llama_stack Rllama_stack].
+  - split; [exact Hh | reflexivity].
+  - exact IH.
+Qed.
+
+Definition Rllama_forward (reps : R) (rnormw : list R) (n : nat)
+                          (rh : list (list R)) : list (list R) :=
+  List.map (fun row => Rrmsnorm rnormw reps n row) rh.
+
+Definition Rllama_logits (remb rh : list (list R)) : list (list R) :=
+  List.map (fun hrow => List.map (fun wrow => Rdot hrow wrow) remb) rh.
+
+Lemma ok_llama_forward : forall M m L k n normw rnormw epsv reps fs rfs
+                                emb remb ids nfin rhfin,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  okv (errN M L nfin) normw rnormw -> ok (errN M L nfin) epsv reps ->
+  okm (errN M L k) emb remb ->
+  llama_stack_reg M L k fs rfs (f32_embed_tokens emb ids)
+    (Rembed_tokens remb ids) nfin rhfin ->
+  Forall (fun row => List.length row = n)
+         (f32_llama_stack fs (f32_embed_tokens emb ids)) ->
+  Forall2 (lwrap_norm_reg M m normw rnormw epsv reps)
+    (f32_llama_stack fs (f32_embed_tokens emb ids)) rhfin ->
+  okm (errN M L (nfin + n + 7)) (f32_llama_forward epsv normw fs emb ids)
+      (Rllama_forward reps rnormw n rhfin).
+Proof.
+  intros M m L k n normw rnormw epsv reps fs rfs emb remb ids nfin rhfin
+         HM Hamp Hn Heps Hemb Hstack Hlen Hreg.
+  unfold f32_llama_forward, Rllama_forward.
+  pose proof (ok_llama_stack _ _ _ _ _ _ _ _ _ Hstack) as [Hst _].
+  eapply ok_rmsnorm_rows with (m := m); eassumption.
+Qed.
+
+Corollary ok_llama_logits_full : forall M m L D kk emb remb h rh,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  okm (errN M L D) emb remb ->
+  okm (errN M L D) h rh ->
+  Forall (fun col => Forall (fun r => Rabs r <= M) col) remb ->
+  Forall (fun hrow => Forall (fun wrow => dotreg M hrow wrow f32_zero
+                                          /\ (List.length hrow <= kk)%nat) emb) h ->
+  okm (errN M L (D + 2 * kk)) (f32_llama_logits emb h) (Rllama_logits remb rh).
+Proof.
+  intros M m L D kk emb remb h rh HM Hamp Hemb Hh Hbnd Hreg.
+  unfold f32_llama_logits, Rllama_logits.
+  eapply ok_gpt2_logits with (m := m); eassumption.
+Qed.
+
+(** * Backward error through the linear layers
+
+    Every scalar a linear layer or a logit projection produces is a dot
+    product, so [f32_dot_backward] lifts to them directly: each output entry is
+    exactly the real inner product of the row it came from, with each product
+    scaled by a factor within [(1 + u)^(k+1) - 1] of one, where [k] bounds that
+    row's length. Unlike the forward bound, nothing here grows with the depth of
+    the network. *)
+
+Lemma f32_dot_map_backward : forall kk rows v,
+  Forall (fun row => f32_dot_regular row v f32_zero
+                     /\ (List.length row <= kk)%nat) rows ->
+  Forall2 (fun row out =>
+     exists ts, List.length ts = List.length row
+       /\ Forall (fun t => Rabs (t - 1) <= (1 + f32_u) ^ (S kk) - 1) ts
+       /\ B2R out = Rdot_terms row v ts)
+    rows (List.map (fun row => f32_dot row v) rows).
+Proof.
+  intros kk rows v H.
+  induction H as [|row rows' [Hreg Hlen] H IH]; cbn [List.map]; constructor.
+  - destruct (f32_dot_backward row v Hreg) as [ts (Hl & Ht & He)].
+    exists ts. repeat apply conj; try assumption.
+    eapply Forall_pert_weaken; [| exact Ht]. lia.
+  - exact IH.
+Qed.
+
+Lemma f32_dot_map_backward_r : forall kk h rows,
+  (List.length h <= kk)%nat ->
+  Forall (fun row => f32_dot_regular h row f32_zero) rows ->
+  Forall2 (fun row out =>
+     exists ts, List.length ts = List.length h
+       /\ Forall (fun t => Rabs (t - 1) <= (1 + f32_u) ^ (S kk) - 1) ts
+       /\ B2R out = Rdot_terms h row ts)
+    rows (List.map (fun row => f32_dot h row) rows).
+Proof.
+  intros kk h rows Hlen H.
+  induction H as [|row rows' Hreg H IH]; cbn [List.map]; constructor.
+  - destruct (f32_dot_backward h row Hreg) as [ts (Hl & Ht & He)].
+    exists ts. repeat apply conj; try assumption.
+    eapply Forall_pert_weaken; [| exact Ht]. lia.
+  - exact IH.
+Qed.
+
+(** The matrix-vector product: one perturbed inner product per row. *)
+Corollary f32_mat_vec_mul_backward : forall kk mm v,
+  Forall (fun row => f32_dot_regular row v f32_zero
+                     /\ (List.length row <= kk)%nat) mm ->
+  Forall2 (fun row out =>
+     exists ts, List.length ts = List.length row
+       /\ Forall (fun t => Rabs (t - 1) <= (1 + f32_u) ^ (S kk) - 1) ts
+       /\ B2R out = Rdot_terms row v ts)
+    mm (f32_mat_vec_mul mm v).
+Proof.
+  intros kk mm v H. unfold f32_mat_vec_mul.
+  apply f32_dot_map_backward, H.
+Qed.
+
+(** The tied-embedding projection, for each of the three models. Every logit is
+    exactly the inner product of its hidden row with its embedding row, with the
+    perturbation set by the hidden width alone. *)
+Definition logits_backward_of (kk : nat) (emb h logits : list (list binary32))
+                              : Prop :=
+  Forall2 (fun hrow outrow =>
+     Forall2 (fun wrow out =>
+        exists ts, List.length ts = List.length hrow
+          /\ Forall (fun t => Rabs (t - 1) <= (1 + f32_u) ^ (S kk) - 1) ts
+          /\ B2R out = Rdot_terms hrow wrow ts)
+       emb outrow)
+    h logits.
+
+Lemma logits_backward : forall kk emb h,
+  Forall (fun hrow => (List.length hrow <= kk)%nat
+                      /\ Forall (fun wrow => f32_dot_regular hrow wrow f32_zero) emb) h ->
+  logits_backward_of kk emb h
+    (List.map (fun hrow => List.map (fun wrow => f32_dot hrow wrow) emb) h).
+Proof.
+  intros kk emb h H. unfold logits_backward_of.
+  induction H as [|hrow h' [Hlen Hreg] H IH]; cbn [List.map]; constructor.
+  - apply f32_dot_map_backward_r; assumption.
+  - exact IH.
+Qed.
+
+Corollary f32_gpt2_logits_backward : forall kk cfg eps model toks,
+  Forall (fun hrow => (List.length hrow <= kk)%nat
+                      /\ Forall (fun wrow => f32_dot_regular hrow wrow f32_zero)
+                                (f32_wte model))
+         (f32_gpt2_forward cfg eps model toks) ->
+  logits_backward_of kk (f32_wte model) (f32_gpt2_forward cfg eps model toks)
+    (f32_gpt2_logits cfg eps model toks).
+Proof.
+  intros kk cfg eps model toks H. unfold f32_gpt2_logits.
+  apply logits_backward, H.
+Qed.
+
+Corollary f32_qwen_logits_backward : forall kk emb h,
+  Forall (fun hrow => (List.length hrow <= kk)%nat
+                      /\ Forall (fun wrow => f32_dot_regular hrow wrow f32_zero) emb) h ->
+  logits_backward_of kk emb h (f32_qwen_logits emb h).
+Proof.
+  intros kk emb h H. unfold f32_qwen_logits. apply logits_backward, H.
+Qed.
+
+Corollary f32_llama_logits_backward : forall kk emb h,
+  Forall (fun hrow => (List.length hrow <= kk)%nat
+                      /\ Forall (fun wrow => f32_dot_regular hrow wrow f32_zero) emb) h ->
+  logits_backward_of kk emb h (f32_llama_logits emb h).
+Proof.
+  intros kk emb h H. unfold f32_llama_logits. apply logits_backward, H.
+Qed.
+
+(** * Checking a regularity side condition by computation
+
+    The records the composed bounds rest on are conjunctions of conditions on
+    exact real quantities, and every quantity a concrete witness produces is
+    built from [B2R] of concrete binary32 values by [+], [*] and [/]. Such a
+    value is a rational, so the conditions become decidable comparisons once
+    the floats are read as rationals. [Qb] does that reading, [Qb_correct] says
+    it is faithful, and [regz_Q] turns one side condition into two comparisons
+    a machine can check. *)
+
+Open Scope Q_scope.
+
+(** The exact value of a binary32, as a rational. *)
+Definition Qb (x : binary32) : Q :=
+  match x with
+  | B754_finite s m e _ =>
+      let n := cond_Zopp s (Zpos m) in
+      match e with
+      | Z0 => inject_Z n
+      | Zpos p => inject_Z (n * Zpower_pos 2 p)
+      | Zneg p => inject_Z n / inject_Z (Zpower_pos 2 p)
+      end
+  | _ => 0
+  end.
+
+Close Scope Q_scope.
+
+Lemma Q2R_inject : forall n, Q2R (inject_Z n) = IZR n.
+Proof. intros n. unfold Q2R, inject_Z. simpl. field. Qed.
+
+Lemma Zpower_pos_gt0 : forall p, (0 < Zpower_pos 2 p)%Z.
+Proof. intros p. apply Zpower_pos_gt_0. lia. Qed.
+
+Lemma Qb_correct : forall x : binary32, B2R x = Q2R (Qb x).
+Proof.
+  intros x. destruct x as [s|s| |s m e H]; simpl;
+    try (unfold Q2R; simpl; lra).
+  unfold F2R. simpl.
+  destruct e as [|p|p].
+  - rewrite Q2R_inject. simpl. lra.
+  - rewrite Q2R_inject, mult_IZR. reflexivity.
+  - rewrite Q2R_div by
+      (intro Hc; unfold Qeq, inject_Z in Hc; simpl in Hc;
+       pose proof (Zpower_pos_gt0 p); lia).
+    rewrite !Q2R_inject. unfold bpow. unfold Rdiv. reflexivity.
+Qed.
+
+Lemma u_le_one : f32_u <= 1.
+Proof.
+  unfold f32_u, prec32.
+  set (e := (- 24 + 1)%Z).
+  assert (H : bpow radix2 e <= 1).
+  { replace 1 with (bpow radix2 0) by reflexivity. apply bpow_le. unfold e. lia. }
+  assert (Hp : 0 < bpow radix2 e) by apply bpow_gt_0.
+  assert (Hi : / 2 <= 1).
+  { rewrite <- Rinv_1. apply Rinv_le_contravar; lra. }
+  apply Rle_trans with (1 * bpow radix2 e).
+  - apply Rmult_le_compat_r; [lra | exact Hi].
+  - lra.
+Qed.
+
+Lemma Q2R_0q : Q2R 0%Q = 0%R.
+Proof. unfold Q2R. simpl. lra. Qed.
+
+Lemma Q2R_two : Q2R (2 # 1) = 2%R.
+Proof. unfold Q2R. simpl. lra. Qed.
+
+Lemma Q2R_abs : forall q, Q2R (Qabs q) = Rabs (Q2R q).
+Proof.
+  intros q. apply Qabs_case; intros H.
+  - symmetry. apply Rabs_pos_eq.
+    apply Qle_Rle in H. rewrite Q2R_0q in H. exact H.
+  - rewrite Q2R_opp. symmetry. rewrite <- Rabs_Ropp. apply Rabs_pos_eq.
+    apply Qle_Rle in H. rewrite Q2R_0q in H. lra.
+Qed.
+
+Lemma normal_lo_Q : f32_normal_lo = Q2R (1 # (2^126)%positive).
+Proof.
+  unfold f32_normal_lo, f32_emin, prec32, emax32.
+  replace (3 - 128 - 24 + 24 - 1)%Z with (-126)%Z by lia.
+  unfold Q2R. cbn [Qnum Qden]. rewrite Rmult_1_l.
+  unfold bpow.
+  replace (Z.pos (2^126)%positive) with (Zpower_pos 2 126)
+    by (vm_compute; reflexivity).
+  reflexivity.
+Qed.
+
+(** One side condition, as two comparisons on rationals. Doubling the magnitude
+    is a coarser bound than [1 + u], which is what lets the check avoid the
+    unit roundoff entirely. *)
+Lemma regz_Q : forall (q qM : Q),
+  Qle_bool (1 # (2^126)%positive) (Qabs q) = true ->
+  Qle_bool (Qabs q * (2 # 1)) qM = true ->
+  regz (Q2R qM) (Q2R q).
+Proof.
+  intros q qM H1 H2. split.
+  - rewrite normal_lo_Q, <- Q2R_abs. apply Qle_Rle, Qle_bool_imp_le, H1.
+  - pose proof u_le_one as Hu.
+    assert (Habs : 0 <= Q2R (Qabs q)) by (rewrite Q2R_abs; apply Rabs_pos).
+    assert (H2' : Q2R (Qabs q) * 2 <= Q2R qM).
+    { replace (Q2R (Qabs q) * 2) with (Q2R (Qabs q * (2 # 1))).
+      - apply Qle_Rle, Qle_bool_imp_le, H2.
+      - rewrite Q2R_mult, Q2R_two. reflexivity. }
+    rewrite <- Q2R_abs. nra.
+Qed.
+
+(** A magnitude bound, likewise. *)
+Lemma abs_le_Q : forall (q qM : Q),
+  Qle_bool (Qabs q) qM = true -> Rabs (Q2R q) <= Q2R qM.
+Proof.
+  intros q qM H. rewrite <- Q2R_abs.
+  apply Qle_Rle, Qle_bool_imp_le, H.
+Qed.
+
+Lemma le_abs_Q : forall (q qm : Q),
+  Qle_bool qm (Qabs q) = true -> Q2R qm <= Rabs (Q2R q).
+Proof.
+  intros q qm H. rewrite <- Q2R_abs.
+  apply Qle_Rle, Qle_bool_imp_le, H.
+Qed.
+
+(** The exponential's reduced argument at one, checked rather than estimated:
+    the division is exact, so the reduced argument is two to the minus eight,
+    and every side condition about it reduces to arithmetic on rationals. *)
+Example regz_e_r2_one :
+  regz (Q2R (4 # 1)) (B2R (e_r f32_one) * B2R (e_r f32_one)).
+Proof.
+  rewrite !Qb_correct, <- Q2R_mult.
+  apply regz_Q; vm_compute; reflexivity.
+Qed.
+
+Example abs_e_r_one : Rabs (B2R (e_r f32_one)) <= Q2R (4 # 1).
+Proof. rewrite Qb_correct. apply abs_le_Q. vm_compute. reflexivity. Qed.
+
+(** The amplification budget is satisfiable. *)
+Lemma amp_ok_ones : amp_ok 1 1 2.
+Proof.
+  assert (Hs : sqrt 1 = 1) by apply sqrt_1.
+  assert (Hi : / 2 <= 1)
+    by (rewrite <- Rinv_1; apply Rinv_le_contravar; lra).
+  unfold amp_ok.
+  split; [lra|]. split; [lra|]. split; [lra|]. split; [lra|].
+  split.
+  - replace (1 / 1 + 1 / (1 * 1)) with 2 by field. lra.
+  - rewrite Hs. replace (1 / (2 * 1)) with (/ 2) by field. lra.
 Qed.
