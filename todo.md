@@ -1,38 +1,30 @@
 # Outstanding work
 
-## The Llama and Qwen forward bounds, composed
+## Regularity witnesses, record by record
 
-`theories/Float_error.v` carries the propagation relation over every Llama and
-Qwen3.5 primitive, and over the Qwen layer, stack and logits. The Llama layer
-has its pieces bounded but no composed statement of its own yet: what is
-missing is the counterpart of `ok_qwen_wrap` for `f32_llama_layer`, and a stack
-relation over it. Everything it would rest on is already proved.
+The machinery is in place and demonstrated. `Qb` reads a binary32 as the
+rational it exactly denotes, `Qb_correct` says that reading is faithful, and
+`regz_Q`, `abs_le_Q` and `le_abs_Q` turn a side condition into comparisons a
+machine checks by computation, since every quantity a concrete witness produces
+is built from `B2R` of concrete floats by addition, multiplication and
+division. `regz_e_r2_one` and `abs_e_r_one` are worked instances over the
+exponential's reduced argument, and `amp_ok_ones` witnesses the amplification
+budget.
 
-The trigonometric bounds are stated on the reduced argument, since the magic
-constant reduction is the identity in exact arithmetic and the rounding step in
-binary32. Carrying a bound across the reduction itself would need a relation
-between the two evaluations rather than the propagation relation used here.
+What remains is applying it: assembling a full satisfying assignment for
+`exp_reg`, and then for the records that contain it (`sig_reg`, `gelu_reg`,
+`sp_reg`, `sm_reg`, `dstep_reg`, `conv_chan`) and the ones that do not
+(`log_reg`, `sin_reg`, `cos_reg`, `rms_reg`, `ln_reg`, `ca_reg`). At
+`f32_one` the exponential's reduced argument and its six powers are exact
+powers of two, so those conditions check immediately; the coefficient divisions
+and the eight squarings are where the rational check earns its keep.
+`f32_dot_regular` and `amp_ok` are the two that already have witnesses.
 
-## Regularity witnesses
+## Backward error above the linear layers
 
-`f32_dot_regular` has a witness, so the dot-product bounds are visibly not
-vacuous, and `f32_dot_backward_ones` reuses it. The larger records the layer
-bounds rest on, `exp_reg`, `ln_reg`, `ca_reg`, `log_reg`, `rms_reg`,
-`dstep_reg` and the rest, have none. Exhibiting one satisfying assignment per
-record would put the composed statements on the same footing.
-
-## Bound tightness
-
-The forward bound is worst-case and compounds with depth, so at GPT-2 scale it
-is far larger than the divergence `RESULTS.md` measures. `f32_dot_backward`
-gives the backward-error form for the dot product, where the perturbation is
-relative and sized by that one product. Carrying the same treatment up through
-the linear layers and the block would replace the compounding forward bound
-with a perturbation of the weights.
-
-## Scale of the architecture sweep
-
-`scripts/experiment_arch.py` sweeps four samples per configuration against the
-inductive reference, which is slow enough that the models are small. The GPT-2
-sweep runs sixteen samples over wider models. Raising the architecture sweep to
-the same scale wants either the native extraction as the oracle or more patience.
+`f32_dot_backward` gives the backward-error form for the dot product, and
+`f32_mat_vec_mul_backward` and `logits_backward` carry it to the matrix-vector
+product and to the tied-embedding projection of all three models. Layer
+normalization, the exponential and softmax have no backward form, so the
+statement stops where the network stops being linear. Carrying it through
+would mean a perturbation of the weights rather than of the products.

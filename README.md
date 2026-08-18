@@ -387,11 +387,22 @@ The development proves:
   the magic constant is the identity in exact arithmetic and the rounding step
   in binary32, so the trigonometric bounds are stated on the reduced argument
   (`theories/Float_error.v`).
+- The Llama layer, stack and logits under the same relation, so all three
+  architectures carry a bound from their primitives to their logits
+  (`ok_llama_wrap`, `ok_llama_stack`, `ok_llama_logits_full`).
 - A backward-error statement for the dot product: the computed value is exactly
   the real inner product of the same operands with each product scaled by a
   factor within `(1 + u)^(n+1) - 1` of one, so the perturbation is relative and
   its size is set by the length of that one dot product rather than by the depth
-  of the surrounding network (`f32_dot_backward`).
+  of the surrounding network (`f32_dot_backward`). The same statement carries to
+  the matrix-vector product and to the tied-embedding projection of all three
+  models (`f32_mat_vec_mul_backward`, `logits_backward`), which is where the
+  longest dot products are.
+- That a side condition of the composed bounds can be checked by computation
+  rather than estimated: `Qb` reads a binary32 as the rational it exactly
+  denotes, `Qb_correct` proves that reading faithful, and `regz_Q` turns one
+  condition into two rational comparisons. `amp_ok_ones` witnesses the
+  amplification budget.
 
 The float arithmetic is exactly Flocq's, and each operation is proved to land
 within half a ULP of the exact real result, so the extracted executable is a
@@ -458,10 +469,12 @@ extraction of `f32_llama_forward` and `f32_qwen_forward` rather than the native
 build, so the oracle there trusts no floating-point boundary at all. Weights are
 handed to both sides as raw binary32 bit patterns, so the reference and the
 mirror start from identical values and the only difference is the reduction
-order. The tables in `RESULTS.md` put the Llama divergence in the same range as
-GPT-2's and the Qwen divergence about an order of magnitude higher, which is
-what a recurrence that carries a state matrix across the sequence, on top of a
-logarithm and a convolution, predicts. No configuration produced a next-token
+order. Sixteen samples per configuration, as in the GPT-2 sweep, put the Llama
+divergence in the same range as GPT-2's and the Qwen divergence about an order
+of magnitude higher, which is what a recurrence carrying a state matrix across
+the sequence, on top of a logarithm and a convolution, predicts. The Qwen rows
+include the layer pattern the real model uses, three gated DeltaNet blocks to
+one gated full-attention block. No configuration produced a next-token
 disagreement there either.
 
 ## Building and running
