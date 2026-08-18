@@ -206,9 +206,18 @@ produces "The capital of France is Paris." Generation uses a key/value cache: th
 prompt is processed once, its per-layer rotary keys and values are stored, and
 each new token is computed as a single position attending over the cache, which
 is bit-identical to a full recompute and removes the per-token cost of
-reprocessing the prefix. `scripts/llama_chat.py` drives an interactive session: it
-applies the model's chat template, sends the token ids to the runner, and decodes
-the generated ids, so each reply is produced entirely by the verified operators.
+reprocessing the prefix. `scripts/chat.py` drives an interactive session against
+either model: it applies the model's chat template, sends the token ids to the
+runner, and decodes the generated ids, so each reply is produced entirely by the
+verified operators.
+`theories/Llama.v` also names the composition itself, so the layer, the stack
+and the forward pass are Rocq functions rather than only an order the runner
+follows: `f32_llama_layer` is RMSNorm, the projections, rotary embedding,
+grouped-query causal attention, the output projection and SwiGLU inside their
+two residuals, and `f32_llama_forward` embeds, runs the stack and applies the
+final norm. `runners/llama_ref.ml` executes exactly that against the inductive
+extraction, where no floating-point boundary is trusted at all.
+
 `f32_sin` and `f32_cos` are compositions of the four arithmetic primitives, so
 the native build extracts them structurally rather than calling the host libm:
 it runs the same argument reduction and the same Taylor polynomial the
@@ -255,6 +264,11 @@ the trailing convolution window. Over eight tokens it emits
 the reference and decodes to "The capital of France is **Paris**." The prompt
 and those eight tokens together take five and a half minutes.
 
+`runners/qwen_ref.ml` runs the same composition against the inductive
+extraction on a small configuration, calling `f32_qwen_forward` directly rather
+than composing the primitives itself, so the definitions the error bound is
+stated about are the ones executed.
+
 The primitives are defined in Rocq with their shape lemmas and extracted, so
 the arithmetic that runs is the arithmetic the definitions specify.
 `theories/Float_error.v` carries the propagation relation over every one of
@@ -275,8 +289,10 @@ soundness and completeness theorems; the prompt-preservation guarantee follows
 from the proven generation property `gpt2_generation_preserves_prompt`. A receipt
 is checked without trusting the producer: recompute the weight checksum from the
 file, re-run the deterministic verified generation, and compare both against the
-receipt. `scripts/llama_receipt.py emit` writes a receipt for an answer and
-`scripts/llama_receipt.py verify` recomputes and re-runs to confirm it. Because the
+receipt. `scripts/receipt.py emit` writes a receipt for an answer and
+`scripts/receipt.py verify` recomputes and re-runs to confirm it. Both the
+SmolLM2 and the Qwen3.5 runner print the checksum of the weight file they
+loaded, so either model can be receipted. Because the
 forward is a pure verified function, the regeneration is reproducible, so anyone
 holding the weights and the receipt can confirm that the recorded output is
 exactly what the model produces under the proven semantics.
@@ -365,6 +381,17 @@ The development proves:
   the gated delta step and scan, partial rotary embedding, SwiGLU and the query
   preparation, then the two mixers, the residual pair, the alternating stack
   and the tied-embedding projection (`theories/Float_error.v`).
+- The Llama primitives under the same relation: RMSNorm, SiLU over a vector,
+  and the sine and cosine Taylor polynomials. The argument reduction is where
+  the two evaluations deliberately part company, because adding and subtracting
+  the magic constant is the identity in exact arithmetic and the rounding step
+  in binary32, so the trigonometric bounds are stated on the reduced argument
+  (`theories/Float_error.v`).
+- A backward-error statement for the dot product: the computed value is exactly
+  the real inner product of the same operands with each product scaled by a
+  factor within `(1 + u)^(n+1) - 1` of one, so the perturbation is relative and
+  its size is set by the length of that one dot product rather than by the depth
+  of the surrounding network (`f32_dot_backward`).
 
 The float arithmetic is exactly Flocq's, and each operation is proved to land
 within half a ULP of the exact real result, so the extracted executable is a
@@ -426,6 +453,17 @@ produced a next-token disagreement. At full scale, the reference produces the
 same next-token prediction as the PyTorch implementation on GPT-2 weights, as
 described above.
 
+The Llama and Qwen3.5 paths carry the same harness, against the inductive
+extraction of `f32_llama_forward` and `f32_qwen_forward` rather than the native
+build, so the oracle there trusts no floating-point boundary at all. Weights are
+handed to both sides as raw binary32 bit patterns, so the reference and the
+mirror start from identical values and the only difference is the reduction
+order. The tables in `RESULTS.md` put the Llama divergence in the same range as
+GPT-2's and the Qwen divergence about an order of magnitude higher, which is
+what a recurrence that carries a state matrix across the sequence, on top of a
+logarithm and a convolution, predicts. No configuration produced a next-token
+disagreement there either.
+
 ## Building and running
 
 Requires Rocq 9 with `coq-flocq`, and OCaml (4.14 or later). The GPT-2 fetch and
@@ -484,8 +522,21 @@ python scripts/qwen_setup.py
 # rotary_dim, ff, vocab, deltanet heads, deltanet head_dim, conv kernel, ids.
 ./qwen_talk_native qwen.safetensors 1024 24 8 2 256 64 3584 248320 16 128 4 <ids>
 
-# Chat. Tokenization runs locally; the verified forward runs on the host.
-python scripts/llama_chat.py "What is the capital of France?"
+# Chat against either model. Tokenization runs in the script; the verified
+# forward runs in the built runner.
+python scripts/chat.py smollm "What is the capital of France?"
+python scripts/chat.py qwen "What is the capital of France?"
+
+# The inductive references for the two later architectures, which trust no
+# floating-point boundary, and the differential sweep that measures a numpy
+# float32 implementation of the same operations against them.
+cd theories
+rocq compile -R . "" Llama_inductive.v
+rocq compile -R . "" Qwen_inductive.v
+cd ..
+ocamlopt -rectypes -w -a -I theories theories/llama_inductive.mli theories/llama_inductive.ml runners/llama_ref.ml -o llama_ref
+ocamlopt -rectypes -w -a -I theories theories/qwen_inductive.mli theories/qwen_inductive.ml runners/qwen_ref.ml -o qwen_ref
+python scripts/experiment_arch.py
 ```
 
 The integer path has its own build. `make -C tools` compiles the development,
@@ -506,9 +557,10 @@ calls `f32_load_model` to assemble the typed weights, and calls
 |------|----------|
 | `theories/Phases1_15_complete.v` | The development: definitions, proofs, and the inductive extraction. |
 | `theories/Float_error.v` | Numerical semantics: correct rounding per operation, the native build's rounding step, and the composed error bounds for the dot product and the whole forward pass. |
-| `theories/Llama.v` | Llama primitives: RMSNorm, SiLU, and `f32_sin`/`f32_cos` for RoPE. |
+| `theories/Llama.v` | Llama primitives: RMSNorm, SiLU, `f32_sin`/`f32_cos` for RoPE, rotary embedding, slicing and SwiGLU; then the layer, the stack and the forward pass. |
 | `theories/Qwen.v` | Qwen3.5 primitives: the logarithm and softplus the DeltaNet decay needs, Euclidean normalisation, the two extra RMSNorm variants, the depthwise causal convolution, the gated delta rule, and partial RoPE; then the layers they assemble into, the stack and the forward pass. |
-| `theories/Extract.v` | Native re-extraction mapping `binary32` to hardware float; emits both the GPT-2 and Llama targets. |
+| `theories/Extract.v` | Native re-extraction mapping `binary32` to hardware float; emits the GPT-2, Llama and Qwen3.5 targets. |
+| `theories/Llama_inductive.v`, `theories/Qwen_inductive.v` | Inductive extraction of the two later architectures, with no trusted float boundary; the oracle the differential harness measures against. |
 | `theories/Receipt.v` | Inference receipt, the checker `verify_receipt`, and its soundness and completeness. |
 | `theories/Audit.v` | `Print Assumptions` report for the headline theorems. |
 | `runners/gpt2_talk.ml` | GPT-2 runner against the inductive extraction (exact). |
@@ -516,14 +568,17 @@ calls `f32_load_model` to assemble the typed weights, and calls
 | `runners/llama_talk_native.ml` | SmolLM2 runner: the verified Llama forward and greedy generation. |
 | `runners/qwen_talk_native.ml` | Qwen3.5 runner: the verified gated-DeltaNet and gated-attention forward. |
 | `runners/ref_logits.ml` | Smaller runner using the verified list-based loader on toy models. |
+| `runners/llama_ref.ml`, `runners/qwen_ref.ml` | The Llama and Qwen3.5 forwards against the inductive extraction, on small models. |
 | `runners/float_smoke.ml`, `runners/float_load_run.ml`, `runners/test_bplus.ml` | Small drivers for the float path. |
 | `scripts/gpt2_setup.py` | Fetches GPT-2, saves f32 weights with the loader's tensor names, prints the PyTorch reference. |
 | `scripts/smollm_setup.py` | Fetches SmolLM2, saves f32 weights and rotary frequencies, prints the PyTorch oracle. |
 | `scripts/qwen_setup.py` | Fetches Qwen3.5-0.8B, saves the text decoder as f32 weights, prints the PyTorch oracle. |
-| `scripts/llama_chat.py` | Interactive chat: local tokenization, verified forward on the host. |
-| `scripts/llama_receipt.py` | Emit and verify proof-carrying receipts for generated answers. |
+| `scripts/models.py` | The models the runners can be driven against, and how to reach one. |
+| `scripts/chat.py` | Interactive chat against either model: local tokenization, verified forward in the runner. |
+| `scripts/receipt.py` | Emit and verify proof-carrying receipts for generated answers. |
 | `scripts/tiny_gpt2_ref.py` | numpy reference of the identical computation, and a tiny `.safetensors` generator. |
-| `scripts/experiment_gen.py`, `scripts/experiment_cmp.py` | Differential-testing harness: generate models, compare the reference against numpy. |
+| `scripts/experiment_gen.py`, `scripts/experiment_cmp.py` | Differential-testing harness for GPT-2: generate models, compare the reference against numpy. |
+| `scripts/arch_ref.py`, `scripts/experiment_arch.py` | numpy mirrors of the Llama and Qwen3.5 forwards, and the sweep that compares them against the inductive reference. |
 | `scripts/run_batch.sh`, `scripts/run_float_demo.sh` | Drive the harness and the toy-model demo. |
 | `tools/` | Makefile and OCaml I/O wrapper that export the integer example networks to `.safetensors`. |
 

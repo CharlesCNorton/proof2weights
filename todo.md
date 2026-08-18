@@ -1,54 +1,38 @@
 # Outstanding work
 
-## Llama propagation lemmas
+## The Llama and Qwen forward bounds, composed
 
-`theories/Llama.v` has shape lemmas and no propagation lemmas. `f32_rmsnorm`,
-`f32_silu_vec`, `f32_sin` and `f32_cos` need `ok_` forms before the Llama
-forward can carry a bound. `f32_sin` and `f32_cos` reduce the argument with the
-add-then-subtract magic-constant trick, which is a branch on magnitude in
-disguise and needs its own premise, as the exponential's saturation does.
-`ok_silu_vec` in `theories/Float_error.v` already covers `f32_silu_vec`, and
-`ok_rms_scale` covers everything `f32_rmsnorm` needs except the final weight
-multiply, so the remaining work is concentrated in the trigonometry.
+`theories/Float_error.v` carries the propagation relation over every Llama and
+Qwen3.5 primitive, and over the Qwen layer, stack and logits. The Llama layer
+has its pieces bounded but no composed statement of its own yet: what is
+missing is the counterpart of `ok_qwen_wrap` for `f32_llama_layer`, and a stack
+relation over it. Everything it would rest on is already proved.
 
-## Differential harness beyond GPT-2
+The trigonometric bounds are stated on the reduced argument, since the magic
+constant reduction is the identity in exact arithmetic and the rounding step in
+binary32. Carrying a bound across the reduction itself would need a relation
+between the two evaluations rather than the propagation relation used here.
 
-`scripts/experiment_gen.py` and `experiment_cmp.py` sweep the GPT-2 reference
-against a numpy float32 implementation of the identical operations, and
-`RESULTS.md` reports it. Neither the Llama nor the Qwen path has a numpy mirror
-or a differential table.
+## Regularity witnesses
 
-## Inductive runner for Qwen
-
-`runners/ref_logits.ml` runs the GPT-2 stack against the inductive extraction,
-which is the proof artifact rather than the trusted fast path. Qwen has only a
-native runner. An inductive Qwen runner would be slow enough that a toy
-configuration is the only practical target.
-
-## Qwen runner surface
-
-`runners/qwen_talk_native.ml` takes one prompt and exits.
-`runners/llama_talk_native.ml` additionally holds weights resident and answers
-queries from stdin, which is what `scripts/llama_chat.py` drives. Qwen has no
-serve mode and no chat driver.
-
-## Receipts beyond SmolLM2
-
-`theories/Receipt.v` and `scripts/llama_receipt.py` bind a generation to a
-weight checksum, a prompt, an output sequence and the IEEE-754 semantics. The
-script is SmolLM2-specific; the Qwen runner emits no checksum line.
-
-## Setup scripts since the work-directory change
-
-`scripts/gpt2_setup.py` and `scripts/smollm_setup.py` have not been re-run since
-the `P2W_WORK` change. The Coq and OCaml halves of the build, including
-`make -C tools all` and `make -C tools verify`, now run end to end from a fresh
-clone on a single host.
+`f32_dot_regular` has a witness, so the dot-product bounds are visibly not
+vacuous, and `f32_dot_backward_ones` reuses it. The larger records the layer
+bounds rest on, `exp_reg`, `ln_reg`, `ca_reg`, `log_reg`, `rms_reg`,
+`dstep_reg` and the rest, have none. Exhibiting one satisfying assignment per
+record would put the composed statements on the same footing.
 
 ## Bound tightness
 
-The forward-pass bound is worst-case and compounds with depth, so at GPT-2
-scale it is far larger than the divergence `RESULTS.md` measures. A running
-bound in the style of `f32_dot_err_bound`, or a backward-error statement that
-exhibits the computed result as the exact evaluation of a perturbed expression,
-would both be tighter.
+The forward bound is worst-case and compounds with depth, so at GPT-2 scale it
+is far larger than the divergence `RESULTS.md` measures. `f32_dot_backward`
+gives the backward-error form for the dot product, where the perturbation is
+relative and sized by that one product. Carrying the same treatment up through
+the linear layers and the block would replace the compounding forward bound
+with a perturbation of the weights.
+
+## Scale of the architecture sweep
+
+`scripts/experiment_arch.py` sweeps four samples per configuration against the
+inductive reference, which is slow enough that the models are small. The GPT-2
+sweep runs sixteen samples over wider models. Raising the architecture sweep to
+the same scale wants either the native extraction as the oracle or more patience.
