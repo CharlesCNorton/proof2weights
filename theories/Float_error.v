@@ -6642,3 +6642,24 @@ Proof.
   - replace (1 / 1 + 1 / (1 * 1)) with 2 by field. lra.
   - rewrite Hs. replace (1 / (2 * 1)) with (/ 2) by field. lra.
 Qed.
+
+(** Two facts the remaining witnesses need. Squaring cannot leave the unit
+    disc, which bounds the exponential's eight iterations without evaluating
+    the rational they produce; and a square root whose radicand is a rational
+    square can be read off, which is what a witness needs where the relation
+    passes through [sqrt]. *)
+Lemma iter_sq_le_one : forall i v, Rabs v <= 1 -> Rabs (Nat.iter i Re_sq v) <= 1.
+Proof.
+  induction i as [|i IH]; intros v H; simpl; [exact H|].
+  unfold Re_sq at 1. rewrite Rabs_mult.
+  pose proof (IH v H). pose proof (Rabs_pos (Nat.iter i Re_sq v)). nra.
+Qed.
+
+Lemma sqrt_of_sq : forall (t : binary32) (q : Q),
+  (0 <= q)%Q -> (Qb t == q * q)%Q -> sqrt (B2R t) = Q2R q.
+Proof.
+  intros t q Hq He.
+  rewrite Qb_correct, (Qeq_eqR _ _ He), Q2R_mult.
+  apply sqrt_square. apply Qle_Rle in Hq.
+  replace (Q2R 0) with 0 in Hq by (unfold Q2R; simpl; lra). exact Hq.
+Qed.
