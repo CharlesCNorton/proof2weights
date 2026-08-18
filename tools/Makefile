@@ -7,7 +7,8 @@
 
 COQC ?= coqc
 OCAMLC ?= ocamlc
-PYTHON ?= python
+# python3 on Linux, python on Windows; override with PYTHON=... for a venv.
+PYTHON ?= $(shell command -v python3 2>/dev/null || command -v python 2>/dev/null || echo python3)
 
 THEORIES = ../theories
 STEM = phases1_15_complete
