@@ -23,6 +23,8 @@ nul
 /theories/phases1_15_native.ml
 /theories/llama_native.ml
 /theories/qwen_native.ml
+/theories/llama_inductive.ml
+/theories/qwen_inductive.ml
 /*.mli
 /phases1_15_complete.ml
 /phases1_15_native.ml
@@ -40,7 +42,9 @@ nul
 
 # Differential-testing harness output.
 /expbatch/
+/archbatch/
 /coq_out.txt
+*.w
 
 # Fixtures and binaries the demo scripts build in place.
 /tiny_gpt2_ref_logits.txt
