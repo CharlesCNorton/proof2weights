@@ -334,3 +334,198 @@ Proof.
   intros. unfold f32_delta_prep_q.
   rewrite List.length_map. apply f32_l2norm_length.
 Qed.
+
+(** * The layers, assembled
+
+    The primitives above are what one Qwen3.5 layer is built from; these are the
+    layers themselves, in the order the runner composes them. A DeltaNet layer
+    projects the input to a fused query/key/value triple, passes it through the
+    depthwise causal convolution, runs the gated delta recurrence per head,
+    normalises each head against its own gate, and projects back. A gated
+    attention layer normalises the per-head query and key, rotates a prefix of
+    each, attends causally, gates the output and projects back. Both sit inside
+    the same residual pair with a SwiGLU feed-forward. *)
+
+Definition f32_slice (off len : nat) (r : list binary32) : list binary32 :=
+  List.firstn len (List.skipn off r).
+
+Lemma f32_slice_length : forall off len r,
+  (off + len <= List.length r)%nat -> List.length (f32_slice off len r) = len.
+Proof.
+  intros off len r H. unfold f32_slice.
+  rewrite List.length_firstn, List.length_skipn. lia.
+Qed.
+
+Record qwen_delta_weights := mk_qwen_delta_weights {
+  qd_in_qkv : list (list binary32);
+  qd_in_z : list (list binary32);
+  qd_in_a : list (list binary32);
+  qd_in_b : list (list binary32);
+  qd_conv_w : list (list binary32);
+  qd_a_log : list binary32;
+  qd_dt_bias : list binary32;
+  qd_norm_w : list binary32;
+  qd_out : list (list binary32)
+}.
+
+Record qwen_attn_weights := mk_qwen_attn_weights {
+  qa_q : list (list binary32);
+  qa_k : list (list binary32);
+  qa_v : list (list binary32);
+  qa_o : list (list binary32);
+  qa_q_norm : list binary32;
+  qa_k_norm : list binary32
+}.
+
+Record qwen_mlp_weights := mk_qwen_mlp_weights {
+  qm_gate : list (list binary32);
+  qm_up : list (list binary32);
+  qm_down : list (list binary32)
+}.
+
+(** One DeltaNet head over the whole sequence: prepare the query and key, read
+    the value, form the decay and the correction rate, and scan. *)
+Definition f32_qwen_delta_head (ldim lhd : nat) (eps : binary32)
+    (alog dtb : list binary32) (hh : nat)
+    (c : list (list binary32)) (av bv : list (list binary32))
+    : list (list binary32) :=
+  let qs := List.map (fun r => f32_delta_prep_q eps lhd (f32_slice (hh * lhd) lhd r)) c in
+  let ks := List.map (fun r => f32_l2norm eps (f32_slice (ldim + hh * lhd) lhd r)) c in
+  let vs := List.map (fun r => f32_slice (2 * ldim + hh * lhd) lhd r) c in
+  let betas := List.map (fun r => f32_sigmoid (List.nth hh r f32_zero)) bv in
+  let gs := List.map (fun r => f32_delta_decay (List.nth hh alog f32_zero)
+                                 (List.nth hh dtb f32_zero)
+                                 (List.nth hh r f32_zero)) av in
+  f32_delta_scan betas gs qs ks vs (f32_delta_state0 lhd lhd).
+
+(** One head's contribution, after the scan: each token's state read-out is
+    normalised against its own slice of the gate stream. *)
+Definition f32_qwen_delta_head_out (ldim lhd : nat) (eps : binary32)
+    (nw alog dtb : list binary32) (hh : nat)
+    (c av bv zs : list (list binary32)) : list (list binary32) :=
+  List.map (fun p => let '(zr, o) := p in
+              f32_rmsnorm_gated nw eps (f32_slice (hh * lhd) lhd zr) o)
+           (List.combine zs (f32_qwen_delta_head ldim lhd eps alog dtb hh c av bv)).
+
+Definition f32_qwen_delta_mix (lnh lhd ck : nat) (eps : binary32)
+    (w : qwen_delta_weights) (hn : list (list binary32)) : list (list binary32) :=
+  let ldim := (lnh * lhd)%nat in
+  let qkv := List.map (fun h => f32_mat_vec_mul (qd_in_qkv w) h) hn in
+  let c := f32_causal_conv1d (3 * ldim) ck (qd_conv_w w) [] qkv in
+  let zs := List.map (fun h => f32_mat_vec_mul (qd_in_z w) h) hn in
+  let av := List.map (fun h => f32_mat_vec_mul (qd_in_a w) h) hn in
+  let bv := List.map (fun h => f32_mat_vec_mul (qd_in_b w) h) hn in
+  let heads := List.map (fun hh =>
+      f32_qwen_delta_head_out ldim lhd eps (qd_norm_w w) (qd_a_log w) (qd_dt_bias w)
+                              hh c av bv zs)
+      (List.seq 0 lnh) in
+  List.map (fun t => f32_mat_vec_mul (qd_out w)
+              (List.concat (List.map (fun ho => List.nth t ho []) heads)))
+           (List.seq 0 (List.length hn)).
+
+Lemma f32_qwen_delta_mix_rows : forall lnh lhd ck eps w hn,
+  List.length (f32_qwen_delta_mix lnh lhd ck eps w hn) = List.length hn.
+Proof.
+  intros. unfold f32_qwen_delta_mix. cbv zeta.
+  rewrite List.length_map, List.length_seq. reflexivity.
+Qed.
+
+(** One gated full-attention layer over the whole sequence. The query stream
+    carries its gate interleaved with the query itself, which is why the query
+    projection is twice as wide as the head dimension. *)
+Definition f32_qwen_attn_mix (nh nkv hd rd : nat) (eps : binary32)
+    (w : qwen_attn_weights) (cosv sinv : list (list binary32))
+    (hn : list (list binary32)) : list (list binary32) :=
+  let qg := List.map (fun h => f32_mat_vec_mul (qa_q w) h) hn in
+  let kraw := List.map (fun h => f32_mat_vec_mul (qa_k w) h) hn in
+  let vraw := List.map (fun h => f32_mat_vec_mul (qa_v w) h) hn in
+  let group := Nat.div nh nkv in
+  let ks := List.map (fun c =>
+      List.map (fun p => let '(pos, r) := p in
+                  f32_partial_rope rd (List.nth pos cosv []) (List.nth pos sinv [])
+                    (f32_rmsnorm_zc (qa_k_norm w) eps (f32_slice (c * hd) hd r)))
+               (List.combine (List.seq 0 (List.length kraw)) kraw))
+      (List.seq 0 nkv) in
+  let vs := List.map (fun c => List.map (fun r => f32_slice (c * hd) hd r) vraw)
+                     (List.seq 0 nkv) in
+  let qs := List.map (fun hh =>
+      List.map (fun p => let '(pos, r) := p in
+                  f32_partial_rope rd (List.nth pos cosv []) (List.nth pos sinv [])
+                    (f32_rmsnorm_zc (qa_q_norm w) eps (f32_slice (hh * hd * 2) hd r)))
+               (List.combine (List.seq 0 (List.length qg)) qg))
+      (List.seq 0 nh) in
+  let heads := List.map (fun hh =>
+      f32_causal_attention (List.nth hh qs []) (List.nth (Nat.div hh group) ks [])
+                           (List.nth (Nat.div hh group) vs []) hd)
+      (List.seq 0 nh) in
+  let gates := List.map (fun r =>
+      List.concat (List.map (fun hh => f32_slice (hh * hd * 2 + hd) hd r)
+                            (List.seq 0 nh))) qg in
+  List.map (fun p => let '(g, o) := p in f32_mat_vec_mul (qa_o w) (f32_gate_sigmoid g o))
+           (List.combine gates (f32_concat_heads heads)).
+
+(** The residual pair both layer kinds sit in. *)
+Definition f32_qwen_wrap (eps : binary32) (ln1 ln2 : list binary32)
+    (mlp : qwen_mlp_weights)
+    (mix : list (list binary32) -> list (list binary32))
+    (h : list (list binary32)) : list (list binary32) :=
+  let hn := List.map (fun row => f32_rmsnorm_zc ln1 eps row) h in
+  let hidden2 := List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+                          (List.combine h (mix hn)) in
+  let h2 := List.map (fun row => f32_rmsnorm_zc ln2 eps row) hidden2 in
+  List.map (fun p => let '(a, b) := p in f32_vec_add a b)
+    (List.combine hidden2
+       (List.map (fun row => f32_swiglu (qm_gate mlp) (qm_up mlp) (qm_down mlp) row)
+                 h2)).
+
+(** The final norm and the tied-embedding logit projection. *)
+Definition f32_qwen_final (eps : binary32) (normw : list binary32)
+    (h : list (list binary32)) : list (list binary32) :=
+  List.map (fun row => f32_rmsnorm_zc normw eps row) h.
+
+Definition f32_qwen_logits (emb : list (list binary32))
+    (h : list (list binary32)) : list (list binary32) :=
+  List.map (fun hrow => List.map (fun wrow => f32_dot hrow wrow) emb) h.
+
+Lemma f32_qwen_logits_rows : forall emb h,
+  List.length (f32_qwen_logits emb h) = List.length h.
+Proof. intros. unfold f32_qwen_logits. apply List.length_map. Qed.
+
+Lemma f32_qwen_logits_row_width : forall emb h row,
+  In row (f32_qwen_logits emb h) -> List.length row = List.length emb.
+Proof.
+  intros emb h row Hin. unfold f32_qwen_logits in Hin.
+  apply List.in_map_iff in Hin. destruct Hin as [hr [Heq _]]. subst row.
+  apply List.length_map.
+Qed.
+
+(** * The stack and the forward pass
+
+    Qwen3.5 alternates layer kinds, so the stack is a list of layer forwards
+    rather than a list of uniform weight records; the runner picks the kind by
+    [i mod 4 = 3]. Composing them left to right is the whole of the forward,
+    followed by the final norm and the tied-embedding projection. *)
+
+Fixpoint f32_qwen_stack (fs : list (list (list binary32) -> list (list binary32)))
+                        (h : list (list binary32)) : list (list binary32) :=
+  match fs with
+  | [] => h
+  | f :: rest => f32_qwen_stack rest (f h)
+  end.
+
+Definition f32_qwen_forward (eps : binary32) (normw : list binary32)
+    (fs : list (list (list binary32) -> list (list binary32)))
+    (emb : list (list binary32)) (ids : list nat) : list (list binary32) :=
+  f32_qwen_final eps normw (f32_qwen_stack fs (f32_embed_tokens emb ids)).
+
+Definition f32_qwen_next_token_logits (eps : binary32) (normw : list binary32)
+    (fs : list (list (list binary32) -> list (list binary32)))
+    (emb : list (list binary32)) (ids : list nat) : list binary32 :=
+  match List.rev (f32_qwen_logits emb (f32_qwen_forward eps normw fs emb ids)) with
+  | [] => []
+  | last :: _ => last
+  end.
+
+Lemma f32_qwen_final_rows : forall eps normw h,
+  List.length (f32_qwen_final eps normw h) = List.length h.
+Proof. intros. unfold f32_qwen_final. apply List.length_map. Qed.

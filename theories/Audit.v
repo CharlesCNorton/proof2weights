@@ -65,3 +65,22 @@ Print Assumptions ok_block_forward.
 Print Assumptions ok_blocks_forward.
 Print Assumptions ok_gpt2_forward.
 Print Assumptions ok_gpt2_logits_full.
+
+(** The Qwen3.5 primitives, and the same chain up to its logits. *)
+Print Assumptions ok_log_unit.
+Print Assumptions ok_softplus.
+Print Assumptions ok_rmsnorm_zc.
+Print Assumptions ok_rmsnorm_gated.
+Print Assumptions ok_conv_step.
+Print Assumptions ok_causal_conv1d.
+Print Assumptions ok_delta_step.
+Print Assumptions ok_delta_scan.
+Print Assumptions ok_partial_rope.
+Print Assumptions ok_swiglu.
+Print Assumptions ok_delta_prep_q.
+Print Assumptions ok_qwen_delta_mix.
+Print Assumptions ok_qwen_attn_mix.
+Print Assumptions ok_qwen_wrap.
+Print Assumptions ok_qwen_stack.
+Print Assumptions ok_qwen_forward.
+Print Assumptions ok_qwen_logits_full.

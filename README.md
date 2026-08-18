@@ -257,10 +257,14 @@ and those eight tokens together take five and a half minutes.
 
 The primitives are defined in Rocq with their shape lemmas and extracted, so
 the arithmetic that runs is the arithmetic the definitions specify.
-`theories/Float_error.v` carries the propagation relation over them as well:
-the comparison-based maximum, the absolute value, SiLU, the decay term,
-Euclidean normalisation, the squared entries and the shared RMSNorm scale
-factor, and the output gate.
+`theories/Float_error.v` carries the propagation relation over every one of
+them and on to the logits: the logarithm and softplus, both RMSNorm variants,
+the depthwise convolution and its window, the gated delta step and the scan
+that threads its state, partial rotary embedding, SwiGLU, and the query
+preparation. `theories/Qwen.v` then assembles the layers those primitives make
+up, and the error file bounds the two mixers, the residual pair they sit in,
+the alternating stack and the tied-embedding projection, so the composed bound
+reaches the Qwen logits the way it reaches the GPT-2 logits.
 
 ## Proof-carrying receipts
 
@@ -356,6 +360,11 @@ The development proves:
   primitives through layer normalization, the exponential, softmax, causal
   attention, the transformer block and the block stack, to the logits
   (`theories/Float_error.v`).
+- The same bound over the Qwen3.5 primitives and up to its logits: the
+  logarithm, softplus, both RMSNorm variants, the depthwise causal convolution,
+  the gated delta step and scan, partial rotary embedding, SwiGLU and the query
+  preparation, then the two mixers, the residual pair, the alternating stack
+  and the tied-embedding projection (`theories/Float_error.v`).
 
 The float arithmetic is exactly Flocq's, and each operation is proved to land
 within half a ULP of the exact real result, so the extracted executable is a
@@ -498,7 +507,7 @@ calls `f32_load_model` to assemble the typed weights, and calls
 | `theories/Phases1_15_complete.v` | The development: definitions, proofs, and the inductive extraction. |
 | `theories/Float_error.v` | Numerical semantics: correct rounding per operation, the native build's rounding step, and the composed error bounds for the dot product and the whole forward pass. |
 | `theories/Llama.v` | Llama primitives: RMSNorm, SiLU, and `f32_sin`/`f32_cos` for RoPE. |
-| `theories/Qwen.v` | Qwen3.5 primitives: the logarithm and softplus the DeltaNet decay needs, Euclidean normalisation, the two extra RMSNorm variants, the depthwise causal convolution, the gated delta rule, and partial RoPE. |
+| `theories/Qwen.v` | Qwen3.5 primitives: the logarithm and softplus the DeltaNet decay needs, Euclidean normalisation, the two extra RMSNorm variants, the depthwise causal convolution, the gated delta rule, and partial RoPE; then the layers they assemble into, the stack and the forward pass. |
 | `theories/Extract.v` | Native re-extraction mapping `binary32` to hardware float; emits both the GPT-2 and Llama targets. |
 | `theories/Receipt.v` | Inference receipt, the checker `verify_receipt`, and its soundness and completeness. |
 | `theories/Audit.v` | `Print Assumptions` report for the headline theorems. |
