@@ -5590,62 +5590,82 @@ Qed.
 
 (** * Sine and cosine
 
-    The argument reduction rounds by adding and subtracting a magic constant.
-    In exact real arithmetic that pair of operations is the identity, while in
-    binary32 it is what selects the nearest multiple of two pi, so the reduction
-    is not something the propagation relation can carry across: the two
-    evaluations deliberately disagree. The bounds below are therefore stated on
-    the reduced argument, with whatever real value the reduction settled on
-    supplied by the caller, and they carry the Taylor polynomial from there.
-    This is the same treatment the exponential's saturation gets, where the
-    premise is that the float and the real evaluation follow one path. *)
+    The argument reduction rounds by adding and subtracting a magic constant
+    and then subtracts a Cody-Waite split of two pi. In exact real arithmetic
+    that rounding step is not the identity, so the reduction is not something
+    the propagation relation can carry across: the two evaluations deliberately
+    disagree there. The bounds below are therefore stated on the reduced
+    argument, with whatever real value the reduction settled on supplied by
+    the caller, and they carry the Taylor polynomial from there. This is the
+    same treatment the exponential's saturation gets. Approx.v bounds the same
+    polynomials against [sin] and [cos] themselves. *)
 
-Definition s_r2  (r : binary32) : binary32 := f32_mult r r.
-Definition s_r3  (r : binary32) : binary32 := f32_mult (s_r2 r) r.
-Definition s_r5  (r : binary32) : binary32 := f32_mult (s_r3 r) (s_r2 r).
-Definition s_r7  (r : binary32) : binary32 := f32_mult (s_r5 r) (s_r2 r).
-Definition s_r9  (r : binary32) : binary32 := f32_mult (s_r7 r) (s_r2 r).
+Definition s_r2 (r : binary32) : binary32 := f32_mult r r.
+Definition s_r3 (r : binary32) : binary32 := f32_mult (s_r2 r) (r).
+Definition s_r5 (r : binary32) : binary32 := f32_mult (s_r3 r) (s_r2 r).
+Definition s_r7 (r : binary32) : binary32 := f32_mult (s_r5 r) (s_r2 r).
+Definition s_r9 (r : binary32) : binary32 := f32_mult (s_r7 r) (s_r2 r).
 Definition s_r11 (r : binary32) : binary32 := f32_mult (s_r9 r) (s_r2 r).
-
-Definition s_d3  (r : binary32) : binary32 := f32_div (s_r3 r) f32_fac3.
-Definition s_d5  (r : binary32) : binary32 := f32_div (s_r5 r) f32_fac5.
-Definition s_d7  (r : binary32) : binary32 := f32_div (s_r7 r) f32_fac7.
-Definition s_d9  (r : binary32) : binary32 := f32_div (s_r9 r) f32_fac9.
+Definition s_r13 (r : binary32) : binary32 := f32_mult (s_r11 r) (s_r2 r).
+Definition s_r15 (r : binary32) : binary32 := f32_mult (s_r13 r) (s_r2 r).
+Definition s_r17 (r : binary32) : binary32 := f32_mult (s_r15 r) (s_r2 r).
+Definition s_r19 (r : binary32) : binary32 := f32_mult (s_r17 r) (s_r2 r).
+Definition s_d3 (r : binary32) : binary32 := f32_div (s_r3 r) f32_fac3.
+Definition s_d5 (r : binary32) : binary32 := f32_div (s_r5 r) f32_fac5.
+Definition s_d7 (r : binary32) : binary32 := f32_div (s_r7 r) f32_fac7.
+Definition s_d9 (r : binary32) : binary32 := f32_div (s_r9 r) f32_fac9.
 Definition s_d11 (r : binary32) : binary32 := f32_div (s_r11 r) f32_fac11.
-
-Definition s_t1 (r : binary32) : binary32 := f32_minus r (s_d3 r).
-Definition s_t2 (r : binary32) : binary32 := f32_plus (s_t1 r) (s_d5 r).
-Definition s_t3 (r : binary32) : binary32 := f32_minus (s_t2 r) (s_d7 r).
-Definition s_t4 (r : binary32) : binary32 := f32_plus (s_t3 r) (s_d9 r).
-Definition s_poly (r : binary32) : binary32 := f32_minus (s_t4 r) (s_d11 r).
+Definition s_d13 (r : binary32) : binary32 := f32_div (s_r13 r) f32_fac13.
+Definition s_d15 (r : binary32) : binary32 := f32_div (s_r15 r) f32_fac15.
+Definition s_d17 (r : binary32) : binary32 := f32_div (s_r17 r) f32_fac17.
+Definition s_d19 (r : binary32) : binary32 := f32_div (s_r19 r) f32_fac19.
+Definition s_a0 (r : binary32) : binary32 := f32_minus (s_d17 r) (s_d19 r).
+Definition s_a1 (r : binary32) : binary32 := f32_minus (s_a0 r) (s_d15 r).
+Definition s_a2 (r : binary32) : binary32 := f32_plus (s_a1 r) (s_d13 r).
+Definition s_a3 (r : binary32) : binary32 := f32_minus (s_a2 r) (s_d11 r).
+Definition s_a4 (r : binary32) : binary32 := f32_plus (s_a3 r) (s_d9 r).
+Definition s_a5 (r : binary32) : binary32 := f32_minus (s_a4 r) (s_d7 r).
+Definition s_a6 (r : binary32) : binary32 := f32_plus (s_a5 r) (s_d5 r).
+Definition s_a7 (r : binary32) : binary32 := f32_minus (s_a6 r) (s_d3 r).
+Definition s_poly (r : binary32) : binary32 := f32_plus r (s_a7 r).
 
 Lemma f32_sin_stages : forall x, f32_sin x = s_poly (f32_reduce_2pi x).
 Proof.
   intros x. unfold f32_sin. cbv zeta.
-  unfold s_poly, s_t4, s_t3, s_t2, s_t1,
-         s_d11, s_d9, s_d7, s_d5, s_d3,
-         s_r11, s_r9, s_r7, s_r5, s_r3, s_r2.
+  unfold s_poly, s_a7, s_a6, s_a5, s_a4, s_a3, s_a2, s_a1, s_a0, s_d19,
+         s_d17, s_d15, s_d13, s_d11, s_d9, s_d7, s_d5, s_d3, s_r19,
+         s_r17, s_r15, s_r13, s_r11, s_r9, s_r7, s_r5, s_r3, s_r2.
   reflexivity.
 Qed.
 
-Definition Rs_r2  (rr : R) : R := rr * rr.
-Definition Rs_r3  (rr : R) : R := Rs_r2 rr * rr.
-Definition Rs_r5  (rr : R) : R := Rs_r3 rr * Rs_r2 rr.
-Definition Rs_r7  (rr : R) : R := Rs_r5 rr * Rs_r2 rr.
-Definition Rs_r9  (rr : R) : R := Rs_r7 rr * Rs_r2 rr.
-Definition Rs_r11 (rr : R) : R := Rs_r9 rr * Rs_r2 rr.
-
-Definition Rs_d3  (rr : R) : R := Rs_r3 rr / B2R f32_fac3.
-Definition Rs_d5  (rr : R) : R := Rs_r5 rr / B2R f32_fac5.
-Definition Rs_d7  (rr : R) : R := Rs_r7 rr / B2R f32_fac7.
-Definition Rs_d9  (rr : R) : R := Rs_r9 rr / B2R f32_fac9.
+Definition Rs_r2 (rr : R) : R := rr * rr.
+Definition Rs_r3 (rr : R) : R := (Rs_r2 rr) * (rr).
+Definition Rs_r5 (rr : R) : R := (Rs_r3 rr) * (Rs_r2 rr).
+Definition Rs_r7 (rr : R) : R := (Rs_r5 rr) * (Rs_r2 rr).
+Definition Rs_r9 (rr : R) : R := (Rs_r7 rr) * (Rs_r2 rr).
+Definition Rs_r11 (rr : R) : R := (Rs_r9 rr) * (Rs_r2 rr).
+Definition Rs_r13 (rr : R) : R := (Rs_r11 rr) * (Rs_r2 rr).
+Definition Rs_r15 (rr : R) : R := (Rs_r13 rr) * (Rs_r2 rr).
+Definition Rs_r17 (rr : R) : R := (Rs_r15 rr) * (Rs_r2 rr).
+Definition Rs_r19 (rr : R) : R := (Rs_r17 rr) * (Rs_r2 rr).
+Definition Rs_d3 (rr : R) : R := Rs_r3 rr / B2R f32_fac3.
+Definition Rs_d5 (rr : R) : R := Rs_r5 rr / B2R f32_fac5.
+Definition Rs_d7 (rr : R) : R := Rs_r7 rr / B2R f32_fac7.
+Definition Rs_d9 (rr : R) : R := Rs_r9 rr / B2R f32_fac9.
 Definition Rs_d11 (rr : R) : R := Rs_r11 rr / B2R f32_fac11.
-
-Definition Rs_t1 (rr : R) : R := rr - Rs_d3 rr.
-Definition Rs_t2 (rr : R) : R := Rs_t1 rr + Rs_d5 rr.
-Definition Rs_t3 (rr : R) : R := Rs_t2 rr - Rs_d7 rr.
-Definition Rs_t4 (rr : R) : R := Rs_t3 rr + Rs_d9 rr.
-Definition Rs_poly (rr : R) : R := Rs_t4 rr - Rs_d11 rr.
+Definition Rs_d13 (rr : R) : R := Rs_r13 rr / B2R f32_fac13.
+Definition Rs_d15 (rr : R) : R := Rs_r15 rr / B2R f32_fac15.
+Definition Rs_d17 (rr : R) : R := Rs_r17 rr / B2R f32_fac17.
+Definition Rs_d19 (rr : R) : R := Rs_r19 rr / B2R f32_fac19.
+Definition Rs_a0 (rr : R) : R := Rs_d17 rr - Rs_d19 rr.
+Definition Rs_a1 (rr : R) : R := Rs_a0 rr - Rs_d15 rr.
+Definition Rs_a2 (rr : R) : R := Rs_a1 rr + Rs_d13 rr.
+Definition Rs_a3 (rr : R) : R := Rs_a2 rr - Rs_d11 rr.
+Definition Rs_a4 (rr : R) : R := Rs_a3 rr + Rs_d9 rr.
+Definition Rs_a5 (rr : R) : R := Rs_a4 rr - Rs_d7 rr.
+Definition Rs_a6 (rr : R) : R := Rs_a5 rr + Rs_d5 rr.
+Definition Rs_a7 (rr : R) : R := Rs_a6 rr - Rs_d3 rr.
+Definition Rs_poly (rr : R) : R := rr + Rs_a7 rr.
 
 Record sin_reg (M m : R) (r : binary32) (rr : R) : Prop := {
   snr_fin3 : is_finite f32_fac3 = true;
@@ -5653,17 +5673,25 @@ Record sin_reg (M m : R) (r : binary32) (rr : R) : Prop := {
   snr_fin7 : is_finite f32_fac7 = true;
   snr_fin9 : is_finite f32_fac9 = true;
   snr_fin11 : is_finite f32_fac11 = true;
+  snr_fin13 : is_finite f32_fac13 = true;
+  snr_fin15 : is_finite f32_fac15 = true;
+  snr_fin17 : is_finite f32_fac17 = true;
+  snr_fin19 : is_finite f32_fac19 = true;
   snr_m3 : m <= Rabs (B2R f32_fac3);
   snr_m5 : m <= Rabs (B2R f32_fac5);
   snr_m7 : m <= Rabs (B2R f32_fac7);
   snr_m9 : m <= Rabs (B2R f32_fac9);
   snr_m11 : m <= Rabs (B2R f32_fac11);
+  snr_m13 : m <= Rabs (B2R f32_fac13);
+  snr_m15 : m <= Rabs (B2R f32_fac15);
+  snr_m17 : m <= Rabs (B2R f32_fac17);
+  snr_m19 : m <= Rabs (B2R f32_fac19);
   snr_br : Rabs (B2R r) <= M;
   snr_brr : Rabs rr <= M;
   snr_z2 : regz M (B2R r * B2R r);
   snr_b2 : Rabs (B2R (s_r2 r)) <= M;
   snr_b2r : Rabs (Rs_r2 rr) <= M;
-  snr_z3 : regz M (B2R (s_r2 r) * B2R r);
+  snr_z3 : regz M (B2R (s_r2 r) * B2R (r));
   snr_b3 : Rabs (B2R (s_r3 r)) <= M;
   snr_b3r : Rabs (Rs_r3 rr) <= M;
   snr_z5 : regz M (B2R (s_r3 r) * B2R (s_r2 r));
@@ -5676,169 +5704,278 @@ Record sin_reg (M m : R) (r : binary32) (rr : R) : Prop := {
   snr_b9 : Rabs (B2R (s_r9 r)) <= M;
   snr_b9r : Rabs (Rs_r9 rr) <= M;
   snr_z11 : regz M (B2R (s_r9 r) * B2R (s_r2 r));
+  snr_b11 : Rabs (B2R (s_r11 r)) <= M;
   snr_b11r : Rabs (Rs_r11 rr) <= M;
+  snr_z13 : regz M (B2R (s_r11 r) * B2R (s_r2 r));
+  snr_b13 : Rabs (B2R (s_r13 r)) <= M;
+  snr_b13r : Rabs (Rs_r13 rr) <= M;
+  snr_z15 : regz M (B2R (s_r13 r) * B2R (s_r2 r));
+  snr_b15 : Rabs (B2R (s_r15 r)) <= M;
+  snr_b15r : Rabs (Rs_r15 rr) <= M;
+  snr_z17 : regz M (B2R (s_r15 r) * B2R (s_r2 r));
+  snr_b17 : Rabs (B2R (s_r17 r)) <= M;
+  snr_b17r : Rabs (Rs_r17 rr) <= M;
+  snr_z19 : regz M (B2R (s_r17 r) * B2R (s_r2 r));
+  snr_b19r : Rabs (Rs_r19 rr) <= M;
   snr_zd3 : regz M (B2R (s_r3 r) / B2R f32_fac3);
   snr_zd5 : regz M (B2R (s_r5 r) / B2R f32_fac5);
   snr_zd7 : regz M (B2R (s_r7 r) / B2R f32_fac7);
   snr_zd9 : regz M (B2R (s_r9 r) / B2R f32_fac9);
   snr_zd11 : regz M (B2R (s_r11 r) / B2R f32_fac11);
-  snr_zt1 : regz M (B2R r + B2R (f32_neg (s_d3 r)));
-  snr_zt2 : regz M (B2R (s_t1 r) + B2R (s_d5 r));
-  snr_zt3 : regz M (B2R (s_t2 r) + B2R (f32_neg (s_d7 r)));
-  snr_zt4 : regz M (B2R (s_t3 r) + B2R (s_d9 r));
-  snr_zt5 : regz M (B2R (s_t4 r) + B2R (f32_neg (s_d11 r)))
+  snr_zd13 : regz M (B2R (s_r13 r) / B2R f32_fac13);
+  snr_zd15 : regz M (B2R (s_r15 r) / B2R f32_fac15);
+  snr_zd17 : regz M (B2R (s_r17 r) / B2R f32_fac17);
+  snr_zd19 : regz M (B2R (s_r19 r) / B2R f32_fac19);
+  snr_zt0 : regz M (B2R (s_d17 r) + B2R (f32_neg (s_d19 r)));
+  snr_zt1 : regz M (B2R (s_a0 r) + B2R (f32_neg (s_d15 r)));
+  snr_zt2 : regz M (B2R (s_a1 r) + B2R (s_d13 r));
+  snr_zt3 : regz M (B2R (s_a2 r) + B2R (f32_neg (s_d11 r)));
+  snr_zt4 : regz M (B2R (s_a3 r) + B2R (s_d9 r));
+  snr_zt5 : regz M (B2R (s_a4 r) + B2R (f32_neg (s_d7 r)));
+  snr_zt6 : regz M (B2R (s_a5 r) + B2R (s_d5 r));
+  snr_zt7 : regz M (B2R (s_a6 r) + B2R (f32_neg (s_d3 r)));
+  snr_ztf : regz M (B2R r + B2R (s_a7 r))
 }.
 
-Lemma ok_sin_poly : forall M m L k r rr,
+Lemma ok_s_poly : forall M m L k r rr,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) r rr ->
   sin_reg M m r rr ->
-  ok (errN M L (k + 12)) (s_poly r) (Rs_poly rr).
+  ok (errN M L (k + 20)) (s_poly r) (Rs_poly rr).
 Proof.
   intros M m L k r rr HM Hamp Hr Hreg.
   assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
   assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
-  destruct Hreg as [Ef3 Ef5 Ef7 Ef9 Ef11 Em3 Em5 Em7 Em9 Em11
-                    Ebr Ebrr Ez2 Eb2 Eb2r Ez3 Eb3 Eb3r Ez5 Eb5 Eb5r
-                    Ez7 Eb7 Eb7r Ez9 Eb9 Eb9r Ez11 Eb11r
-                    Ezd3 Ezd5 Ezd7 Ezd9 Ezd11 Ezt1 Ezt2 Ezt3 Ezt4 Ezt5].
+  assert (Hone : forall j, ok (errN M L j) f32_one 1).
+  { intros j. replace 1 with (B2R f32_one) by apply f32_one_correct.
+    apply ok_const; [exact HM0 | exact HL1 | exact f32_one_finite]. }
+  destruct Hreg as [F3 F5 F7 F9 F11 F13 F15 F17 F19 Q3 Q5 Q7 Q9 Q11 Q13 Q15 Q17 Q19 Br Brr Z2 B2 B2r Z3 B3 B3r Z5 B5 B5r Z7 B7 B7r Z9 B9 B9r Z11 B11 B11r Z13 B13 B13r Z15 B15 B15r Z17 B17 B17r Z19 B19r Zd3 Zd5 Zd7 Zd9 Zd11 Zd13 Zd15 Zd17 Zd19 Zt0 Zt1 Zt2 Zt3 Zt4 Zt5 Zt6 Zt7 Ztf].
   assert (H2 : ok (errN M L (k + 1)) (s_r2 r) (Rs_r2 rr)).
   { unfold s_r2, Rs_r2. replace (k + 1)%nat with (S k)%nat by lia.
     eapply ok_mult_S with (m := m); eassumption. }
   assert (H3 : ok (errN M L (k + 2)) (s_r3 r) (Rs_r3 rr)).
   { unfold s_r3, Rs_r3. replace (k + 2)%nat with (S (k + 1))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hr]. }
+    - eapply ok_errN_mono with (n := k);
+        [exact HM0 | exact HL1 | lia | exact Hr].
+  }
   assert (H5 : ok (errN M L (k + 3)) (s_r5 r) (Rs_r5 rr)).
   { unfold s_r5, Rs_r5. replace (k + 3)%nat with (S (k + 2))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 1)%nat);
-      [exact HM0 | exact HL1 | lia | exact H2]. }
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
   assert (H7 : ok (errN M L (k + 4)) (s_r7 r) (Rs_r7 rr)).
   { unfold s_r7, Rs_r7. replace (k + 4)%nat with (S (k + 3))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 1)%nat);
-      [exact HM0 | exact HL1 | lia | exact H2]. }
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
   assert (H9 : ok (errN M L (k + 5)) (s_r9 r) (Rs_r9 rr)).
   { unfold s_r9, Rs_r9. replace (k + 5)%nat with (S (k + 4))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 1)%nat);
-      [exact HM0 | exact HL1 | lia | exact H2]. }
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
   assert (H11 : ok (errN M L (k + 6)) (s_r11 r) (Rs_r11 rr)).
   { unfold s_r11, Rs_r11. replace (k + 6)%nat with (S (k + 5))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 1)%nat);
-      [exact HM0 | exact HL1 | lia | exact H2]. }
-  assert (D3 : ok (errN M L (k + 7)) (s_d3 r) (Rs_d3 rr)).
-  { unfold s_d3, Rs_d3. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H13 : ok (errN M L (k + 7)) (s_r13 r) (Rs_r13 rr)).
+  { unfold s_r13, Rs_r13. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H15 : ok (errN M L (k + 8)) (s_r15 r) (Rs_r15 rr)).
+  { unfold s_r15, Rs_r15. replace (k + 8)%nat with (S (k + 7))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H17 : ok (errN M L (k + 9)) (s_r17 r) (Rs_r17 rr)).
+  { unfold s_r17, Rs_r17. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H19 : ok (errN M L (k + 10)) (s_r19 r) (Rs_r19 rr)).
+  { unfold s_r19, Rs_r19. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (D3 : ok (errN M L (k + 11)) (s_d3 r) (Rs_d3 rr)).
+  { unfold s_d3, Rs_d3. replace (k + 11)%nat with (S (k + 10))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 2)%nat);
         [exact HM0 | exact HL1 | lia | exact H3].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef3]. }
-  assert (D5 : ok (errN M L (k + 7)) (s_d5 r) (Rs_d5 rr)).
-  { unfold s_d5, Rs_d5. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F3]. }
+  assert (D5 : ok (errN M L (k + 11)) (s_d5 r) (Rs_d5 rr)).
+  { unfold s_d5, Rs_d5. replace (k + 11)%nat with (S (k + 10))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 3)%nat);
         [exact HM0 | exact HL1 | lia | exact H5].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef5]. }
-  assert (D7 : ok (errN M L (k + 7)) (s_d7 r) (Rs_d7 rr)).
-  { unfold s_d7, Rs_d7. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F5]. }
+  assert (D7 : ok (errN M L (k + 11)) (s_d7 r) (Rs_d7 rr)).
+  { unfold s_d7, Rs_d7. replace (k + 11)%nat with (S (k + 10))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 4)%nat);
         [exact HM0 | exact HL1 | lia | exact H7].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef7]. }
-  assert (D9 : ok (errN M L (k + 7)) (s_d9 r) (Rs_d9 rr)).
-  { unfold s_d9, Rs_d9. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F7]. }
+  assert (D9 : ok (errN M L (k + 11)) (s_d9 r) (Rs_d9 rr)).
+  { unfold s_d9, Rs_d9. replace (k + 11)%nat with (S (k + 10))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 5)%nat);
         [exact HM0 | exact HL1 | lia | exact H9].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef9]. }
-  assert (D11 : ok (errN M L (k + 7)) (s_d11 r) (Rs_d11 rr)).
-  { unfold s_d11, Rs_d11. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F9]. }
+  assert (D11 : ok (errN M L (k + 11)) (s_d11 r) (Rs_d11 rr)).
+  { unfold s_d11, Rs_d11. replace (k + 11)%nat with (S (k + 10))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
-    apply ok_const; [exact HM0 | exact HL1 | exact Ef11]. }
-  assert (T1 : ok (errN M L (k + 8)) (s_t1 r) (Rs_t1 rr)).
-  { unfold s_t1, Rs_t1. replace (k + 8)%nat with (S (k + 7))%nat by lia.
+    - eapply ok_errN_mono with (n := (k + 6)%nat);
+        [exact HM0 | exact HL1 | lia | exact H11].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F11]. }
+  assert (D13 : ok (errN M L (k + 11)) (s_d13 r) (Rs_d13 rr)).
+  { unfold s_d13, Rs_d13. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 7)%nat);
+        [exact HM0 | exact HL1 | lia | exact H13].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F13]. }
+  assert (D15 : ok (errN M L (k + 11)) (s_d15 r) (Rs_d15 rr)).
+  { unfold s_d15, Rs_d15. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 8)%nat);
+        [exact HM0 | exact HL1 | lia | exact H15].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F15]. }
+  assert (D17 : ok (errN M L (k + 11)) (s_d17 r) (Rs_d17 rr)).
+  { unfold s_d17, Rs_d17. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 9)%nat);
+        [exact HM0 | exact HL1 | lia | exact H17].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F17]. }
+  assert (D19 : ok (errN M L (k + 11)) (s_d19 r) (Rs_d19 rr)).
+  { unfold s_d19, Rs_d19. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    apply ok_const; [exact HM0 | exact HL1 | exact F19]. }
+  assert (A0 : ok (errN M L (k + 12)) (s_a0 r) (Rs_a0 rr)).
+  { unfold s_a0, Rs_a0. replace (k + 12)%nat with (S (k + 11))%nat by lia.
+    eapply ok_minus_S with (m := m); eassumption. }
+  assert (A1 : ok (errN M L (k + 13)) (s_a1 r) (Rs_a1 rr)).
+  { unfold s_a1, Rs_a1. replace (k + 13)%nat with (S (k + 12))%nat by lia.
     eapply ok_minus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hr]. }
-  assert (T2 : ok (errN M L (k + 9)) (s_t2 r) (Rs_t2 rr)).
-  { unfold s_t2, Rs_t2. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 11)%nat);
+      [exact HM0 | exact HL1 | lia | exact D15]. }
+  assert (A2 : ok (errN M L (k + 14)) (s_a2 r) (Rs_a2 rr)).
+  { unfold s_a2, Rs_a2. replace (k + 14)%nat with (S (k + 13))%nat by lia.
     eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 7)%nat);
-      [exact HM0 | exact HL1 | lia | exact D5]. }
-  assert (T3 : ok (errN M L (k + 10)) (s_t3 r) (Rs_t3 rr)).
-  { unfold s_t3, Rs_t3. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 11)%nat);
+      [exact HM0 | exact HL1 | lia | exact D13]. }
+  assert (A3 : ok (errN M L (k + 15)) (s_a3 r) (Rs_a3 rr)).
+  { unfold s_a3, Rs_a3. replace (k + 15)%nat with (S (k + 14))%nat by lia.
     eapply ok_minus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 7)%nat);
-      [exact HM0 | exact HL1 | lia | exact D7]. }
-  assert (T4 : ok (errN M L (k + 11)) (s_t4 r) (Rs_t4 rr)).
-  { unfold s_t4, Rs_t4. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 11)%nat);
+      [exact HM0 | exact HL1 | lia | exact D11]. }
+  assert (A4 : ok (errN M L (k + 16)) (s_a4 r) (Rs_a4 rr)).
+  { unfold s_a4, Rs_a4. replace (k + 16)%nat with (S (k + 15))%nat by lia.
     eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 7)%nat);
+    eapply ok_errN_mono with (n := (k + 11)%nat);
       [exact HM0 | exact HL1 | lia | exact D9]. }
-  unfold s_poly, Rs_poly. replace (k + 12)%nat with (S (k + 11))%nat by lia.
-  eapply ok_minus_S with (m := m); try eassumption.
-  eapply ok_errN_mono with (n := (k + 7)%nat);
-    [exact HM0 | exact HL1 | lia | exact D11].
+  assert (A5 : ok (errN M L (k + 17)) (s_a5 r) (Rs_a5 rr)).
+  { unfold s_a5, Rs_a5. replace (k + 17)%nat with (S (k + 16))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 11)%nat);
+      [exact HM0 | exact HL1 | lia | exact D7]. }
+  assert (A6 : ok (errN M L (k + 18)) (s_a6 r) (Rs_a6 rr)).
+  { unfold s_a6, Rs_a6. replace (k + 18)%nat with (S (k + 17))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 11)%nat);
+      [exact HM0 | exact HL1 | lia | exact D5]. }
+  assert (A7 : ok (errN M L (k + 19)) (s_a7 r) (Rs_a7 rr)).
+  { unfold s_a7, Rs_a7. replace (k + 19)%nat with (S (k + 18))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 11)%nat);
+      [exact HM0 | exact HL1 | lia | exact D3]. }
+  unfold s_poly, Rs_poly. replace (k + 20)%nat with (S (k + 19))%nat by lia.
+  eapply ok_plus_S with (m := m); try eassumption.
+  eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hr].
 Qed.
 
-(** The bound on [f32_sin] itself, at whatever real value the reduction chose. *)
 Corollary ok_sin : forall M m L k x rr,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) (f32_reduce_2pi x) rr ->
   sin_reg M m (f32_reduce_2pi x) rr ->
-  ok (errN M L (k + 12)) (f32_sin x) (Rs_poly rr).
+  ok (errN M L (k + 20)) (f32_sin x) (Rs_poly rr).
 Proof.
   intros M m L k x rr HM Hamp Hr Hreg.
-  rewrite f32_sin_stages. eapply ok_sin_poly with (m := m); eassumption.
+  rewrite f32_sin_stages. eapply ok_s_poly with (m := m); eassumption.
 Qed.
 
-(** The cosine, on the same footing. *)
-
-Definition c_r2  (r : binary32) : binary32 := f32_mult r r.
-Definition c_r4  (r : binary32) : binary32 := f32_mult (c_r2 r) (c_r2 r).
-Definition c_r6  (r : binary32) : binary32 := f32_mult (c_r4 r) (c_r2 r).
-Definition c_r8  (r : binary32) : binary32 := f32_mult (c_r6 r) (c_r2 r).
+Definition c_r2 (r : binary32) : binary32 := f32_mult r r.
+Definition c_r4 (r : binary32) : binary32 := f32_mult (c_r2 r) (c_r2 r).
+Definition c_r6 (r : binary32) : binary32 := f32_mult (c_r4 r) (c_r2 r).
+Definition c_r8 (r : binary32) : binary32 := f32_mult (c_r6 r) (c_r2 r).
 Definition c_r10 (r : binary32) : binary32 := f32_mult (c_r8 r) (c_r2 r).
-
-Definition c_d2  (r : binary32) : binary32 := f32_div (c_r2 r) f32_fac2.
-Definition c_d4  (r : binary32) : binary32 := f32_div (c_r4 r) f32_fac4.
-Definition c_d6  (r : binary32) : binary32 := f32_div (c_r6 r) f32_fac6.
-Definition c_d8  (r : binary32) : binary32 := f32_div (c_r8 r) f32_fac8.
+Definition c_r12 (r : binary32) : binary32 := f32_mult (c_r10 r) (c_r2 r).
+Definition c_r14 (r : binary32) : binary32 := f32_mult (c_r12 r) (c_r2 r).
+Definition c_r16 (r : binary32) : binary32 := f32_mult (c_r14 r) (c_r2 r).
+Definition c_r18 (r : binary32) : binary32 := f32_mult (c_r16 r) (c_r2 r).
+Definition c_d2 (r : binary32) : binary32 := f32_div (c_r2 r) f32_fac2.
+Definition c_d4 (r : binary32) : binary32 := f32_div (c_r4 r) f32_fac4.
+Definition c_d6 (r : binary32) : binary32 := f32_div (c_r6 r) f32_fac6.
+Definition c_d8 (r : binary32) : binary32 := f32_div (c_r8 r) f32_fac8.
 Definition c_d10 (r : binary32) : binary32 := f32_div (c_r10 r) f32_fac10.
-
-Definition c_t1 (r : binary32) : binary32 := f32_minus f32_one (c_d2 r).
-Definition c_t2 (r : binary32) : binary32 := f32_plus (c_t1 r) (c_d4 r).
-Definition c_t3 (r : binary32) : binary32 := f32_minus (c_t2 r) (c_d6 r).
-Definition c_t4 (r : binary32) : binary32 := f32_plus (c_t3 r) (c_d8 r).
-Definition c_poly (r : binary32) : binary32 := f32_minus (c_t4 r) (c_d10 r).
+Definition c_d12 (r : binary32) : binary32 := f32_div (c_r12 r) f32_fac12.
+Definition c_d14 (r : binary32) : binary32 := f32_div (c_r14 r) f32_fac14.
+Definition c_d16 (r : binary32) : binary32 := f32_div (c_r16 r) f32_fac16.
+Definition c_d18 (r : binary32) : binary32 := f32_div (c_r18 r) f32_fac18.
+Definition c_a0 (r : binary32) : binary32 := f32_minus (c_d16 r) (c_d18 r).
+Definition c_a1 (r : binary32) : binary32 := f32_minus (c_a0 r) (c_d14 r).
+Definition c_a2 (r : binary32) : binary32 := f32_plus (c_a1 r) (c_d12 r).
+Definition c_a3 (r : binary32) : binary32 := f32_minus (c_a2 r) (c_d10 r).
+Definition c_a4 (r : binary32) : binary32 := f32_plus (c_a3 r) (c_d8 r).
+Definition c_a5 (r : binary32) : binary32 := f32_minus (c_a4 r) (c_d6 r).
+Definition c_a6 (r : binary32) : binary32 := f32_plus (c_a5 r) (c_d4 r).
+Definition c_a7 (r : binary32) : binary32 := f32_minus (c_a6 r) (c_d2 r).
+Definition c_poly (r : binary32) : binary32 := f32_plus f32_one (c_a7 r).
 
 Lemma f32_cos_stages : forall x, f32_cos x = c_poly (f32_reduce_2pi x).
 Proof.
   intros x. unfold f32_cos. cbv zeta.
-  unfold c_poly, c_t4, c_t3, c_t2, c_t1,
-         c_d10, c_d8, c_d6, c_d4, c_d2,
-         c_r10, c_r8, c_r6, c_r4, c_r2.
+  unfold c_poly, c_a7, c_a6, c_a5, c_a4, c_a3, c_a2, c_a1, c_a0, c_d18,
+         c_d16, c_d14, c_d12, c_d10, c_d8, c_d6, c_d4, c_d2, c_r18,
+         c_r16, c_r14, c_r12, c_r10, c_r8, c_r6, c_r4, c_r2.
   reflexivity.
 Qed.
 
-Definition Rc_r2  (rr : R) : R := rr * rr.
-Definition Rc_r4  (rr : R) : R := Rc_r2 rr * Rc_r2 rr.
-Definition Rc_r6  (rr : R) : R := Rc_r4 rr * Rc_r2 rr.
-Definition Rc_r8  (rr : R) : R := Rc_r6 rr * Rc_r2 rr.
-Definition Rc_r10 (rr : R) : R := Rc_r8 rr * Rc_r2 rr.
-
-Definition Rc_d2  (rr : R) : R := Rc_r2 rr / B2R f32_fac2.
-Definition Rc_d4  (rr : R) : R := Rc_r4 rr / B2R f32_fac4.
-Definition Rc_d6  (rr : R) : R := Rc_r6 rr / B2R f32_fac6.
-Definition Rc_d8  (rr : R) : R := Rc_r8 rr / B2R f32_fac8.
+Definition Rc_r2 (rr : R) : R := rr * rr.
+Definition Rc_r4 (rr : R) : R := (Rc_r2 rr) * (Rc_r2 rr).
+Definition Rc_r6 (rr : R) : R := (Rc_r4 rr) * (Rc_r2 rr).
+Definition Rc_r8 (rr : R) : R := (Rc_r6 rr) * (Rc_r2 rr).
+Definition Rc_r10 (rr : R) : R := (Rc_r8 rr) * (Rc_r2 rr).
+Definition Rc_r12 (rr : R) : R := (Rc_r10 rr) * (Rc_r2 rr).
+Definition Rc_r14 (rr : R) : R := (Rc_r12 rr) * (Rc_r2 rr).
+Definition Rc_r16 (rr : R) : R := (Rc_r14 rr) * (Rc_r2 rr).
+Definition Rc_r18 (rr : R) : R := (Rc_r16 rr) * (Rc_r2 rr).
+Definition Rc_d2 (rr : R) : R := Rc_r2 rr / B2R f32_fac2.
+Definition Rc_d4 (rr : R) : R := Rc_r4 rr / B2R f32_fac4.
+Definition Rc_d6 (rr : R) : R := Rc_r6 rr / B2R f32_fac6.
+Definition Rc_d8 (rr : R) : R := Rc_r8 rr / B2R f32_fac8.
 Definition Rc_d10 (rr : R) : R := Rc_r10 rr / B2R f32_fac10.
-
-Definition Rc_t1 (rr : R) : R := 1 - Rc_d2 rr.
-Definition Rc_t2 (rr : R) : R := Rc_t1 rr + Rc_d4 rr.
-Definition Rc_t3 (rr : R) : R := Rc_t2 rr - Rc_d6 rr.
-Definition Rc_t4 (rr : R) : R := Rc_t3 rr + Rc_d8 rr.
-Definition Rc_poly (rr : R) : R := Rc_t4 rr - Rc_d10 rr.
+Definition Rc_d12 (rr : R) : R := Rc_r12 rr / B2R f32_fac12.
+Definition Rc_d14 (rr : R) : R := Rc_r14 rr / B2R f32_fac14.
+Definition Rc_d16 (rr : R) : R := Rc_r16 rr / B2R f32_fac16.
+Definition Rc_d18 (rr : R) : R := Rc_r18 rr / B2R f32_fac18.
+Definition Rc_a0 (rr : R) : R := Rc_d16 rr - Rc_d18 rr.
+Definition Rc_a1 (rr : R) : R := Rc_a0 rr - Rc_d14 rr.
+Definition Rc_a2 (rr : R) : R := Rc_a1 rr + Rc_d12 rr.
+Definition Rc_a3 (rr : R) : R := Rc_a2 rr - Rc_d10 rr.
+Definition Rc_a4 (rr : R) : R := Rc_a3 rr + Rc_d8 rr.
+Definition Rc_a5 (rr : R) : R := Rc_a4 rr - Rc_d6 rr.
+Definition Rc_a6 (rr : R) : R := Rc_a5 rr + Rc_d4 rr.
+Definition Rc_a7 (rr : R) : R := Rc_a6 rr - Rc_d2 rr.
+Definition Rc_poly (rr : R) : R := 1 + Rc_a7 rr.
 
 Record cos_reg (M m : R) (r : binary32) (rr : R) : Prop := {
   csr_fin2 : is_finite f32_fac2 = true;
@@ -5846,11 +5983,19 @@ Record cos_reg (M m : R) (r : binary32) (rr : R) : Prop := {
   csr_fin6 : is_finite f32_fac6 = true;
   csr_fin8 : is_finite f32_fac8 = true;
   csr_fin10 : is_finite f32_fac10 = true;
+  csr_fin12 : is_finite f32_fac12 = true;
+  csr_fin14 : is_finite f32_fac14 = true;
+  csr_fin16 : is_finite f32_fac16 = true;
+  csr_fin18 : is_finite f32_fac18 = true;
   csr_m2 : m <= Rabs (B2R f32_fac2);
   csr_m4 : m <= Rabs (B2R f32_fac4);
   csr_m6 : m <= Rabs (B2R f32_fac6);
   csr_m8 : m <= Rabs (B2R f32_fac8);
   csr_m10 : m <= Rabs (B2R f32_fac10);
+  csr_m12 : m <= Rabs (B2R f32_fac12);
+  csr_m14 : m <= Rabs (B2R f32_fac14);
+  csr_m16 : m <= Rabs (B2R f32_fac16);
+  csr_m18 : m <= Rabs (B2R f32_fac18);
   csr_br : Rabs (B2R r) <= M;
   csr_brr : Rabs rr <= M;
   csr_z2 : regz M (B2R r * B2R r);
@@ -5866,24 +6011,44 @@ Record cos_reg (M m : R) (r : binary32) (rr : R) : Prop := {
   csr_b8 : Rabs (B2R (c_r8 r)) <= M;
   csr_b8r : Rabs (Rc_r8 rr) <= M;
   csr_z10 : regz M (B2R (c_r8 r) * B2R (c_r2 r));
+  csr_b10 : Rabs (B2R (c_r10 r)) <= M;
   csr_b10r : Rabs (Rc_r10 rr) <= M;
+  csr_z12 : regz M (B2R (c_r10 r) * B2R (c_r2 r));
+  csr_b12 : Rabs (B2R (c_r12 r)) <= M;
+  csr_b12r : Rabs (Rc_r12 rr) <= M;
+  csr_z14 : regz M (B2R (c_r12 r) * B2R (c_r2 r));
+  csr_b14 : Rabs (B2R (c_r14 r)) <= M;
+  csr_b14r : Rabs (Rc_r14 rr) <= M;
+  csr_z16 : regz M (B2R (c_r14 r) * B2R (c_r2 r));
+  csr_b16 : Rabs (B2R (c_r16 r)) <= M;
+  csr_b16r : Rabs (Rc_r16 rr) <= M;
+  csr_z18 : regz M (B2R (c_r16 r) * B2R (c_r2 r));
+  csr_b18r : Rabs (Rc_r18 rr) <= M;
   csr_zd2 : regz M (B2R (c_r2 r) / B2R f32_fac2);
   csr_zd4 : regz M (B2R (c_r4 r) / B2R f32_fac4);
   csr_zd6 : regz M (B2R (c_r6 r) / B2R f32_fac6);
   csr_zd8 : regz M (B2R (c_r8 r) / B2R f32_fac8);
   csr_zd10 : regz M (B2R (c_r10 r) / B2R f32_fac10);
-  csr_zt1 : regz M (B2R f32_one + B2R (f32_neg (c_d2 r)));
-  csr_zt2 : regz M (B2R (c_t1 r) + B2R (c_d4 r));
-  csr_zt3 : regz M (B2R (c_t2 r) + B2R (f32_neg (c_d6 r)));
-  csr_zt4 : regz M (B2R (c_t3 r) + B2R (c_d8 r));
-  csr_zt5 : regz M (B2R (c_t4 r) + B2R (f32_neg (c_d10 r)))
+  csr_zd12 : regz M (B2R (c_r12 r) / B2R f32_fac12);
+  csr_zd14 : regz M (B2R (c_r14 r) / B2R f32_fac14);
+  csr_zd16 : regz M (B2R (c_r16 r) / B2R f32_fac16);
+  csr_zd18 : regz M (B2R (c_r18 r) / B2R f32_fac18);
+  csr_zt0 : regz M (B2R (c_d16 r) + B2R (f32_neg (c_d18 r)));
+  csr_zt1 : regz M (B2R (c_a0 r) + B2R (f32_neg (c_d14 r)));
+  csr_zt2 : regz M (B2R (c_a1 r) + B2R (c_d12 r));
+  csr_zt3 : regz M (B2R (c_a2 r) + B2R (f32_neg (c_d10 r)));
+  csr_zt4 : regz M (B2R (c_a3 r) + B2R (c_d8 r));
+  csr_zt5 : regz M (B2R (c_a4 r) + B2R (f32_neg (c_d6 r)));
+  csr_zt6 : regz M (B2R (c_a5 r) + B2R (c_d4 r));
+  csr_zt7 : regz M (B2R (c_a6 r) + B2R (f32_neg (c_d2 r)));
+  csr_ztf : regz M (B2R f32_one + B2R (c_a7 r))
 }.
 
-Lemma ok_cos_poly : forall M m L k r rr,
+Lemma ok_c_poly : forall M m L k r rr,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) r rr ->
   cos_reg M m r rr ->
-  ok (errN M L (k + 11)) (c_poly r) (Rc_poly rr).
+  ok (errN M L (k + 19)) (c_poly r) (Rc_poly rr).
 Proof.
   intros M m L k r rr HM Hamp Hr Hreg.
   assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
@@ -5891,10 +6056,7 @@ Proof.
   assert (Hone : forall j, ok (errN M L j) f32_one 1).
   { intros j. replace 1 with (B2R f32_one) by apply f32_one_correct.
     apply ok_const; [exact HM0 | exact HL1 | exact f32_one_finite]. }
-  destruct Hreg as [Ef2 Ef4 Ef6 Ef8 Ef10 Em2 Em4 Em6 Em8 Em10
-                    Ebr Ebrr Ez2 Eb2 Eb2r Ez4 Eb4 Eb4r Ez6 Eb6 Eb6r
-                    Ez8 Eb8 Eb8r Ez10 Eb10r
-                    Ezd2 Ezd4 Ezd6 Ezd8 Ezd10 Ezt1 Ezt2 Ezt3 Ezt4 Ezt5].
+  destruct Hreg as [F2 F4 F6 F8 F10 F12 F14 F16 F18 Q2 Q4 Q6 Q8 Q10 Q12 Q14 Q16 Q18 Br Brr Z2 B2 B2r Z4 B4 B4r Z6 B6 B6r Z8 B8 B8r Z10 B10 B10r Z12 B12 B12r Z14 B14 B14r Z16 B16 B16r Z18 B18r Zd2 Zd4 Zd6 Zd8 Zd10 Zd12 Zd14 Zd16 Zd18 Zt0 Zt1 Zt2 Zt3 Zt4 Zt5 Zt6 Zt7 Ztf].
   assert (H2 : ok (errN M L (k + 1)) (c_r2 r) (Rc_r2 rr)).
   { unfold c_r2, Rc_r2. replace (k + 1)%nat with (S k)%nat by lia.
     eapply ok_mult_S with (m := m); eassumption. }
@@ -5904,78 +6066,148 @@ Proof.
   assert (H6 : ok (errN M L (k + 3)) (c_r6 r) (Rc_r6 rr)).
   { unfold c_r6, Rc_r6. replace (k + 3)%nat with (S (k + 2))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 1)%nat);
-      [exact HM0 | exact HL1 | lia | exact H2]. }
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
   assert (H8 : ok (errN M L (k + 4)) (c_r8 r) (Rc_r8 rr)).
   { unfold c_r8, Rc_r8. replace (k + 4)%nat with (S (k + 3))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 1)%nat);
-      [exact HM0 | exact HL1 | lia | exact H2]. }
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
   assert (H10 : ok (errN M L (k + 5)) (c_r10 r) (Rc_r10 rr)).
   { unfold c_r10, Rc_r10. replace (k + 5)%nat with (S (k + 4))%nat by lia.
     eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 1)%nat);
-      [exact HM0 | exact HL1 | lia | exact H2]. }
-  assert (D2 : ok (errN M L (k + 6)) (c_d2 r) (Rc_d2 rr)).
-  { unfold c_d2, Rc_d2. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H12 : ok (errN M L (k + 6)) (c_r12 r) (Rc_r12 rr)).
+  { unfold c_r12, Rc_r12. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H14 : ok (errN M L (k + 7)) (c_r14 r) (Rc_r14 rr)).
+  { unfold c_r14, Rc_r14. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H16 : ok (errN M L (k + 8)) (c_r16 r) (Rc_r16 rr)).
+  { unfold c_r16, Rc_r16. replace (k + 8)%nat with (S (k + 7))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (H18 : ok (errN M L (k + 9)) (c_r18 r) (Rc_r18 rr)).
+  { unfold c_r18, Rc_r18. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 1)%nat);
+        [exact HM0 | exact HL1 | lia | exact H2].
+  }
+  assert (D2 : ok (errN M L (k + 10)) (c_d2 r) (Rc_d2 rr)).
+  { unfold c_d2, Rc_d2. replace (k + 10)%nat with (S (k + 9))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 1)%nat);
         [exact HM0 | exact HL1 | lia | exact H2].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef2]. }
-  assert (D4 : ok (errN M L (k + 6)) (c_d4 r) (Rc_d4 rr)).
-  { unfold c_d4, Rc_d4. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F2]. }
+  assert (D4 : ok (errN M L (k + 10)) (c_d4 r) (Rc_d4 rr)).
+  { unfold c_d4, Rc_d4. replace (k + 10)%nat with (S (k + 9))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 2)%nat);
         [exact HM0 | exact HL1 | lia | exact H4].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef4]. }
-  assert (D6 : ok (errN M L (k + 6)) (c_d6 r) (Rc_d6 rr)).
-  { unfold c_d6, Rc_d6. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F4]. }
+  assert (D6 : ok (errN M L (k + 10)) (c_d6 r) (Rc_d6 rr)).
+  { unfold c_d6, Rc_d6. replace (k + 10)%nat with (S (k + 9))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 3)%nat);
         [exact HM0 | exact HL1 | lia | exact H6].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef6]. }
-  assert (D8 : ok (errN M L (k + 6)) (c_d8 r) (Rc_d8 rr)).
-  { unfold c_d8, Rc_d8. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F6]. }
+  assert (D8 : ok (errN M L (k + 10)) (c_d8 r) (Rc_d8 rr)).
+  { unfold c_d8, Rc_d8. replace (k + 10)%nat with (S (k + 9))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
     - eapply ok_errN_mono with (n := (k + 4)%nat);
         [exact HM0 | exact HL1 | lia | exact H8].
-    - apply ok_const; [exact HM0 | exact HL1 | exact Ef8]. }
-  assert (D10 : ok (errN M L (k + 6)) (c_d10 r) (Rc_d10 rr)).
-  { unfold c_d10, Rc_d10. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    - apply ok_const; [exact HM0 | exact HL1 | exact F8]. }
+  assert (D10 : ok (errN M L (k + 10)) (c_d10 r) (Rc_d10 rr)).
+  { unfold c_d10, Rc_d10. replace (k + 10)%nat with (S (k + 9))%nat by lia.
     eapply ok_div_S with (m := m); try eassumption.
-    apply ok_const; [exact HM0 | exact HL1 | exact Ef10]. }
-  assert (T1 : ok (errN M L (k + 7)) (c_t1 r) (Rc_t1 rr)).
-  { unfold c_t1, Rc_t1. replace (k + 7)%nat with (S (k + 6))%nat by lia.
-    eapply ok_minus_S with (m := m); try eassumption. apply Hone. }
-  assert (T2 : ok (errN M L (k + 8)) (c_t2 r) (Rc_t2 rr)).
-  { unfold c_t2, Rc_t2. replace (k + 8)%nat with (S (k + 7))%nat by lia.
-    eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 6)%nat);
-      [exact HM0 | exact HL1 | lia | exact D4]. }
-  assert (T3 : ok (errN M L (k + 9)) (c_t3 r) (Rc_t3 rr)).
-  { unfold c_t3, Rc_t3. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+    - eapply ok_errN_mono with (n := (k + 5)%nat);
+        [exact HM0 | exact HL1 | lia | exact H10].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F10]. }
+  assert (D12 : ok (errN M L (k + 10)) (c_d12 r) (Rc_d12 rr)).
+  { unfold c_d12, Rc_d12. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 6)%nat);
+        [exact HM0 | exact HL1 | lia | exact H12].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F12]. }
+  assert (D14 : ok (errN M L (k + 10)) (c_d14 r) (Rc_d14 rr)).
+  { unfold c_d14, Rc_d14. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 7)%nat);
+        [exact HM0 | exact HL1 | lia | exact H14].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F14]. }
+  assert (D16 : ok (errN M L (k + 10)) (c_d16 r) (Rc_d16 rr)).
+  { unfold c_d16, Rc_d16. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 8)%nat);
+        [exact HM0 | exact HL1 | lia | exact H16].
+    - apply ok_const; [exact HM0 | exact HL1 | exact F16]. }
+  assert (D18 : ok (errN M L (k + 10)) (c_d18 r) (Rc_d18 rr)).
+  { unfold c_d18, Rc_d18. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    apply ok_const; [exact HM0 | exact HL1 | exact F18]. }
+  assert (A0 : ok (errN M L (k + 11)) (c_a0 r) (Rc_a0 rr)).
+  { unfold c_a0, Rc_a0. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_minus_S with (m := m); eassumption. }
+  assert (A1 : ok (errN M L (k + 12)) (c_a1 r) (Rc_a1 rr)).
+  { unfold c_a1, Rc_a1. replace (k + 12)%nat with (S (k + 11))%nat by lia.
     eapply ok_minus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 6)%nat);
-      [exact HM0 | exact HL1 | lia | exact D6]. }
-  assert (T4 : ok (errN M L (k + 10)) (c_t4 r) (Rc_t4 rr)).
-  { unfold c_t4, Rc_t4. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 10)%nat);
+      [exact HM0 | exact HL1 | lia | exact D14]. }
+  assert (A2 : ok (errN M L (k + 13)) (c_a2 r) (Rc_a2 rr)).
+  { unfold c_a2, Rc_a2. replace (k + 13)%nat with (S (k + 12))%nat by lia.
     eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 6)%nat);
+    eapply ok_errN_mono with (n := (k + 10)%nat);
+      [exact HM0 | exact HL1 | lia | exact D12]. }
+  assert (A3 : ok (errN M L (k + 14)) (c_a3 r) (Rc_a3 rr)).
+  { unfold c_a3, Rc_a3. replace (k + 14)%nat with (S (k + 13))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 10)%nat);
+      [exact HM0 | exact HL1 | lia | exact D10]. }
+  assert (A4 : ok (errN M L (k + 15)) (c_a4 r) (Rc_a4 rr)).
+  { unfold c_a4, Rc_a4. replace (k + 15)%nat with (S (k + 14))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 10)%nat);
       [exact HM0 | exact HL1 | lia | exact D8]. }
-  unfold c_poly, Rc_poly. replace (k + 11)%nat with (S (k + 10))%nat by lia.
-  eapply ok_minus_S with (m := m); try eassumption.
-  eapply ok_errN_mono with (n := (k + 6)%nat);
-    [exact HM0 | exact HL1 | lia | exact D10].
+  assert (A5 : ok (errN M L (k + 16)) (c_a5 r) (Rc_a5 rr)).
+  { unfold c_a5, Rc_a5. replace (k + 16)%nat with (S (k + 15))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 10)%nat);
+      [exact HM0 | exact HL1 | lia | exact D6]. }
+  assert (A6 : ok (errN M L (k + 17)) (c_a6 r) (Rc_a6 rr)).
+  { unfold c_a6, Rc_a6. replace (k + 17)%nat with (S (k + 16))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 10)%nat);
+      [exact HM0 | exact HL1 | lia | exact D4]. }
+  assert (A7 : ok (errN M L (k + 18)) (c_a7 r) (Rc_a7 rr)).
+  { unfold c_a7, Rc_a7. replace (k + 18)%nat with (S (k + 17))%nat by lia.
+    eapply ok_minus_S with (m := m); try eassumption.
+    eapply ok_errN_mono with (n := (k + 10)%nat);
+      [exact HM0 | exact HL1 | lia | exact D2]. }
+  unfold c_poly, Rc_poly. replace (k + 19)%nat with (S (k + 18))%nat by lia.
+  eapply ok_plus_S with (m := m); try eassumption.
+  apply Hone.
 Qed.
 
 Corollary ok_cos : forall M m L k x rr,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) (f32_reduce_2pi x) rr ->
   cos_reg M m (f32_reduce_2pi x) rr ->
-  ok (errN M L (k + 11)) (f32_cos x) (Rc_poly rr).
+  ok (errN M L (k + 19)) (f32_cos x) (Rc_poly rr).
 Proof.
   intros M m L k x rr HM Hamp Hr Hreg.
-  rewrite f32_cos_stages. eapply ok_cos_poly with (m := m); eassumption.
+  rewrite f32_cos_stages. eapply ok_c_poly with (m := m); eassumption.
 Qed.
 
 (** * Backward error for the dot product

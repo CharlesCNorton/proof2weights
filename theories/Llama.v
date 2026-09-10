@@ -4,10 +4,14 @@
     RMSNorm and SiLU compose existing verified f32 operations. f32_sin and
     f32_cos are defined here by argument reduction modulo 2*pi (nearest-integer
     rounding via the add-then-subtract magic-constant trick) followed by a
-    Taylor polynomial; this is the specification. The native extraction
-    (Llama_native.v) replaces f32_sin and f32_cos with the host's libm, in the
-    same trusted manner as the basic arithmetic. The remaining primitives are
-    bit-identical between the two builds. *)
+    Taylor polynomial. Extract.v emits the native build and does NOT substitute
+    the host libm for them: they are compositions of f32_plus, f32_minus,
+    f32_mult and f32_div, so both builds run the same reduction and the same
+    polynomial, operation for operation.
+
+    The magic constant used below is 2^23, which rounds a negative argument to
+    the nearest half-integer rather than the nearest integer; Approx.v and
+    RoundChk.v diagnose that and supply the corrected reduction. *)
 
 From Stdlib Require Import ZArith.
 From Stdlib Require Import List.
@@ -42,16 +46,28 @@ Qed.
 Definition f32_pi : binary32 := f32_div (f32_of_Z 31415927) (f32_of_Z 10000000).
 Definition f32_2pi : binary32 := f32_mult f32_two f32_pi.
 Definition f32_inv2pi : binary32 := f32_div f32_one f32_2pi.
-Definition f32_magic : binary32 := f32_of_Z 8388608.
+(** [1.5 * 2^23]. The plain [2^23] is wrong for a negative argument: the sum
+    then lands in [2^22, 2^23), where the unit in the last place is one half,
+    so the result is the nearest half-integer and the reduction below shifts
+    the argument by pi. RoundChk.v checks both behaviours by computation. *)
+Definition f32_magic : binary32 := f32_of_Z 12582912.
 
 (** Nearest integer of y, as a binary32, valid for |y| < 2^22. *)
 Definition f32_round_int (y : binary32) : binary32 :=
   f32_minus (f32_plus y f32_magic) f32_magic.
 
+(** Cody-Waite split of [2*pi]. The high part is [201/32], eight significant
+    bits, so [k * f32_2pi_hi] is exact for every [k] the reduction produces and
+    the cancellation in [x - k*2pi] does not consume the low bits of [x]. *)
+Definition f32_2pi_hi : binary32 := f32_div (f32_of_Z 201) (f32_of_Z 32).
+Definition f32_2pi_lo : binary32 :=
+  f32_div (f32_of_Z 19353072) (f32_of_Z 10000000000).
+
 (** Reduce x into [-pi, pi]. *)
 Definition f32_reduce_2pi (x : binary32) : binary32 :=
   let k := f32_round_int (f32_mult x f32_inv2pi) in
-  f32_minus x (f32_mult k f32_2pi).
+  let r := f32_minus x (f32_mult k f32_2pi_hi) in
+  f32_minus r (f32_mult k f32_2pi_lo).
 
 Definition f32_fac2 : binary32 := f32_of_Z 2.
 Definition f32_fac3 : binary32 := f32_of_Z 6.
@@ -63,9 +79,19 @@ Definition f32_fac8 : binary32 := f32_of_Z 40320.
 Definition f32_fac9 : binary32 := f32_of_Z 362880.
 Definition f32_fac10 : binary32 := f32_of_Z 3628800.
 Definition f32_fac11 : binary32 := f32_of_Z 39916800.
+Definition f32_fac12 : binary32 := f32_of_Z 479001600.
+Definition f32_fac13 : binary32 := f32_of_Z 6227020800.
+Definition f32_fac14 : binary32 := f32_of_Z 87178291200.
+Definition f32_fac15 : binary32 := f32_of_Z 1307674368000.
+Definition f32_fac16 : binary32 := f32_of_Z 20922789888000.
+Definition f32_fac17 : binary32 := f32_of_Z 355687428096000.
+Definition f32_fac18 : binary32 := f32_of_Z 6402373705728000.
+Definition f32_fac19 : binary32 := f32_of_Z 121645100408832000.
 
-(** sin via Taylor on the reduced argument:
-    r - r^3/6 + r^5/120 - r^7/5040 + r^9/362880 - r^11/39916800. *)
+(** sin via Taylor on the reduced argument, through r^19. The truncation
+    error of the degree-19 series over a full reduced period is below 1e-9;
+    stopping at r^11, as this development previously did, leaves 4.7e-4.
+    Approx.v carries both bounds. *)
 Definition f32_sin (x : binary32) : binary32 :=
   let r := f32_reduce_2pi x in
   let r2 := f32_mult r r in
@@ -74,18 +100,21 @@ Definition f32_sin (x : binary32) : binary32 :=
   let r7 := f32_mult r5 r2 in
   let r9 := f32_mult r7 r2 in
   let r11 := f32_mult r9 r2 in
-  f32_minus
-    (f32_plus
-      (f32_minus
-        (f32_plus
-          (f32_minus r (f32_div r3 f32_fac3))
-          (f32_div r5 f32_fac5))
-        (f32_div r7 f32_fac7))
-      (f32_div r9 f32_fac9))
-    (f32_div r11 f32_fac11).
+  let r13 := f32_mult r11 r2 in
+  let r15 := f32_mult r13 r2 in
+  let r17 := f32_mult r15 r2 in
+  let r19 := f32_mult r17 r2 in
+  let a := f32_minus (f32_div r17 f32_fac17) (f32_div r19 f32_fac19) in
+  let a := f32_minus a (f32_div r15 f32_fac15) in
+  let a := f32_plus a (f32_div r13 f32_fac13) in
+  let a := f32_minus a (f32_div r11 f32_fac11) in
+  let a := f32_plus a (f32_div r9 f32_fac9) in
+  let a := f32_minus a (f32_div r7 f32_fac7) in
+  let a := f32_plus a (f32_div r5 f32_fac5) in
+  let a := f32_minus a (f32_div r3 f32_fac3) in
+  f32_plus r a.
 
-(** cos via Taylor on the reduced argument:
-    1 - r^2/2 + r^4/24 - r^6/720 + r^8/40320 - r^10/3628800. *)
+(** cos likewise, through r^18. *)
 Definition f32_cos (x : binary32) : binary32 :=
   let r := f32_reduce_2pi x in
   let r2 := f32_mult r r in
@@ -93,15 +122,19 @@ Definition f32_cos (x : binary32) : binary32 :=
   let r6 := f32_mult r4 r2 in
   let r8 := f32_mult r6 r2 in
   let r10 := f32_mult r8 r2 in
-  f32_minus
-    (f32_plus
-      (f32_minus
-        (f32_plus
-          (f32_minus f32_one (f32_div r2 f32_fac2))
-          (f32_div r4 f32_fac4))
-        (f32_div r6 f32_fac6))
-      (f32_div r8 f32_fac8))
-    (f32_div r10 f32_fac10).
+  let r12 := f32_mult r10 r2 in
+  let r14 := f32_mult r12 r2 in
+  let r16 := f32_mult r14 r2 in
+  let r18 := f32_mult r16 r2 in
+  let a := f32_minus (f32_div r16 f32_fac16) (f32_div r18 f32_fac18) in
+  let a := f32_minus a (f32_div r14 f32_fac14) in
+  let a := f32_plus a (f32_div r12 f32_fac12) in
+  let a := f32_minus a (f32_div r10 f32_fac10) in
+  let a := f32_plus a (f32_div r8 f32_fac8) in
+  let a := f32_minus a (f32_div r6 f32_fac6) in
+  let a := f32_plus a (f32_div r4 f32_fac4) in
+  let a := f32_minus a (f32_div r2 f32_fac2) in
+  f32_plus f32_one a.
 
 (** * Shared layer primitives
 
