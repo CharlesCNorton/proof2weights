@@ -21,4 +21,5 @@ Extraction "llama_inductive.ml"
   llama_attn_weights mk_llama_attn_weights la_q la_k la_v la_o
   llama_mlp_weights mk_llama_mlp_weights lm_gate lm_up lm_down
   f32_llama_attn f32_llama_layer f32_llama_stack f32_llama_forward f32_llama_logits
-  f32_embed_tokens f32_causal_attention f32_concat_heads.
+  f32_embed_tokens f32_causal_attention f32_concat_heads
+  json_tensor_offsets.
