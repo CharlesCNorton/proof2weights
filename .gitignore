@@ -51,3 +51,10 @@ nul
 /ref_logits
 /float_smoke
 /float_load_run
+
+# Paper build artifacts and captured tool output.
+/paper/*.pdf
+/paper/*.log
+/paper/*.aux
+/paper/*.out
+/paper/audit_output.txt
