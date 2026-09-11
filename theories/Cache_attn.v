@@ -1,25 +1,13 @@
-(** * Cached attention equals the last row of full causal attention
+(** * Causal attention and the key/value cache
 
-    A decode step attends a single query over a key/value cache. The
-    definition instead recomputes causal attention over the whole sequence and
-    would take the last row. This file proves the two agree exactly, and
-    isolates the two places where the agreement is conditional.
+    Row [i] of [f32_causal_attention] attends its query over the first [i + 1]
+    key and value rows. A row therefore depends on the sequence only through
+    that prefix: extending the sequence leaves every existing row unchanged,
+    and a decode step appends exactly one row, the new query attending over
+    the whole cache. The theorems below are equalities of binary32 values.
 
-    The first is signed zero. Full attention adds the mask entry to every
-    score, and on the last row every mask entry is [+0]; the cached path adds
-    nothing. Under round-to-nearest, [x + (+0) = x] for every binary32 [x]
-    except [-0], where it returns [+0]. The theorem therefore carries the
-    hypothesis that no score is negative zero, which is exactly the condition
-    under which the two paths coincide.
-
-    The second is that the statement is about the last row and not about
-    earlier ones. On row [i < n-1] the full computation exponentiates the
-    masked columns as well. Those contribute [exp(-88)], approximately
-    [6.05e-39], which is subnormal but not zero, and they enter the softmax
-    denominator. A prefix-cached evaluation omits them. The two therefore
-    agree only up to whether that subnormal mass survives rounding, which is
-    not an identity. Decoding only ever computes the last row, so the theorem
-    covers the case that runs. *)
+    The second half concerns transposition, which the attention output and
+    the runners' transposed decode both go through. *)
 
 From Stdlib Require Import List.
 From Stdlib Require Import Lia.
@@ -30,20 +18,85 @@ Require Import Phases1_15_complete.
 
 Import ListNotations.
 
-(** * Adding positive zero
+(** * Rows of causal attention *)
 
-    The only binary32 value [+0] does not fix is [-0]. *)
-
-Lemma f32_plus_zero_r : forall x : binary32,
-  x <> B754_zero true -> f32_plus x f32_zero = x.
+Lemma causal_attention_nth : forall q k v d_k i,
+  (i < List.length q)%nat ->
+  List.nth i (f32_causal_attention q k v d_k) []
+  = f32_attend (List.nth i q []) (List.firstn (S i) k) (List.firstn (S i) v) d_k.
 Proof.
-  intros x Hx. destruct x as [s|s| |s m e H]; try reflexivity.
-  - destruct s; [contradiction | reflexivity].
+  intros q k v d_k i Hi. unfold f32_causal_attention.
+  set (f := fun p : nat * list binary32 => let '(j, qrow) := p in
+              f32_attend qrow (List.firstn (S j) k) (List.firstn (S j) v) d_k).
+  rewrite (List.nth_indep _ [] (f (i, [])))
+    by (rewrite List.length_map, List.length_combine, List.length_seq; lia).
+  rewrite List.map_nth.
+  rewrite List.combine_nth by (rewrite List.length_seq; reflexivity).
+  rewrite List.seq_nth by exact Hi.
+  reflexivity.
 Qed.
 
-(** And it does not fix it: the two paths genuinely differ there. *)
-Example f32_plus_zero_neg : f32_plus (B754_zero true) f32_zero = B754_zero false.
-Proof. reflexivity. Qed.
+Lemma combine_app_eq : forall {A B : Type} (l1 l2 : list A) (r1 r2 : list B),
+  List.length l1 = List.length r1 ->
+  List.combine (l1 ++ l2) (r1 ++ r2) = List.combine l1 r1 ++ List.combine l2 r2.
+Proof.
+  intros A B l1. induction l1 as [|x l1 IH]; intros l2 r1 r2 H.
+  - destruct r1; [reflexivity | discriminate].
+  - destruct r1 as [|y r1]; [discriminate|].
+    cbn [app List.combine]. f_equal. apply IH. cbn in H. lia.
+Qed.
+
+(** Extending the sequence leaves the rows already computed unchanged, and
+    the new rows attend over prefixes of the extended keys and values. *)
+Theorem causal_attention_app : forall q1 q2 k1 k2 v1 v2 d_k,
+  List.length k1 = List.length q1 -> List.length v1 = List.length q1 ->
+  f32_causal_attention (q1 ++ q2) (k1 ++ k2) (v1 ++ v2) d_k
+  = f32_causal_attention q1 k1 v1 d_k
+    ++ List.map (fun p => let '(i, qrow) := p in
+                   f32_attend qrow (List.firstn (S i) (k1 ++ k2))
+                                   (List.firstn (S i) (v1 ++ v2)) d_k)
+                (List.combine (List.seq (List.length q1) (List.length q2)) q2).
+Proof.
+  intros q1 q2 k1 k2 v1 v2 d_k Hk Hv.
+  unfold f32_causal_attention.
+  rewrite List.length_app, List.seq_app.
+  rewrite combine_app_eq by (rewrite List.length_seq; reflexivity).
+  rewrite List.map_app. f_equal.
+  apply List.map_ext_in. intros [i qrow] Hin.
+  apply List.in_combine_l, List.in_seq in Hin.
+  rewrite !List.firstn_app.
+  replace (S i - List.length k1)%nat with 0%nat by lia.
+  replace (S i - List.length v1)%nat with 0%nat by lia.
+  rewrite !List.firstn_0, !List.app_nil_r. reflexivity.
+Qed.
+
+(** A prefix of the sequence computes exactly the corresponding rows. *)
+Corollary causal_attention_prefix : forall q1 q2 k1 k2 v1 v2 d_k,
+  List.length k1 = List.length q1 -> List.length v1 = List.length q1 ->
+  List.firstn (List.length q1) (f32_causal_attention (q1 ++ q2) (k1 ++ k2) (v1 ++ v2) d_k)
+  = f32_causal_attention q1 k1 v1 d_k.
+Proof.
+  intros q1 q2 k1 k2 v1 v2 d_k Hk Hv.
+  pose proof (f32_causal_attention_rows q1 k1 v1 d_k) as Hr.
+  unfold f32_mat_rows in Hr.
+  rewrite causal_attention_app by assumption.
+  rewrite List.firstn_app, Hr, Nat.sub_diag, List.firstn_0, List.app_nil_r.
+  apply List.firstn_all2. lia.
+Qed.
+
+(** The decode step: one more position appends exactly the new query attending
+    over every cached key and value, and changes nothing already emitted. *)
+Corollary causal_attention_snoc : forall q k v qn kn vn d_k,
+  List.length k = List.length q -> List.length v = List.length q ->
+  f32_causal_attention (q ++ [qn]) (k ++ [kn]) (v ++ [vn]) d_k
+  = f32_causal_attention q k v d_k ++ [f32_attend qn (k ++ [kn]) (v ++ [vn]) d_k].
+Proof.
+  intros q k v qn kn vn d_k Hk Hv.
+  rewrite causal_attention_app by assumption.
+  cbn [List.length List.seq List.combine List.map].
+  rewrite !List.firstn_all2 by (rewrite List.length_app; cbn [List.length]; lia).
+  reflexivity.
+Qed.
 
 (** * Rectangular matrices and transposition *)
 
@@ -153,143 +206,4 @@ Proof.
   rewrite HTlen in Hj. cbn in Hj.
   rewrite (transpose_nth m c j Hne Hr Hj).
   apply nth_map_nth.
-Qed.
-
-(** * The last row of the causal mask is all zeros *)
-
-Lemma causal_mask_last_row : forall n,
-  List.nth n (f32_causal_mask (S n)) []
-  = List.repeat f32_zero (S n).
-Proof.
-  intros n. unfold f32_causal_mask.
-  rewrite (List.nth_indep _ []
-    (List.map (fun col => f32_causal_mask_entry 0 col) (List.seq 0 (S n))))
-    by (rewrite List.length_map, List.length_seq; lia).
-  rewrite (List.map_nth (fun row =>
-    List.map (fun col => f32_causal_mask_entry row col) (List.seq 0 (S n)))).
-  rewrite List.seq_nth by lia. cbn [Nat.add].
-  rewrite <- (List.length_seq (S n) 0) at 2.
-  rewrite <- List.map_const.
-  apply List.map_ext_in. intros col Hcol.
-  apply List.in_seq in Hcol. destruct Hcol as [_ Hcol]. cbn in Hcol.
-  unfold f32_causal_mask_entry.
-  destruct (Nat.leb col n) eqn:E; [reflexivity|].
-  apply Nat.leb_gt in E. lia.
-Qed.
-
-(** Zipping a row against an all-zero mask row is the identity, away from
-    negative zero. *)
-Lemma apply_mask_zero_row : forall row n,
-  List.length row = n ->
-  Forall (fun x => x <> B754_zero true) row ->
-  List.map (fun p => let '(s, mv) := p in f32_plus s mv)
-           (List.combine row (List.repeat f32_zero n)) = row.
-Proof.
-  induction row as [|x row IH]; intros n Hlen Hall.
-  - destruct n; reflexivity.
-  - destruct n as [|n]; [discriminate|].
-    cbn [List.repeat List.combine List.map].
-    inversion Hall; subst.
-    rewrite f32_plus_zero_r by assumption.
-    f_equal. apply IH; [cbn in Hlen; lia | assumption].
-Qed.
-
-(** * The cached decode step *)
-
-Definition f32_attn_scale (d_k : nat) : binary32 :=
-  f32_div f32_one (f32_sqrt (f32_of_Z (Z.of_nat d_k))).
-
-(** [nth] commutes with [map] when the function sends the default to the
-    default, which is the case for every row-wise stage below. *)
-Lemma nth_map_nil2 : forall {A B : Type} (f : A -> list B) (l : list A) (d : A) n,
-  f d = [] ->
-  List.nth n (List.map f l) [] = f (List.nth n l d).
-Proof.
-  intros A B f l d n Hf. revert n.
-  induction l as [|x l IH]; intros n.
-  - destruct n; cbn [List.map List.nth]; symmetry; exact Hf.
-  - destruct n; [reflexivity | cbn [List.map List.nth]; apply IH].
-Qed.
-
-Lemma scale_scores_unfold : forall m d_k,
-  f32_scale_scores m d_k
-  = List.map (fun row => List.map (fun x => f32_mult x (f32_attn_scale d_k)) row) m.
-Proof. reflexivity. Qed.
-
-Definition f32_attend_cached (qrow : list binary32)
-    (kc vc : list (list binary32)) (d_k : nat) : list binary32 :=
-  let scores := List.map (fun kj => f32_mult (f32_dot qrow kj) (f32_attn_scale d_k)) kc in
-  let w := f32_softmax scores in
-  List.map (fun vcol => f32_dot w vcol) (f32_mat_transpose vc).
-
-(** * The theorem
-
-    Attending a single query over the cache is exactly the last row of full
-    causal attention over the same sequence. *)
-
-Theorem attention_last_row_cached :
-  forall q k v d_k n c,
-  List.length q = S n ->
-  List.length k = S n ->
-  rect k c -> (0 < c)%nat ->
-  Forall (fun x => x <> B754_zero true)
-    (List.map (fun kj => f32_mult (f32_dot (List.nth n q []) kj) (f32_attn_scale d_k)) k) ->
-  List.nth n (f32_causal_attention q k v d_k) []
-  = f32_attend_cached (List.nth n q []) k v d_k.
-Proof.
-  intros q k v d_k n c Hq Hk Hr Hc Hnz.
-  assert (Hkne : k <> []).
-  { intro H0. rewrite H0 in Hk. cbn in Hk. discriminate. }
-  unfold f32_causal_attention, f32_attend_cached. cbv zeta.
-  (* the outer matrix product: extract row n *)
-  unfold f32_mat_mul at 1.
-  rewrite (List.nth_indep _ []
-    (List.map (fun b_col => f32_dot [] b_col) (f32_mat_transpose v)))
-    by (rewrite List.length_map;
-        unfold f32_softmax_2d, f32_apply_mask, f32_scale_scores;
-        rewrite !List.length_map, List.length_combine, !List.length_map;
-        unfold f32_mat_mul; rewrite List.length_map;
-        unfold f32_causal_mask; rewrite List.length_map, List.length_seq;
-        rewrite Hq; unfold f32_mat_rows; rewrite Hq; lia).
-  rewrite (List.map_nth (fun a_row =>
-    List.map (fun b_col => f32_dot a_row b_col) (f32_mat_transpose v))).
-  f_equal.
-  (* the softmax row *)
-  unfold f32_softmax_2d.
-  rewrite (nth_map_nil2 _ _ (@nil binary32)) by reflexivity.
-  f_equal.
-  (* the masked score row *)
-  unfold f32_apply_mask.
-  rewrite (nth_map_nil2 _ _ (@nil binary32, @nil binary32)) by reflexivity.
-  rewrite List.combine_nth by
-    (unfold f32_scale_scores, f32_mat_mul, f32_causal_mask, f32_mat_rows;
-     rewrite !List.length_map, List.length_seq, Hq; reflexivity).
-  cbn [fst snd].
-  (* the mask row *)
-  unfold f32_mat_rows. rewrite Hq, causal_mask_last_row.
-  (* the scaled score row *)
-  rewrite scale_scores_unfold.
-  rewrite (nth_map_nil2 _ _ (@nil binary32)) by reflexivity.
-  unfold f32_mat_mul.
-  rewrite (List.nth_indep _ []
-    (List.map (fun b_col => f32_dot [] b_col)
-              (f32_mat_transpose (f32_mat_transpose k))))
-    by (rewrite List.length_map, Hq; lia).
-  rewrite (List.map_nth (fun a_row =>
-    List.map (fun b_col => f32_dot a_row b_col)
-             (f32_mat_transpose (f32_mat_transpose k)))).
-  rewrite (transpose_involutive k c Hkne Hc Hr).
-  rewrite List.map_map.
-  assert (Hrow :
-    List.map (fun p => let '(s, mv) := p in f32_plus s mv)
-      (List.combine
-         (List.map (fun x : list binary32 =>
-            f32_mult (f32_dot (List.nth n q []) x) (f32_attn_scale d_k)) k)
-         (List.repeat f32_zero (S n)))
-    = List.map (fun x : list binary32 =>
-        f32_mult (f32_dot (List.nth n q []) x) (f32_attn_scale d_k)) k).
-  { apply apply_mask_zero_row.
-    - rewrite List.length_map. exact Hk.
-    - exact Hnz. }
-  rewrite Hrow. reflexivity.
 Qed.

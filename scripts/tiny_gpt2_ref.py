@@ -1,11 +1,12 @@
 """Tiny GPT-2 reference for the float-pipeline equivalence check.
 
 Builds a tiny model with deterministic weights, saves a real .safetensors
-with GPT-2 tensor names, and computes a reference forward using the EXACT
-operations the Coq f32 pipeline defines (range-reduced exp, exp(x/256)^256,
-gelu(x)=x*sigmoid(1.702x), population-variance layernorm with eps=1e-5,
-causal scaled-dot-product attention with max-shifted softmax, tied-embedding
-logits). The extracted OCaml loads the same file and must agree.
+with GPT-2 tensor names, and computes a reference forward using the exact
+operations, in the exact order, the Rocq float pipeline defines: the scaled
+exponential, the tanh form of GELU, population-variance layernorm with
+eps=1e-5, causal attention where each row attends over its prefix with a
+max-shifted softmax, and tied-embedding logits. The extracted OCaml loads the
+same file and must agree.
 """
 import os
 import numpy as np
@@ -22,7 +23,17 @@ HD = D // H    # head_dim
 FF = 8         # n_inner
 VOCAB = 5
 NPOS = 4
-EPS = f32(1e-5)
+EPS = f32(1) / f32(100000)
+
+EXP_HI = f32(88)
+EXP_LO = f32(-88)
+LN2_HI = f32(355) / f32(512)
+LN2_LO = f32(14581891) / f32(68719476736)
+INV_LN2 = f32(12102203) / f32(8388608)
+MAGIC = f32(12582912)
+GELU_C1 = f32(7978845608) / f32(10000000000)
+GELU_C2 = f32(44715) / f32(1000000)
+HALF = f32(1) / f32(2)
 
 def gen(shape):
     n = int(np.prod(shape))
@@ -30,30 +41,33 @@ def gen(shape):
     return np.array(vals, dtype=f32).reshape(shape)
 
 def my_exp(x):
-    # range-reduced: exp(x) = exp(x/256)^256, matching the Coq f32_exp_approx.
-    # Saturate to the binary32 exponential range, divide by 256 so the argument
-    # lands where a 6-term Taylor series is accurate, then square eight times.
-    # Right-associated accumulation mirrors the Coq f32_plus nesting exactly.
+    # exp(x) = 2^k exp(r) with r = x - k log 2, matching f32_exp_approx. The
+    # right-associated accumulation mirrors the f32_plus nesting exactly.
     x = f32(x)
-    xc = f32(min(max(x, f32(-88.0)), f32(88.0)))
-    r = f32(xc / f32(256.0))
-    r2 = f32(r * r); r3 = f32(r2 * r); r4 = f32(r3 * r); r5 = f32(r4 * r); r6 = f32(r5 * r)
-    i = f32(r6 / f32(720.0))
-    i = f32(f32(r5 / f32(120.0)) + i)
-    i = f32(f32(r4 / f32(24.0)) + i)
-    i = f32(f32(r3 / f32(6.0)) + i)
-    i = f32(f32(r2 / f32(2.0)) + i)
-    i = f32(r + i)
-    s = f32(f32(1.0) + i)
-    for _ in range(8):
-        s = f32(s * s)
-    return s
+    xc = EXP_HI if EXP_HI < x else (EXP_LO if x < EXP_LO else x)
+    k = f32(f32(f32(xc * INV_LN2) + MAGIC) - MAGIC)
+    r = f32(f32(xc - f32(k * LN2_HI)) + f32(k * LN2_LO))
+    r2 = f32(r * r); r3 = f32(r2 * r); r4 = f32(r3 * r)
+    r5 = f32(r4 * r); r6 = f32(r5 * r); r7 = f32(r6 * r)
+    s = f32(f32(r6 / f32(720)) + f32(r7 / f32(5040)))
+    s = f32(f32(r5 / f32(120)) + s)
+    s = f32(f32(r4 / f32(24)) + s)
+    s = f32(f32(r3 / f32(6)) + s)
+    s = f32(f32(r2 / f32(2)) + s)
+    s = f32(r + s)
+    s = f32(f32(1) + s)
+    return f32(s * np.ldexp(f32(1), int(k)))
 
 def my_sigmoid(x):
     return f32(f32(1.0) / f32(f32(1.0) + my_exp(f32(-x))))
 
+def my_tanh(y):
+    return f32(f32(f32(2) * my_sigmoid(f32(f32(2) * y))) - f32(1))
+
 def my_gelu(x):
-    return f32(x * my_sigmoid(f32(f32(1702.0) / f32(1000.0) * x)))
+    x3 = f32(x * f32(x * x))
+    inner = f32(GELU_C1 * f32(x + f32(GELU_C2 * x3)))
+    return f32(f32(HALF * x) * f32(f32(1) + my_tanh(inner)))
 
 def dot(a, b):
     acc = f32(0.0)
@@ -71,7 +85,7 @@ def layernorm(v, g, b):
 def softmax(v):
     m = v[0]
     for x in v:
-        if x > m:
+        if m < x:
             m = x
     exps = [my_exp(f32(x - m)) for x in v]
     s = f32(0.0)
@@ -85,7 +99,6 @@ def linear(x, W, b):
     return [f32(dot([x[i] for i in range(len(x))], [W[i][j] for i in range(W.shape[0])]) + b[j]) for j in range(out_dim)]
 
 def main():
-    rng_names = {}
     wte = gen((VOCAB, D)); wpe = gen((NPOS, D))
     ln1_w = gen((D,)); ln1_b = gen((D,))
     c_attn_w = gen((D, 3 * D)); c_attn_b = gen((3 * D,))
@@ -121,16 +134,12 @@ def main():
         sl = slice(h*HD, (h+1)*HD)
         qh = [row[sl] for row in q]; kh = [row[sl] for row in k]; vh = [row[sl] for row in v]
         for i in range(S):
-            scores = []
-            for j in range(S):
-                sc = f32(dot(qh[i], kh[j]) * inv)
-                if j > i:
-                    sc = f32(sc + f32(-1000000000.0))
-                scores.append(sc)
+            # row i attends over positions 0..i
+            scores = [f32(dot(qh[i], kh[j]) * inv) for j in range(i + 1)]
             w = softmax(scores)
             for c in range(HD):
                 acc = f32(0.0)
-                for j in range(S):
+                for j in range(i + 1):
                     acc = f32(acc + f32(w[j] * vh[j][c]))
                 attn_out[i][h*HD + c] = acc
     proj = [linear(attn_out[i], c_proj_w, c_proj_b) for i in range(S)]
@@ -146,10 +155,10 @@ def main():
 
     flat = [float(x) for row in logits for x in row]
     with open(os.path.join(ROOT, "tiny_gpt2_ref_logits.txt"), "w") as fh:
-        fh.write(" ".join("%.6f" % x for x in flat) + "\n")
+        fh.write(" ".join("%.9g" % x for x in flat) + "\n")
     print("reference logits (%d x %d):" % (S, VOCAB))
     for row in logits:
-        print("  " + " ".join("%.6f" % float(x) for x in row))
+        print("  " + " ".join("%.9g" % float(x) for x in row))
 
 if __name__ == "__main__":
     main()

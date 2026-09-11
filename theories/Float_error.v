@@ -19,15 +19,17 @@
       intermediates the computation itself visits.
 
     - The forward pass. The same composition carried through every remaining
-      stage, to [f32_gpt2_logits]. Every scalar the network computes comes from
-      one of five primitives and everything else is list plumbing that performs
-      no arithmetic, so one propagation lemma per primitive plus the structural
-      lemmas reaches the top.
+      stage, to the logits of all three architectures. Every scalar the network
+      computes comes from one of five primitives and everything else is list
+      plumbing that performs no arithmetic, so one propagation lemma per
+      primitive plus the structural lemmas reaches the top.
 
-    Every hypothesis the bounds rest on is explicit: magnitudes stay under [M],
-    denominators and radicands stay above [m], no intermediate falls below the
-    smallest normal binary32 magnitude, and the exponential's saturation is not
-    engaged, so the float and the real evaluation follow the same path. *)
+    Rounding is modelled as [z (1 + d) + e] with [|d| <= u] and [|e| <= 2^-150],
+    which holds for every real [z], zero and the subnormal range included. The
+    composed bounds rest on three kinds of hypothesis, collected per stage in
+    records: magnitudes stay under [M], denominators and radicands stay above
+    [m], and the integer each exponential's reduction computes is the one the
+    real evaluation selects. *)
 
 From Stdlib Require Import ZArith.
 From Stdlib Require Import Reals.
@@ -145,9 +147,6 @@ Proof.
   apply error_le_half_ulp. apply f32_fexp_valid.
 Qed.
 
-(** * The composed bound for the dot product *)
-
-
 (** * The rounding model
 
     [f32_u] is the unit roundoff of binary32, and [f32_normal_lo] is the
@@ -175,6 +174,20 @@ Proof.
   apply (relative_error_N_FLT_ex radix2 f32_emin prec32 prec32_gt_0 _ z Hz).
 Qed.
 
+(** The values at which rounding is a relative perturbation: the normal range,
+    and zero, which rounds to itself. *)
+Definition relz (z : R) : Prop := f32_normal_lo <= Rabs z \/ z = 0.
+
+Lemma f32_round_relz : forall z : R,
+  relz z -> exists e, Rabs e <= f32_u /\ f32_round z = z * (1 + e).
+Proof.
+  intros z [Hz | Hz].
+  - apply f32_round_rel, Hz.
+  - subst z. exists 0. split.
+    + rewrite Rabs_R0. left. apply f32_u_pos.
+    + unfold f32_round. rewrite round_0 by apply valid_rnd_round_mode. ring.
+Qed.
+
 Lemma Rabs_1_plus : forall e, Rabs e <= f32_u -> Rabs (1 + e) <= 1 + f32_u.
 Proof.
   intros e He.
@@ -198,16 +211,16 @@ Theorem f32_mac_step_error : forall a x y : binary32,
   is_finite (f32_mult x y) = true ->
   Rlt_bool (Rabs (f32_round (B2R x * B2R y))) (bpow radix2 emax32) = true ->
   Rlt_bool (Rabs (f32_round (B2R a + B2R (f32_mult x y)))) (bpow radix2 emax32) = true ->
-  f32_normal_lo <= Rabs (B2R x * B2R y) ->
-  f32_normal_lo <= Rabs (B2R a + B2R (f32_mult x y)) ->
+  relz (B2R x * B2R y) ->
+  relz (B2R a + B2R (f32_mult x y)) ->
   Rabs (B2R (f32_plus a (f32_mult x y)) - (B2R a + B2R x * B2R y))
     <= f32_u * Rabs (B2R a + B2R x * B2R y)
        + f32_u * (1 + f32_u) * Rabs (B2R x * B2R y).
 Proof.
   intros a x y Hfa Hfm Hb1 Hb2 Hu1 Hu2.
   pose proof (f32_mult_correct x y Hb1) as HM.
-  destruct (f32_round_rel _ Hu1) as [e1 [He1 Hr1]].
-  destruct (f32_round_rel _ Hu2) as [e2 [He2 Hr2]].
+  destruct (f32_round_relz _ Hu1) as [e1 [He1 Hr1]].
+  destruct (f32_round_relz _ Hu2) as [e2 [He2 Hr2]].
   rewrite (f32_plus_correct a (f32_mult x y) Hfa Hfm Hb2), Hr2, HM, Hr1.
   replace ((B2R a + B2R x * B2R y * (1 + e1)) * (1 + e2)
              - (B2R a + B2R x * B2R y))
@@ -241,8 +254,9 @@ Proof.
     + rewrite (IH ys (c + B2R x * B2R y)), (IH ys (0 + B2R x * B2R y)). ring.
 Qed.
 
-(** Every step runs where the correctness lemmas apply: finite accumulator,
-    no overflow in either operation, and no underflow in either. *)
+(** Every step runs where rounding is relative: finite accumulator, no
+    overflow in either operation, and each exact result in the normal range or
+    exactly zero. *)
 Inductive f32_dot_regular : list binary32 -> list binary32 -> binary32 -> Prop :=
 | dot_reg_nil_l : forall ys a, f32_dot_regular nil ys a
 | dot_reg_nil_r : forall xs a, f32_dot_regular xs nil a
@@ -251,8 +265,8 @@ Inductive f32_dot_regular : list binary32 -> list binary32 -> binary32 -> Prop :
     is_finite (f32_mult x y) = true ->
     Rlt_bool (Rabs (f32_round (B2R x * B2R y))) (bpow radix2 emax32) = true ->
     Rlt_bool (Rabs (f32_round (B2R a + B2R (f32_mult x y)))) (bpow radix2 emax32) = true ->
-    f32_normal_lo <= Rabs (B2R x * B2R y) ->
-    f32_normal_lo <= Rabs (B2R a + B2R (f32_mult x y)) ->
+    relz (B2R x * B2R y) ->
+    relz (B2R a + B2R (f32_mult x y)) ->
     f32_dot_regular xs ys (f32_plus a (f32_mult x y)) ->
     f32_dot_regular (x :: xs) (y :: ys) a.
 
@@ -329,11 +343,10 @@ Proof.
   rewrite B2R_f32_zero in H. exact H.
 Qed.
 
-(** * The premise is satisfiable
+(** * A witness for the premise
 
-    A bound guarded by an unsatisfiable hypothesis says nothing, so a witness
-    is exhibited: the one-term dot product of ones runs entirely inside the
-    regular regime. *)
+    The one-term dot product of ones runs inside the regime the premise
+    describes. *)
 
 Lemma f32_round_1 : f32_round 1 = 1.
 Proof.
@@ -380,8 +393,8 @@ Proof.
   - exact mult_one_finite.
   - rewrite Hprod, f32_round_1, Rabs_R1. apply Rlt_bool_true, one_lt_emax.
   - rewrite Hsum, f32_round_1, Rabs_R1. apply Rlt_bool_true, one_lt_emax.
-  - rewrite Hprod, Rabs_R1. apply normal_lo_le_1.
-  - rewrite Hsum, Rabs_R1. apply normal_lo_le_1.
+  - left. rewrite Hprod, Rabs_R1. apply normal_lo_le_1.
+  - left. rewrite Hsum, Rabs_R1. apply normal_lo_le_1.
   - apply dot_reg_nil_l.
 Qed.
 
@@ -543,48 +556,88 @@ Qed.
 
 Close Scope Z_scope.
 
-(** * The composed bound for the whole forward pass *)
-
-
 (** * Rounding, in the form the propagation needs *)
 
 (** A rounded value is no larger than the exact one, up to one roundoff. *)
-Lemma round_abs_le : forall z,
-  f32_normal_lo <= Rabs z -> Rabs (f32_round z) <= Rabs z * (1 + f32_u).
+(** * The absolute term
+
+    [f32_eta] is half the smallest positive binary32: the largest absolute
+    error rounding can introduce where a purely relative model does not
+    apply. *)
+
+Definition f32_eta : R := / 2 * bpow radix2 f32_emin.
+
+Lemma f32_eta_pos : 0 < f32_eta.
+Proof. unfold f32_eta. apply Rmult_lt_0_compat; [lra | apply bpow_gt_0]. Qed.
+
+(** Rounding, with no hypothesis on [z] at all. Flocq's [error_N_FLT] gives a
+    relative perturbation in the normal range and an absolute one near zero,
+    and never both at once. *)
+Theorem f32_round_mixed : forall z : R,
+  exists d e,
+    Rabs d <= f32_u /\ Rabs e <= f32_eta /\ d * e = 0
+    /\ f32_round z = z * (1 + d) + e.
 Proof.
-  intros z Hz. destruct (f32_round_rel z Hz) as [e [He Hr]].
-  rewrite Hr, Rabs_mult.
-  apply Rmult_le_compat_l; [apply Rabs_pos | apply Rabs_1_plus, He].
+  intros z. unfold f32_round, f32_u, f32_eta.
+  change f32_fexp with (FLT_exp f32_emin prec32).
+  change (round_mode mode_NE) with (Znearest (fun n => negb (Z.even n))).
+  destruct (error_N_FLT radix2 f32_emin prec32 prec32_gt_0
+              (fun n => negb (Z.even n)) z)
+    as [d [e (Hd & He & Hde & Hr)]].
+  exists d, e. repeat split; assumption.
 Qed.
 
-(** [regz M z]: the exact result [z] of an operation is in the normal range and
-    small enough that rounding it cannot overflow. *)
+(** [regz M z]: the exact result [z] of an operation is small enough that
+    rounding it cannot overflow. No lower bound is imposed, so the relation
+    holds at zero and throughout the subnormal range. *)
 Definition regz (M z : R) : Prop :=
-  f32_normal_lo <= Rabs z /\ Rabs z * (1 + f32_u) <= M.
+  Rabs z * (1 + f32_u) + f32_eta <= M.
 
 Lemma regz_abs_le : forall M z, regz M z -> Rabs z <= M.
 Proof.
-  intros M z [_ Hb]. pose proof f32_u_pos.
+  intros M z Hb. unfold regz in Hb.
+  pose proof f32_u_pos. pose proof f32_eta_pos.
   pose proof (Rabs_pos z). nra.
+Qed.
+
+(** Zero satisfies it, for any budget that admits the absolute term. *)
+Lemma regz_zero : forall M, f32_eta <= M -> regz M 0.
+Proof.
+  intros M HM. unfold regz. rewrite Rabs_R0. lra.
+Qed.
+
+Lemma round_abs_le_mixed : forall M z, regz M z -> Rabs (f32_round z) <= M.
+Proof.
+  intros M z Hb. unfold regz in Hb.
+  destruct (f32_round_mixed z) as [d [e (Hd & He & _ & Hr)]].
+  rewrite Hr.
+  eapply Rle_trans; [apply Rabs_triang|].
+  assert (Hzd : Rabs (z * (1 + d)) <= Rabs z * (1 + f32_u)).
+  { rewrite Rabs_mult. apply Rmult_le_compat_l;
+      [apply Rabs_pos | apply Rabs_1_plus, Hd]. }
+  lra.
 Qed.
 
 Lemma no_overflow : forall M z,
   M < bpow radix2 emax32 -> regz M z ->
   Rlt_bool (Rabs (f32_round z)) (bpow radix2 emax32) = true.
 Proof.
-  intros M z HM [Hn Hb]. apply Rlt_bool_true.
-  eapply Rle_lt_trans; [apply round_abs_le; exact Hn | lra].
+  intros M z HM Hb. apply Rlt_bool_true.
+  eapply Rle_lt_trans; [apply round_abs_le_mixed; exact Hb | lra].
 Qed.
 
 Lemma round_err_le : forall M z,
-  regz M z -> Rabs (f32_round z - z) <= f32_u * M.
+  regz M z -> Rabs (f32_round z - z) <= f32_u * M + f32_eta.
 Proof.
-  intros M z Hr. destruct Hr as [Hn Hb].
-  destruct (f32_round_rel z Hn) as [e [He Hq]].
-  rewrite Hq. replace (z * (1 + e) - z) with (z * e) by ring.
-  rewrite Rabs_mult, Rmult_comm.
-  apply Rmult_le_compat; try apply Rabs_pos; [exact He|].
-  pose proof f32_u_pos. pose proof (Rabs_pos z). nra.
+  intros M z Hb.
+  assert (Hz : Rabs z <= M) by (apply regz_abs_le; exact Hb).
+  destruct (f32_round_mixed z) as [d [e (Hd & He & _ & Hr)]].
+  rewrite Hr. replace (z * (1 + d) + e - z) with (z * d + e) by ring.
+  eapply Rle_trans; [apply Rabs_triang|].
+  assert (Hzd : Rabs (z * d) <= M * f32_u).
+  { rewrite Rabs_mult. apply Rmult_le_compat; try apply Rabs_pos;
+      [exact Hz | exact Hd]. }
+  nra.
 Qed.
 
 (** * The propagation relation *)
@@ -633,7 +686,7 @@ Lemma ok_plus : forall M m L d x y rx ry,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok d x rx -> ok d y ry ->
   regz M (B2R x + B2R y) ->
-  ok (f32_u * M + L * d) (f32_plus x y) (rx + ry).
+  ok (f32_u * M + f32_eta + L * d) (f32_plus x y) (rx + ry).
 Proof.
   intros M m L d x y rx ry HM Hamp Hx Hy Hz.
   assert (HL : 2 <= L) by (destruct Hamp as (_ & _ & H & _); exact H).
@@ -652,7 +705,7 @@ Proof.
       with ((f32_round (B2R x + B2R y) - (B2R x + B2R y))
             + ((B2R x - rx) + (B2R y - ry))) by ring.
     eapply Rle_trans; [apply Rabs_triang|].
-    assert (H1 : Rabs (f32_round (B2R x + B2R y) - (B2R x + B2R y)) <= f32_u * M)
+    assert (H1 : Rabs (f32_round (B2R x + B2R y) - (B2R x + B2R y)) <= f32_u * M + f32_eta)
       by (eapply round_err_le; eassumption).
     assert (H2 : Rabs ((B2R x - rx) + (B2R y - ry)) <= d + d)
       by (eapply Rle_trans; [apply Rabs_triang | lra]).
@@ -672,7 +725,7 @@ Lemma ok_minus : forall M m L d x y rx ry,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok d x rx -> ok d y ry ->
   regz M (B2R x + B2R (f32_neg y)) ->
-  ok (f32_u * M + L * d) (f32_minus x y) (rx - ry).
+  ok (f32_u * M + f32_eta + L * d) (f32_minus x y) (rx - ry).
 Proof.
   intros M m L d x y rx ry HM Hamp Hx Hy Hz.
   unfold f32_minus.
@@ -685,7 +738,7 @@ Lemma ok_mult : forall M m L d x y rx ry,
   ok d x rx -> ok d y ry ->
   Rabs (B2R x) <= M -> Rabs ry <= M ->
   regz M (B2R x * B2R y) ->
-  ok (f32_u * M + L * d) (f32_mult x y) (rx * ry).
+  ok (f32_u * M + f32_eta + L * d) (f32_mult x y) (rx * ry).
 Proof.
   intros M m L d x y rx ry HM Hamp Hx Hy Hbx Hby Hz.
   assert (HL : 2 * M <= L) by (destruct Hamp as (_ & _ & _ & H & _); exact H).
@@ -704,7 +757,7 @@ Proof.
       with ((f32_round (B2R x * B2R y) - B2R x * B2R y)
             + (B2R x * (B2R y - ry) + (B2R x - rx) * ry)) by ring.
     eapply Rle_trans; [apply Rabs_triang|].
-    assert (H1 : Rabs (f32_round (B2R x * B2R y) - B2R x * B2R y) <= f32_u * M)
+    assert (H1 : Rabs (f32_round (B2R x * B2R y) - B2R x * B2R y) <= f32_u * M + f32_eta)
       by (eapply round_err_le; eassumption).
     assert (H2 : Rabs (B2R x * (B2R y - ry)) <= M * d).
     { rewrite Rabs_mult. apply Rmult_le_compat; try apply Rabs_pos; assumption. }
@@ -736,7 +789,7 @@ Lemma ok_div : forall M m L d x y rx ry,
   Rabs rx <= M ->
   m <= Rabs (B2R y) -> m <= Rabs ry ->
   regz M (B2R x / B2R y) ->
-  ok (f32_u * M + L * d) (f32_div x y) (rx / ry).
+  ok (f32_u * M + f32_eta + L * d) (f32_div x y) (rx / ry).
 Proof.
   intros M m L d x y rx ry HM Hamp Hx Hy Hbx Hmy Hmry Hz.
   assert (Hm : 0 < m) by (destruct Hamp as (H & _); exact H).
@@ -762,7 +815,7 @@ Proof.
             + ((B2R x - rx) / B2R y
                + (rx * (ry - B2R y)) / (B2R y * ry))) by (field; split; assumption).
     eapply Rle_trans; [apply Rabs_triang|].
-    assert (H1 : Rabs (f32_round (B2R x / B2R y) - B2R x / B2R y) <= f32_u * M)
+    assert (H1 : Rabs (f32_round (B2R x / B2R y) - B2R x / B2R y) <= f32_u * M + f32_eta)
       by (eapply round_err_le; eassumption).
     assert (H2 : Rabs ((B2R x - rx) / B2R y) <= d / m)
       by (apply abs_div_le with (k := m); assumption).
@@ -806,7 +859,7 @@ Lemma ok_sqrt : forall M m L d x rx,
   ok d x rx ->
   m <= B2R x -> m <= rx ->
   regz M (sqrt (B2R x)) ->
-  ok (f32_u * M + L * d) (f32_sqrt x) (sqrt rx).
+  ok (f32_u * M + f32_eta + L * d) (f32_sqrt x) (sqrt rx).
 Proof.
   intros M m L d x rx HM Hamp Hx Hmx Hmrx Hz.
   assert (Hm : 0 < m) by (destruct Hamp as (H & _); exact H).
@@ -823,7 +876,7 @@ Proof.
     replace (f32_round (sqrt (B2R x)) - sqrt rx)
       with ((f32_round (sqrt (B2R x)) - sqrt (B2R x)) + (sqrt (B2R x) - sqrt rx)) by ring.
     eapply Rle_trans; [apply Rabs_triang|].
-    assert (H1 : Rabs (f32_round (sqrt (B2R x)) - sqrt (B2R x)) <= f32_u * M)
+    assert (H1 : Rabs (f32_round (sqrt (B2R x)) - sqrt (B2R x)) <= f32_u * M + f32_eta)
       by (eapply round_err_le; eassumption).
     assert (Hprod : (sqrt (B2R x) - sqrt rx) * (sqrt (B2R x) + sqrt rx) = B2R x - rx).
     { replace ((sqrt (B2R x) - sqrt rx) * (sqrt (B2R x) + sqrt rx))
@@ -854,18 +907,18 @@ Qed.
 Fixpoint errN (M L : R) (n : nat) : R :=
   match n with
   | O => 0
-  | S k => f32_u * M + L * errN M L k
+  | S k => f32_u * M + f32_eta + L * errN M L k
   end.
 
 Lemma errN_nonneg : forall M L n, 0 <= M -> 1 <= L -> 0 <= errN M L n.
 Proof.
-  intros M L n HM HL. pose proof f32_u_pos.
+  intros M L n HM HL. pose proof f32_u_pos. pose proof f32_eta_pos.
   induction n as [|k IH]; simpl; [lra | nra].
 Qed.
 
 Lemma errN_mono_S : forall M L n, 0 <= M -> 1 <= L -> errN M L n <= errN M L (S n).
 Proof.
-  intros M L n HM HL. pose proof f32_u_pos.
+  intros M L n HM HL. pose proof f32_u_pos. pose proof f32_eta_pos.
   pose proof (errN_nonneg M L n HM HL).
   simpl. nra.
 Qed.
@@ -1037,12 +1090,12 @@ Proof.
     + eapply okv_weaken; [exact Hxs | apply errN_mono; auto; lia].
     + eapply okv_weaken; [exact Hys | apply errN_mono; auto; lia].
     + exact Hss'.
-    + change (errN M L (S (S n))) with (f32_u * M + L * errN M L (S n)).
+    + change (errN M L (S (S n))) with (f32_u * M + f32_eta + L * errN M L (S n)).
       eapply ok_plus with (m := m).
       * exact HM.
       * exact Hamp.
       * eapply ok_errN_mono with (n := n); [exact HM0 | exact HL1 | lia | exact Ha].
-      * change (errN M L (S n)) with (f32_u * M + L * errN M L n).
+      * change (errN M L (S n)) with (f32_u * M + f32_eta + L * errN M L n).
         eapply ok_mult with (m := m); try eassumption.
       * exact Hz2.
 Qed.
@@ -1149,7 +1202,7 @@ Proof.
   - inversion Hx as [|x' rx xs' rs' Hxr Hxs]; subst.
     inversion Hy as [|y' ry ys' ss' Hyr Hys]; subst.
     simpl. constructor.
-    + change (errN M L (S n)) with (f32_u * M + L * errN M L n).
+    + change (errN M L (S n)) with (f32_u * M + f32_eta + L * errN M L n).
       eapply ok_plus with (m := m); eassumption.
     + apply IH; assumption.
 Qed.
@@ -1280,7 +1333,7 @@ Proof.
       [exact HM0 | exact HL1 | lia |].
     apply IH.
     + eapply okv_weaken; [exact Hxs | apply errN_mono; auto; lia].
-    + change (errN M L (S n)) with (f32_u * M + L * errN M L n).
+    + change (errN M L (S n)) with (f32_u * M + f32_eta + L * errN M L n).
       eapply ok_plus with (m := m); eassumption.
 Qed.
 
@@ -1316,7 +1369,7 @@ Proof.
   assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
   unfold f32_mean, Rmean.
   change (errN M L (S (n + List.length xs)))
-    with (f32_u * M + L * errN M L (n + List.length xs)).
+    with (f32_u * M + f32_eta + L * errN M L (n + List.length xs)).
   eapply ok_div with (m := m); try eassumption.
   - eapply ok_sum; eassumption.
   - eapply ok_weaken; [apply ok_exact; exact Hfin | apply errN_nonneg; assumption].
@@ -1346,9 +1399,9 @@ Proof.
   inversion Hx as [|x' rx xs'' rs'' Hxr Hxs]; subst.
   constructor.
   - assert (Hd : ok (errN M L (S n)) (f32_minus x mu) (r - rmu)).
-    { change (errN M L (S n)) with (f32_u * M + L * errN M L n).
+    { change (errN M L (S n)) with (f32_u * M + f32_eta + L * errN M L n).
       eapply ok_minus with (m := m); eassumption. }
-    change (errN M L (S (S n))) with (f32_u * M + L * errN M L (S n)).
+    change (errN M L (S (S n))) with (f32_u * M + f32_eta + L * errN M L (S n)).
     eapply ok_mult with (m := m); eassumption.
   - apply IH; exact Hxs.
 Qed.
@@ -1376,7 +1429,7 @@ Proof.
                  = List.length xs) by apply List.length_map.
   unfold f32_variance, Rvariance.
   change (errN M L (S (S (S n) + List.length xs)))
-    with (f32_u * M + L * errN M L (S (S n) + List.length xs)).
+    with (f32_u * M + f32_eta + L * errN M L (S (S n) + List.length xs)).
   eapply ok_div with (m := m); try eassumption.
   - pose proof (ok_sum M m L (S (S n))
                   (List.map (fun x => let d := f32_minus x mu in f32_mult d d) xs)
@@ -1473,11 +1526,11 @@ Proof.
   destruct p as [i xi]. destruct q as [j ri]. simpl in *. subst j.
   unfold f32_layer_norm_elem, Rlayer_norm_elem.
   assert (Hsub : ok (errN M L (S k)) (f32_minus xi mu) (ri - rmu)).
-  { change (errN M L (S k)) with (f32_u * M + L * errN M L k).
+  { change (errN M L (S k)) with (f32_u * M + f32_eta + L * errN M L k).
     eapply ok_minus with (m := m); eassumption. }
   assert (Hnorm : ok (errN M L (S (S k))) (f32_div (f32_minus xi mu) denom)
                      ((ri - rmu) / rdenom)).
-  { change (errN M L (S (S k))) with (f32_u * M + L * errN M L (S k)).
+  { change (errN M L (S (S k))) with (f32_u * M + f32_eta + L * errN M L (S k)).
     eapply ok_div with (m := m); try eassumption.
     eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hden]. }
   assert (Hgi : ok (errN M L (S (S k))) (List.nth i gamma f32_one) (List.nth i rgamma 1)).
@@ -1490,9 +1543,9 @@ Proof.
                     (f32_mult (List.nth i gamma f32_one)
                               (f32_div (f32_minus xi mu) denom))
                     (List.nth i rgamma 1 * ((ri - rmu) / rdenom))).
-  { change (errN M L (S (S (S k)))) with (f32_u * M + L * errN M L (S (S k))).
+  { change (errN M L (S (S (S k)))) with (f32_u * M + f32_eta + L * errN M L (S (S k))).
     eapply ok_mult with (m := m); eassumption. }
-  change (errN M L (S (S (S (S k))))) with (f32_u * M + L * errN M L (S (S (S k)))).
+  change (errN M L (S (S (S (S k))))) with (f32_u * M + f32_eta + L * errN M L (S (S (S k)))).
   eapply ok_plus with (m := m); eassumption.
 Qed.
 
@@ -1592,12 +1645,12 @@ Proof.
   set (k := S (S n2)).
   assert (Hshift : ok (errN M L (S n2)) (f32_plus (f32_variance x (f32_mean x)) eps)
                       (Rvariance rx (Rmean rx len) len + reps)).
-  { change (errN M L (S n2)) with (f32_u * M + L * errN M L n2).
+  { change (errN M L (S n2)) with (f32_u * M + f32_eta + L * errN M L n2).
     eapply ok_plus with (m := m); try eassumption.
     eapply ok_errN_mono with (n := n); [exact HM0 | exact HL1 | unfold n2, n1; lia | exact Heps]. }
   assert (Hden : ok (errN M L k) (f32_sqrt (f32_plus (f32_variance x (f32_mean x)) eps))
                     (sqrt (Rvariance rx (Rmean rx len) len + reps))).
-  { unfold k. change (errN M L (S (S n2))) with (f32_u * M + L * errN M L (S n2)).
+  { unfold k. change (errN M L (S (S n2))) with (f32_u * M + f32_eta + L * errN M L (S n2)).
     eapply ok_sqrt with (m := m); eassumption. }
   unfold f32_layer_norm_vec, Rlayer_norm_vec.
   eapply okv_weaken.
@@ -1650,7 +1703,7 @@ Lemma ok_plus_S : forall M m L k x y rx ry,
   regz M (B2R x + B2R y) ->
   ok (errN M L (S k)) (f32_plus x y) (rx + ry).
 Proof.
-  intros. change (errN M L (S k)) with (f32_u * M + L * errN M L k).
+  intros. change (errN M L (S k)) with (f32_u * M + f32_eta + L * errN M L k).
   eapply ok_plus; eassumption.
 Qed.
 
@@ -1660,7 +1713,7 @@ Lemma ok_minus_S : forall M m L k x y rx ry,
   regz M (B2R x + B2R (f32_neg y)) ->
   ok (errN M L (S k)) (f32_minus x y) (rx - ry).
 Proof.
-  intros. change (errN M L (S k)) with (f32_u * M + L * errN M L k).
+  intros. change (errN M L (S k)) with (f32_u * M + f32_eta + L * errN M L k).
   eapply ok_minus; eassumption.
 Qed.
 
@@ -1671,7 +1724,7 @@ Lemma ok_mult_S : forall M m L k x y rx ry,
   regz M (B2R x * B2R y) ->
   ok (errN M L (S k)) (f32_mult x y) (rx * ry).
 Proof.
-  intros. change (errN M L (S k)) with (f32_u * M + L * errN M L k).
+  intros. change (errN M L (S k)) with (f32_u * M + f32_eta + L * errN M L k).
   eapply ok_mult; eassumption.
 Qed.
 
@@ -1682,7 +1735,7 @@ Lemma ok_div_S : forall M m L k x y rx ry,
   regz M (B2R x / B2R y) ->
   ok (errN M L (S k)) (f32_div x y) (rx / ry).
 Proof.
-  intros. change (errN M L (S k)) with (f32_u * M + L * errN M L k).
+  intros. change (errN M L (S k)) with (f32_u * M + f32_eta + L * errN M L k).
   eapply ok_div; eassumption.
 Qed.
 
@@ -1693,7 +1746,7 @@ Lemma ok_sqrt_S : forall M m L k x rx,
   regz M (sqrt (B2R x)) ->
   ok (errN M L (S k)) (f32_sqrt x) (sqrt rx).
 Proof.
-  intros. change (errN M L (S k)) with (f32_u * M + L * errN M L k).
+  intros. change (errN M L (S k)) with (f32_u * M + f32_eta + L * errN M L k).
   eapply ok_sqrt; eassumption.
 Qed.
 
@@ -1706,100 +1759,327 @@ Proof.
   eapply ok_weaken; [apply ok_exact; exact Hf | apply errN_nonneg; assumption].
 Qed.
 
+(** * Reading a binary32 as the rational it denotes
+
+    [Qb] reads a binary32 as the exact rational it denotes, and [Qb_correct]
+    says the reading is faithful. A finite set of concrete binary32 facts can
+    then be checked by computation; the exponential below uses that to
+    establish its scaling. *)
+
+Open Scope Q_scope.
+
+(** The exact value of a binary32, as a rational. *)
+Definition Qb (x : binary32) : Q :=
+  match x with
+  | B754_finite s m e _ =>
+      let n := cond_Zopp s (Zpos m) in
+      match e with
+      | Z0 => inject_Z n
+      | Zpos p => inject_Z (n * Zpower_pos 2 p)
+      | Zneg p => inject_Z n / inject_Z (Zpower_pos 2 p)
+      end
+  | _ => 0
+  end.
+
+(** The rational value of [2^z]. *)
+Definition pow2Q (z : Z) : Q :=
+  match z with
+  | Z0 => 1
+  | Zpos p => inject_Z (Zpower_pos 2 p)
+  | Zneg p => inject_Z 1 / inject_Z (Zpower_pos 2 p)
+  end.
+
+Close Scope Q_scope.
+
+Lemma Q2R_inject : forall n, Q2R (inject_Z n) = IZR n.
+Proof. intros n. unfold Q2R, inject_Z. simpl. field. Qed.
+
+Lemma Zpower_pos_gt0 : forall p, (0 < Zpower_pos 2 p)%Z.
+Proof. intros p. apply Zpower_pos_gt_0. lia. Qed.
+
+Lemma Qb_correct : forall x : binary32, B2R x = Q2R (Qb x).
+Proof.
+  intros x. destruct x as [s|s| |s m e H]; simpl;
+    try (unfold Q2R; simpl; lra).
+  unfold F2R. simpl.
+  destruct e as [|p|p].
+  - rewrite Q2R_inject. simpl. lra.
+  - rewrite Q2R_inject, mult_IZR. reflexivity.
+  - rewrite Q2R_div by
+      (intro Hc; unfold Qeq, inject_Z in Hc; simpl in Hc;
+       pose proof (Zpower_pos_gt0 p); lia).
+    rewrite !Q2R_inject. unfold bpow. unfold Rdiv. reflexivity.
+Qed.
+
+Lemma pow2Q_correct : forall z, bpow radix2 z = Q2R (pow2Q z).
+Proof.
+  intros [|p|p]; unfold pow2Q.
+  - unfold Q2R. simpl. lra.
+  - rewrite Q2R_inject. reflexivity.
+  - rewrite Q2R_div by
+      (intro Hc; unfold Qeq, inject_Z in Hc; simpl in Hc;
+       pose proof (Zpower_pos_gt0 p); lia).
+    rewrite !Q2R_inject. unfold bpow. unfold Rdiv. rewrite Rmult_1_l.
+    reflexivity.
+Qed.
+
+(** * Comparison *)
+
+Lemma f32_lt_correct : forall x y,
+  is_finite x = true -> is_finite y = true ->
+  f32_lt x y = true <-> B2R x < B2R y.
+Proof.
+  intros x y Hx Hy. unfold f32_lt, f32_compare.
+  rewrite (Bcompare_correct prec32 emax32 x y Hx Hy).
+  destruct (Rcompare_spec (B2R x) (B2R y)) as [H|H|H]; split; intro Hc;
+    try discriminate; try lra; try reflexivity.
+Qed.
+
 (** * The exponential
 
-    [f32_exp_approx] saturates its argument, divides by 256, evaluates a
-    six-term Taylor series and squares eight times. The saturation is the only
-    branch in the forward pass; the bound below is stated for arguments the
-    saturation leaves alone, so the float and the real evaluation follow the
-    same path. *)
+    [f32_exp_approx] saturates its argument to [[-88, 88]], reduces it to
+    [r = x - k log 2] with [k] the nearest integer to [x / log 2], evaluates a
+    degree-seven Taylor polynomial at [r], and multiplies by [2^k]. The real
+    evaluation saturates too, through [Rsat]. Saturation cannot widen a
+    distance, so the relation passes through it for arguments on either side
+    of the range, and the rest of the computation is bounded on the saturated
+    argument. The one branch that is a hypothesis is the integer [k]: the
+    float reduction must land on the integer [Re_k] the real evaluation
+    selects. The factor [2^k] is exact, so the scaling contributes a single
+    rounding. *)
 
-Definition e_r  (x : binary32) : binary32 := f32_div x f32_exp_div.
-Definition e_r2 (x : binary32) : binary32 := f32_mult (e_r x) (e_r x).
-Definition e_r3 (x : binary32) : binary32 := f32_mult (e_r2 x) (e_r x).
-Definition e_r4 (x : binary32) : binary32 := f32_mult (e_r3 x) (e_r x).
-Definition e_r5 (x : binary32) : binary32 := f32_mult (e_r4 x) (e_r x).
-Definition e_r6 (x : binary32) : binary32 := f32_mult (e_r5 x) (e_r x).
+(** The integers the reduction produces, and the binary32 facts about them
+    that the scaling needs, checked by computation over the whole range. *)
+Definition exp_k_range : list Z :=
+  List.map (fun n => (Z.of_nat n - 127)%Z) (List.seq 0 255).
+
+Lemma in_exp_k_range : forall z, (-127 <= z <= 127)%Z -> In z exp_k_range.
+Proof.
+  intros z Hz. unfold exp_k_range. apply List.in_map_iff.
+  exists (Z.to_nat (z + 127)). split.
+  - rewrite Z2Nat.id by lia. lia.
+  - apply List.in_seq. lia.
+Qed.
+
+Definition exp_k_ok (z : Z) : bool :=
+  is_finite (f32_of_Z z) && Qeq_bool (Qb (f32_of_Z z)) (inject_Z z)
+  && is_finite (f32_pow2 (f32_of_Z z))
+  && Qeq_bool (Qb (f32_pow2 (f32_of_Z z))) (pow2Q z).
+
+Lemma exp_k_ok_all : List.forallb exp_k_ok exp_k_range = true.
+Proof. vm_compute. reflexivity. Qed.
+
+Lemma exp_k_facts : forall z, (-127 <= z <= 127)%Z ->
+  is_finite (f32_of_Z z) = true /\ B2R (f32_of_Z z) = IZR z
+  /\ is_finite (f32_pow2 (f32_of_Z z)) = true
+  /\ B2R (f32_pow2 (f32_of_Z z)) = bpow radix2 z.
+Proof.
+  intros z Hz.
+  pose proof (proj1 (List.forallb_forall exp_k_ok exp_k_range) exp_k_ok_all z
+                (in_exp_k_range z Hz)) as H.
+  unfold exp_k_ok in H.
+  apply andb_prop in H as [H H4]. apply andb_prop in H as [H H3].
+  apply andb_prop in H as [H1 H2].
+  apply Qeq_bool_eq in H2. apply Qeq_bool_eq in H4.
+  repeat split; try assumption.
+  - rewrite Qb_correct, (Qeq_eqR _ _ H2). apply Q2R_inject.
+  - rewrite Qb_correct, (Qeq_eqR _ _ H4). symmetry. apply pow2Q_correct.
+Qed.
+
+(** The stages of the unsaturated computation, named as the definition forms
+    them. *)
+Definition e_k    (x : binary32) : binary32 := f32_exp_k x.
+Definition e_khi  (x : binary32) : binary32 := f32_mult (e_k x) f32_ln2_hi.
+Definition e_klo  (x : binary32) : binary32 := f32_mult (e_k x) f32_ln2_lo.
+Definition e_r1   (x : binary32) : binary32 := f32_minus x (e_khi x).
+Definition e_r    (x : binary32) : binary32 := f32_plus (e_r1 x) (e_klo x).
+Definition e_r2   (x : binary32) : binary32 := f32_mult (e_r x) (e_r x).
+Definition e_r3   (x : binary32) : binary32 := f32_mult (e_r2 x) (e_r x).
+Definition e_r4   (x : binary32) : binary32 := f32_mult (e_r3 x) (e_r x).
+Definition e_r5   (x : binary32) : binary32 := f32_mult (e_r4 x) (e_r x).
+Definition e_r6   (x : binary32) : binary32 := f32_mult (e_r5 x) (e_r x).
+Definition e_r7   (x : binary32) : binary32 := f32_mult (e_r6 x) (e_r x).
 
 Definition e_d2 (x : binary32) : binary32 := f32_div (e_r2 x) f32_two.
 Definition e_d3 (x : binary32) : binary32 := f32_div (e_r3 x) f32_six.
 Definition e_d4 (x : binary32) : binary32 := f32_div (e_r4 x) f32_twenty_four.
 Definition e_d5 (x : binary32) : binary32 := f32_div (e_r5 x) f32_one_twenty.
 Definition e_d6 (x : binary32) : binary32 := f32_div (e_r6 x) f32_seven_twenty.
+Definition e_d7 (x : binary32) : binary32 := f32_div (e_r7 x) f32_five_thousand_forty.
 
-Definition e_p1 (x : binary32) : binary32 := f32_plus (e_d5 x) (e_d6 x).
-Definition e_p2 (x : binary32) : binary32 := f32_plus (e_d4 x) (e_p1 x).
-Definition e_p3 (x : binary32) : binary32 := f32_plus (e_d3 x) (e_p2 x).
-Definition e_p4 (x : binary32) : binary32 := f32_plus (e_d2 x) (e_p3 x).
-Definition e_p5 (x : binary32) : binary32 := f32_plus (e_r x) (e_p4 x).
-Definition e_poly (x : binary32) : binary32 := f32_plus f32_one (e_p5 x).
+Definition e_p1 (x : binary32) : binary32 := f32_plus (e_d6 x) (e_d7 x).
+Definition e_p2 (x : binary32) : binary32 := f32_plus (e_d5 x) (e_p1 x).
+Definition e_p3 (x : binary32) : binary32 := f32_plus (e_d4 x) (e_p2 x).
+Definition e_p4 (x : binary32) : binary32 := f32_plus (e_d3 x) (e_p3 x).
+Definition e_p5 (x : binary32) : binary32 := f32_plus (e_d2 x) (e_p4 x).
+Definition e_p6 (x : binary32) : binary32 := f32_plus (e_r x) (e_p5 x).
+Definition e_poly (x : binary32) : binary32 := f32_plus f32_one (e_p6 x).
 
-Definition e_sq (s : binary32) : binary32 := f32_mult s s.
+(** The saturation, and the computation that follows it. *)
+Definition e_sat (x : binary32) : binary32 :=
+  if f32_lt f32_exp_hi x then f32_exp_hi
+  else if f32_lt x f32_exp_lo then f32_exp_lo else x.
 
-Definition sq8 (s0 : binary32) : binary32 :=
-  let s := e_sq s0 in let s := e_sq s in let s := e_sq s in let s := e_sq s in
-  let s := e_sq s in let s := e_sq s in let s := e_sq s in let s := e_sq s in s.
+Definition f32_exp_core (x : binary32) : binary32 :=
+  f32_mult (e_poly x) (f32_pow2 (e_k x)).
 
-Lemma f32_exp_approx_unclamped : forall x,
-  f32_lt f32_exp_hi x = false -> f32_lt x f32_exp_lo = false ->
-  f32_exp_approx x = sq8 (e_poly x).
+Lemma f32_exp_approx_sat : forall x, f32_exp_approx x = f32_exp_core (e_sat x).
 Proof.
-  intros x H1 H2.
-  unfold f32_exp_approx, sq8, e_sq, e_poly, e_p5, e_p4, e_p3, e_p2, e_p1,
-         e_d6, e_d5, e_d4, e_d3, e_d2, e_r6, e_r5, e_r4, e_r3, e_r2, e_r.
-  rewrite H1, H2. reflexivity.
+  intros x.
+  unfold f32_exp_approx, f32_exp_core, e_sat, e_poly, e_p6, e_p5, e_p4, e_p3,
+         e_p2, e_p1, e_d7, e_d6, e_d5, e_d4, e_d3, e_d2,
+         e_r7, e_r6, e_r5, e_r4, e_r3, e_r2, e_r, e_r1, e_khi, e_klo, e_k.
+  cbv zeta. reflexivity.
 Qed.
 
-Lemma sq8_iter : forall s, sq8 s = Nat.iter 8 e_sq s.
-Proof. intros s. reflexivity. Qed.
+(** The real evaluation. It selects [k] by rounding the exact product, and
+    otherwise performs the same operations on the same constants. *)
+Definition Re_k (rx : R) : Z :=
+  Znearest (fun n => negb (Z.even n)) (rx * B2R f32_inv_ln2).
 
-Definition Re_r  (rx : R) : R := rx / B2R f32_exp_div.
-Definition Re_r2 (rx : R) : R := Re_r rx * Re_r rx.
-Definition Re_r3 (rx : R) : R := Re_r2 rx * Re_r rx.
-Definition Re_r4 (rx : R) : R := Re_r3 rx * Re_r rx.
-Definition Re_r5 (rx : R) : R := Re_r4 rx * Re_r rx.
-Definition Re_r6 (rx : R) : R := Re_r5 rx * Re_r rx.
+Definition Re_khi (rx : R) : R := IZR (Re_k rx) * B2R f32_ln2_hi.
+Definition Re_klo (rx : R) : R := IZR (Re_k rx) * B2R f32_ln2_lo.
+Definition Re_r1  (rx : R) : R := rx - Re_khi rx.
+Definition Re_r   (rx : R) : R := Re_r1 rx + Re_klo rx.
+Definition Re_r2  (rx : R) : R := Re_r rx * Re_r rx.
+Definition Re_r3  (rx : R) : R := Re_r2 rx * Re_r rx.
+Definition Re_r4  (rx : R) : R := Re_r3 rx * Re_r rx.
+Definition Re_r5  (rx : R) : R := Re_r4 rx * Re_r rx.
+Definition Re_r6  (rx : R) : R := Re_r5 rx * Re_r rx.
+Definition Re_r7  (rx : R) : R := Re_r6 rx * Re_r rx.
 
 Definition Re_d2 (rx : R) : R := Re_r2 rx / B2R f32_two.
 Definition Re_d3 (rx : R) : R := Re_r3 rx / B2R f32_six.
 Definition Re_d4 (rx : R) : R := Re_r4 rx / B2R f32_twenty_four.
 Definition Re_d5 (rx : R) : R := Re_r5 rx / B2R f32_one_twenty.
 Definition Re_d6 (rx : R) : R := Re_r6 rx / B2R f32_seven_twenty.
+Definition Re_d7 (rx : R) : R := Re_r7 rx / B2R f32_five_thousand_forty.
 
-Definition Re_p1 (rx : R) : R := Re_d5 rx + Re_d6 rx.
-Definition Re_p2 (rx : R) : R := Re_d4 rx + Re_p1 rx.
-Definition Re_p3 (rx : R) : R := Re_d3 rx + Re_p2 rx.
-Definition Re_p4 (rx : R) : R := Re_d2 rx + Re_p3 rx.
-Definition Re_p5 (rx : R) : R := Re_r rx + Re_p4 rx.
-Definition Re_poly (rx : R) : R := 1 + Re_p5 rx.
+Definition Re_p1 (rx : R) : R := Re_d6 rx + Re_d7 rx.
+Definition Re_p2 (rx : R) : R := Re_d5 rx + Re_p1 rx.
+Definition Re_p3 (rx : R) : R := Re_d4 rx + Re_p2 rx.
+Definition Re_p4 (rx : R) : R := Re_d3 rx + Re_p3 rx.
+Definition Re_p5 (rx : R) : R := Re_d2 rx + Re_p4 rx.
+Definition Re_p6 (rx : R) : R := Re_r rx + Re_p5 rx.
+Definition Re_poly (rx : R) : R := 1 + Re_p6 rx.
 
-Definition Re_sq (s : R) : R := s * s.
-Definition Re_exp_approx (rx : R) : R := Nat.iter 8 Re_sq (Re_poly rx).
+Definition Re_exp_core (rx : R) : R := Re_poly rx * bpow radix2 (Re_k rx).
 
-(** Iterated squaring, with the magnitude conditions supplied per step. *)
-Lemma ok_iter_sq : forall M m L j k s rs,
-  M < bpow radix2 emax32 -> amp_ok M m L ->
-  ok (errN M L k) s rs ->
-  (forall i, (i < j)%nat ->
-     Rabs (B2R (Nat.iter i e_sq s)) <= M
-     /\ Rabs (Nat.iter i Re_sq rs) <= M
-     /\ regz M (B2R (Nat.iter i e_sq s) * B2R (Nat.iter i e_sq s))) ->
-  ok (errN M L (k + j)) (Nat.iter j e_sq s) (Nat.iter j Re_sq rs).
+Definition Rsat (rx : R) : R := Rmax (-88) (Rmin 88 rx).
+
+Definition Re_exp_approx (rx : R) : R := Re_exp_core (Rsat rx).
+
+Lemma Rsat_cases : forall rx,
+  (88 <= rx /\ Rsat rx = 88) \/ (rx <= -88 /\ Rsat rx = -88)
+  \/ (-88 <= rx <= 88 /\ Rsat rx = rx).
 Proof.
-  intros M m L j. induction j as [|j IH]; intros k s rs HM Hamp Hs Hcond.
-  - simpl. rewrite Nat.add_0_r. exact Hs.
-  - simpl. replace (k + S j)%nat with (S (k + j))%nat by lia.
-    unfold e_sq at 1. unfold Re_sq at 1.
-    eapply ok_mult_S with (m := m); try eassumption.
-    + apply IH; try assumption. intros i Hi. apply Hcond. lia.
-    + apply IH; try assumption. intros i Hi. apply Hcond. lia.
-    + apply (Hcond j). lia.
-    + apply (Hcond j). lia.
-    + apply (Hcond j). lia.
+  intros rx. unfold Rsat.
+  destruct (Rle_or_lt 88 rx) as [H|H].
+  - left. split; [exact H|].
+    rewrite Rmin_left by exact H. apply Rmax_right. lra.
+  - destruct (Rle_or_lt rx (-88)) as [H'|H'].
+    + right; left. split; [exact H'|].
+      rewrite Rmin_right by lra. apply Rmax_left. exact H'.
+    + right; right. split; [lra|].
+      rewrite Rmin_right by lra. apply Rmax_right. lra.
 Qed.
 
-Lemma fin_exp_div : is_finite f32_exp_div = true.
-Proof. vm_compute. reflexivity. Qed.
+Lemma Rsat_range : forall rx, -88 <= Rsat rx <= 88.
+Proof.
+  intros rx. destruct (Rsat_cases rx) as [[_ H]|[[_ H]|[H1 H]]]; rewrite H; lra.
+Qed.
+
+Lemma Rsat_id : forall rx, -88 <= rx <= 88 -> Rsat rx = rx.
+Proof.
+  intros rx Hr.
+  destruct (Rsat_cases rx) as [[H1 H]|[[H1 H]|[_ H]]]; rewrite H; lra.
+Qed.
+
+(** Saturating both evaluations does not widen the distance between them. *)
+Lemma ok_sat : forall d x rx, ok d x rx -> ok d (e_sat x) (Rsat rx).
+Proof.
+  intros d x rx [Hf Hd].
+  destruct (exp_k_facts 88 ltac:(lia)) as (Hhf & Hh & _).
+  destruct (exp_k_facts (-88) ltac:(lia)) as (Hlf & Hl & _).
+  change (f32_of_Z 88) with f32_exp_hi in Hhf, Hh.
+  change (f32_of_Z (-88)) with f32_exp_lo in Hlf, Hl.
+  apply Rabs_le_inv in Hd.
+  unfold e_sat.
+  destruct (f32_lt f32_exp_hi x) eqn:E1; cbv iota.
+  - apply (proj1 (f32_lt_correct _ _ Hhf Hf)) in E1. rewrite Hh in E1.
+    split; [exact Hhf|]. rewrite Hh. apply Rabs_le.
+    destruct (Rsat_cases rx) as [[H1 H]|[[H1 H]|[H1 H]]]; rewrite H; lra.
+  - destruct (f32_lt x f32_exp_lo) eqn:E2; cbv iota.
+    + apply (proj1 (f32_lt_correct _ _ Hf Hlf)) in E2. rewrite Hl in E2.
+      split; [exact Hlf|]. rewrite Hl. apply Rabs_le.
+      destruct (Rsat_cases rx) as [[H1 H]|[[H1 H]|[H1 H]]]; rewrite H; lra.
+    + assert (N1 : B2R x <= 88).
+      { apply Rnot_lt_le. intro C. rewrite <- Hh in C.
+        apply (proj2 (f32_lt_correct _ _ Hhf Hf)) in C. congruence. }
+      assert (N2 : -88 <= B2R x).
+      { apply Rnot_lt_le. intro C. rewrite <- Hl in C.
+        apply (proj2 (f32_lt_correct _ _ Hf Hlf)) in C. congruence. }
+      split; [exact Hf|]. apply Rabs_le.
+      destruct (Rsat_cases rx) as [[H1 H]|[[H1 H]|[H1 H]]]; rewrite H; lra.
+Qed.
+
+(** The integer the real reduction selects stays in the range [exp_k_facts]
+    covers. *)
+Lemma B2R_inv_ln2 : B2R f32_inv_ln2 = 12102203 / 8388608.
+Proof.
+  rewrite Qb_correct.
+  rewrite (Qeq_eqR _ (Qmake 12102203 8388608)) by (vm_compute; reflexivity).
+  unfold Q2R; cbn [Qnum Qden]; unfold Rdiv; reflexivity.
+Qed.
+
+Lemma Re_k_half : forall rx : R,
+  Rabs (rx * (12102203 / 8388608) - IZR (Re_k rx)) <= / 2.
+Proof. intros rx. unfold Re_k. rewrite B2R_inv_ln2. apply Znearest_half. Qed.
+
+Lemma Re_k_range : forall rx : R,
+  -88 <= rx <= 88 -> (-127 <= Re_k rx <= 127)%Z.
+Proof.
+  intros rx Hrx.
+  pose proof (Re_k_half rx) as H. apply Rabs_le_inv in H.
+  split.
+  - destruct (Z_lt_le_dec (Re_k rx) (-127)) as [Hc|Hc]; [|exact Hc].
+    exfalso. assert (Hc' : (Re_k rx <= Z.opp 128)%Z) by lia.
+    apply IZR_le in Hc'. rewrite opp_IZR in Hc'. lra.
+  - destruct (Z_lt_le_dec 127 (Re_k rx)) as [Hc|Hc]; [|exact Hc].
+    exfalso. assert (Hc' : (128 <= Re_k rx)%Z) by lia.
+    apply IZR_le in Hc'. lra.
+Qed.
+
+(** The reduced argument stays where the series is accurate. *)
+Lemma B2R_ln2_hi : B2R f32_ln2_hi = 355 / 512.
+Proof.
+  rewrite Qb_correct.
+  rewrite (Qeq_eqR _ (Qmake 355 512)) by (vm_compute; reflexivity).
+  unfold Q2R; cbn [Qnum Qden]; unfold Rdiv; reflexivity.
+Qed.
+
+Lemma B2R_ln2_lo : B2R f32_ln2_lo = 14581891 / 68719476736.
+Proof.
+  rewrite Qb_correct.
+  rewrite (Qeq_eqR _ (Qmake 14581891 68719476736)) by (vm_compute; reflexivity).
+  unfold Q2R; cbn [Qnum Qden]; unfold Rdiv; reflexivity.
+Qed.
+
+Lemma Re_r_eq : forall rx : R,
+  Re_r rx = rx - IZR (Re_k rx) * (355 / 512 - 14581891 / 68719476736).
+Proof.
+  intros rx. unfold Re_r, Re_r1, Re_khi, Re_klo.
+  rewrite B2R_ln2_hi, B2R_ln2_lo. ring.
+Qed.
+
+Lemma Re_r_range : forall rx : R,
+  -88 <= rx <= 88 -> Rabs (Re_r rx) <= 0.35.
+Proof.
+  intros rx Hrx.
+  pose proof (Re_k_half rx) as H. apply Rabs_le_inv in H.
+  rewrite Re_r_eq. apply Rabs_le. split; lra.
+Qed.
+
 Lemma fin_two : is_finite f32_two = true.
 Proof. vm_compute. reflexivity. Qed.
 Lemma fin_six : is_finite f32_six = true.
@@ -1810,14 +2090,25 @@ Lemma fin_one_twenty : is_finite f32_one_twenty = true.
 Proof. vm_compute. reflexivity. Qed.
 Lemma fin_seven_twenty : is_finite f32_seven_twenty = true.
 Proof. vm_compute. reflexivity. Qed.
+Lemma fin_five_thousand_forty : is_finite f32_five_thousand_forty = true.
+Proof. vm_compute. reflexivity. Qed.
+Lemma fin_ln2_hi : is_finite f32_ln2_hi = true.
+Proof. vm_compute. reflexivity. Qed.
+Lemma fin_ln2_lo : is_finite f32_ln2_lo = true.
+Proof. vm_compute. reflexivity. Qed.
 
-(** The side conditions of one exponential. *)
-Record exp_reg (M m : R) (x : binary32) (rx : R) : Prop := {
-  exr_hi : f32_lt f32_exp_hi x = false;
-  exr_lo : f32_lt x f32_exp_lo = false;
-  exr_bx : Rabs rx <= M;
-  exr_mdiv : m <= Rabs (B2R f32_exp_div);
-  exr_zr : regz M (B2R x / B2R f32_exp_div);
+(** The side conditions of the computation after saturation. [exr_kz] fixes
+    the integer the float reduction lands on to the one the real evaluation
+    selects; the remaining conditions are one per operation. *)
+Record exp_core_reg (M m : R) (x : binary32) (rx : R) : Prop := {
+  exr_kz : B2SF (e_k x) = B2SF (f32_of_Z (Re_k rx));
+  exr_bk : Rabs (B2R (e_k x)) <= M;
+  exr_bhi : Rabs (B2R f32_ln2_hi) <= M;
+  exr_blo : Rabs (B2R f32_ln2_lo) <= M;
+  exr_zkhi : regz M (B2R (e_k x) * B2R f32_ln2_hi);
+  exr_zklo : regz M (B2R (e_k x) * B2R f32_ln2_lo);
+  exr_zr1 : regz M (B2R x + B2R (f32_neg (e_khi x)));
+  exr_zr : regz M (B2R (e_r1 x) + B2R (e_klo x));
   exr_br : Rabs (B2R (e_r x)) <= M;
   exr_brr : Rabs (Re_r rx) <= M;
   exr_z2 : regz M (B2R (e_r x) * B2R (e_r x));
@@ -1833,110 +2124,178 @@ Record exp_reg (M m : R) (x : binary32) (rx : R) : Prop := {
   exr_b5 : Rabs (B2R (e_r5 x)) <= M;
   exr_b5r : Rabs (Re_r5 rx) <= M;
   exr_z6 : regz M (B2R (e_r5 x) * B2R (e_r x));
+  exr_b6 : Rabs (B2R (e_r6 x)) <= M;
   exr_b6r : Rabs (Re_r6 rx) <= M;
+  exr_z7 : regz M (B2R (e_r6 x) * B2R (e_r x));
+  exr_b7r : Rabs (Re_r7 rx) <= M;
   exr_m2 : m <= Rabs (B2R f32_two);
   exr_m6 : m <= Rabs (B2R f32_six);
   exr_m24 : m <= Rabs (B2R f32_twenty_four);
   exr_m120 : m <= Rabs (B2R f32_one_twenty);
   exr_m720 : m <= Rabs (B2R f32_seven_twenty);
+  exr_m5040 : m <= Rabs (B2R f32_five_thousand_forty);
   exr_zd2 : regz M (B2R (e_r2 x) / B2R f32_two);
   exr_zd3 : regz M (B2R (e_r3 x) / B2R f32_six);
   exr_zd4 : regz M (B2R (e_r4 x) / B2R f32_twenty_four);
   exr_zd5 : regz M (B2R (e_r5 x) / B2R f32_one_twenty);
   exr_zd6 : regz M (B2R (e_r6 x) / B2R f32_seven_twenty);
-  exr_zp1 : regz M (B2R (e_d5 x) + B2R (e_d6 x));
-  exr_zp2 : regz M (B2R (e_d4 x) + B2R (e_p1 x));
-  exr_zp3 : regz M (B2R (e_d3 x) + B2R (e_p2 x));
-  exr_zp4 : regz M (B2R (e_d2 x) + B2R (e_p3 x));
-  exr_zp5 : regz M (B2R (e_r x) + B2R (e_p4 x));
-  exr_zpoly : regz M (B2R f32_one + B2R (e_p5 x));
-  exr_sq : forall i, (i < 8)%nat ->
-     Rabs (B2R (Nat.iter i e_sq (e_poly x))) <= M
-     /\ Rabs (Nat.iter i Re_sq (Re_poly rx)) <= M
-     /\ regz M (B2R (Nat.iter i e_sq (e_poly x)) * B2R (Nat.iter i e_sq (e_poly x)))
+  exr_zd7 : regz M (B2R (e_r7 x) / B2R f32_five_thousand_forty);
+  exr_zp1 : regz M (B2R (e_d6 x) + B2R (e_d7 x));
+  exr_zp2 : regz M (B2R (e_d5 x) + B2R (e_p1 x));
+  exr_zp3 : regz M (B2R (e_d4 x) + B2R (e_p2 x));
+  exr_zp4 : regz M (B2R (e_d3 x) + B2R (e_p3 x));
+  exr_zp5 : regz M (B2R (e_d2 x) + B2R (e_p4 x));
+  exr_zp6 : regz M (B2R (e_r x) + B2R (e_p5 x));
+  exr_zpoly : regz M (B2R f32_one + B2R (e_p6 x));
+  exr_bpoly : Rabs (B2R (e_poly x)) <= M;
+  exr_bpow : Rabs (bpow radix2 (Re_k rx)) <= M;
+  exr_zscale : regz M (B2R (e_poly x) * B2R (f32_pow2 (e_k x)))
 }.
+
+(** The side conditions of one exponential: those of the computation, at the
+    saturated arguments. *)
+Definition exp_reg (M m : R) (x : binary32) (rx : R) : Prop :=
+  exp_core_reg M m (e_sat x) (Rsat rx).
 
 Lemma ok_exp_poly : forall M m L k x rx,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) x rx ->
-  exp_reg M m x rx ->
-  ok (errN M L (k + 13)) (e_poly x) (Re_poly rx).
+  exp_core_reg M m x rx ->
+  (-127 <= Re_k rx <= 127)%Z ->
+  ok (errN M L (k + 17)) (e_poly x) (Re_poly rx).
 Proof.
-  intros M m L k x rx HM Hamp Hx Hreg.
+  intros M m L k x rx HM Hamp Hx Hreg Hkr.
   assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
   assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  assert (Hkeq : e_k x = f32_of_Z (Re_k rx))
+    by (apply B2SF_inj; exact (exr_kz _ _ _ _ Hreg)).
+  destruct (exp_k_facts (Re_k rx) Hkr)
+    as (Hkfin & HkB & _ & _).
   destruct Hreg.
-  assert (Hr : ok (errN M L (S k)) (e_r x) (Re_r rx)).
-  { unfold e_r, Re_r. eapply ok_div_S with (m := m); try eassumption.
-    apply ok_const; [exact HM0 | exact HL1 | exact fin_exp_div]. }
-  assert (Hr2 : ok (errN M L (S (S k))) (e_r2 x) (Re_r2 rx)).
-  { unfold e_r2, Re_r2. eapply ok_mult_S with (m := m); eassumption. }
-  assert (Hr3 : ok (errN M L (S (S (S k)))) (e_r3 x) (Re_r3 rx)).
-  { unfold e_r3, Re_r3. eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (S k)%nat); [exact HM0 | exact HL1 | lia | exact Hr]. }
-  assert (Hr4 : ok (errN M L (S (S (S (S k))))) (e_r4 x) (Re_r4 rx)).
-  { unfold e_r4, Re_r4. eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (S k)%nat); [exact HM0 | exact HL1 | lia | exact Hr]. }
-  assert (Hr5 : ok (errN M L (S (S (S (S (S k)))))) (e_r5 x) (Re_r5 rx)).
-  { unfold e_r5, Re_r5. eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (S k)%nat); [exact HM0 | exact HL1 | lia | exact Hr]. }
-  assert (Hr6 : ok (errN M L (S (S (S (S (S (S k))))))) (e_r6 x) (Re_r6 rx)).
-  { unfold e_r6, Re_r6. eapply ok_mult_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (S k)%nat); [exact HM0 | exact HL1 | lia | exact Hr]. }
-  assert (Hd2 : ok (errN M L (k + 7)) (e_d2 x) (Re_d2 rx)).
-  { unfold e_d2, Re_d2.
-    replace (k + 7)%nat with (S (k + 6))%nat by lia.
-    eapply ok_div_S with (m := m); try eassumption.
-    - eapply ok_errN_mono with (n := (S (S k))%nat); [exact HM0 | exact HL1 | lia | exact Hr2].
-    - apply ok_const; [exact HM0 | exact HL1 | exact fin_two]. }
-  assert (Hd3 : ok (errN M L (k + 7)) (e_d3 x) (Re_d3 rx)).
-  { unfold e_d3, Re_d3.
-    replace (k + 7)%nat with (S (k + 6))%nat by lia.
-    eapply ok_div_S with (m := m); try eassumption.
-    - eapply ok_errN_mono with (n := (S (S (S k)))%nat); [exact HM0 | exact HL1 | lia | exact Hr3].
-    - apply ok_const; [exact HM0 | exact HL1 | exact fin_six]. }
-  assert (Hd4 : ok (errN M L (k + 7)) (e_d4 x) (Re_d4 rx)).
-  { unfold e_d4, Re_d4.
-    replace (k + 7)%nat with (S (k + 6))%nat by lia.
-    eapply ok_div_S with (m := m); try eassumption.
-    - eapply ok_errN_mono with (n := (S (S (S (S k))))%nat); [exact HM0 | exact HL1 | lia | exact Hr4].
-    - apply ok_const; [exact HM0 | exact HL1 | exact fin_twenty_four]. }
-  assert (Hd5 : ok (errN M L (k + 7)) (e_d5 x) (Re_d5 rx)).
-  { unfold e_d5, Re_d5.
-    replace (k + 7)%nat with (S (k + 6))%nat by lia.
-    eapply ok_div_S with (m := m); try eassumption.
-    - eapply ok_errN_mono with (n := (S (S (S (S (S k)))))%nat); [exact HM0 | exact HL1 | lia | exact Hr5].
-    - apply ok_const; [exact HM0 | exact HL1 | exact fin_one_twenty]. }
-  assert (Hd6 : ok (errN M L (k + 7)) (e_d6 x) (Re_d6 rx)).
-  { unfold e_d6, Re_d6.
-    replace (k + 7)%nat with (S (k + 6))%nat by lia.
-    eapply ok_div_S with (m := m); try eassumption.
-    - eapply ok_errN_mono with (n := (S (S (S (S (S (S k))))))%nat);
-        [exact HM0 | exact HL1 | lia | exact Hr6].
-    - apply ok_const; [exact HM0 | exact HL1 | exact fin_seven_twenty]. }
-  assert (Hp1 : ok (errN M L (k + 8)) (e_p1 x) (Re_p1 rx)).
-  { unfold e_p1, Re_p1. replace (k + 8)%nat with (S (k + 7))%nat by lia.
+  (* the integer the reduction selects is exact *)
+  assert (Hk : ok (errN M L k) (e_k x) (IZR (Re_k rx))).
+  { rewrite Hkeq, <- HkB. apply ok_const; [exact HM0 | exact HL1 | exact Hkfin]. }
+  assert (Hchi : ok (errN M L k) f32_ln2_hi (B2R f32_ln2_hi))
+    by (apply ok_const; [exact HM0 | exact HL1 | exact fin_ln2_hi]).
+  assert (Hclo : ok (errN M L k) f32_ln2_lo (B2R f32_ln2_lo))
+    by (apply ok_const; [exact HM0 | exact HL1 | exact fin_ln2_lo]).
+  assert (Hkhi : ok (errN M L (S k)) (e_khi x) (Re_khi rx)).
+  { unfold e_khi, Re_khi. eapply ok_mult_S with (m := m); eassumption. }
+  assert (Hklo : ok (errN M L (S k)) (e_klo x) (Re_klo rx)).
+  { unfold e_klo, Re_klo. eapply ok_mult_S with (m := m); eassumption. }
+  assert (Hx1 : ok (errN M L (S k)) x rx)
+    by (eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hx]).
+  assert (Hr1 : ok (errN M L (S (S k))) (e_r1 x) (Re_r1 rx)).
+  { unfold e_r1, Re_r1. eapply ok_minus_S with (m := m); eassumption. }
+  assert (Hklo2 : ok (errN M L (S (S k))) (e_klo x) (Re_klo rx))
+    by (eapply ok_errN_mono with (n := S k); [exact HM0 | exact HL1 | lia | exact Hklo]).
+  assert (Hr : ok (errN M L (k + 3)) (e_r x) (Re_r rx)).
+  { unfold e_r, Re_r. replace (k + 3)%nat with (S (S (S k)))%nat by lia.
     eapply ok_plus_S with (m := m); eassumption. }
-  assert (Hp2 : ok (errN M L (k + 9)) (e_p2 x) (Re_p2 rx)).
-  { unfold e_p2, Re_p2. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+  assert (Hrw : forall j, (k + 3 <= j)%nat -> ok (errN M L j) (e_r x) (Re_r rx))
+    by (intros j Hj; eapply ok_errN_mono with (n := (k + 3)%nat);
+        [exact HM0 | exact HL1 | exact Hj | exact Hr]).
+  (* the powers of the reduced argument *)
+  assert (Hr2 : ok (errN M L (k + 4)) (e_r2 x) (Re_r2 rx)).
+  { unfold e_r2, Re_r2. replace (k + 4)%nat with (S (k + 3))%nat by lia.
+    eapply ok_mult_S with (m := m); eassumption. }
+  assert (Hr3 : ok (errN M L (k + 5)) (e_r3 x) (Re_r3 rx)).
+  { unfold e_r3, Re_r3. replace (k + 5)%nat with (S (k + 4))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption. apply Hrw; lia. }
+  assert (Hr4 : ok (errN M L (k + 6)) (e_r4 x) (Re_r4 rx)).
+  { unfold e_r4, Re_r4. replace (k + 6)%nat with (S (k + 5))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption. apply Hrw; lia. }
+  assert (Hr5 : ok (errN M L (k + 7)) (e_r5 x) (Re_r5 rx)).
+  { unfold e_r5, Re_r5. replace (k + 7)%nat with (S (k + 6))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption. apply Hrw; lia. }
+  assert (Hr6 : ok (errN M L (k + 8)) (e_r6 x) (Re_r6 rx)).
+  { unfold e_r6, Re_r6. replace (k + 8)%nat with (S (k + 7))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption. apply Hrw; lia. }
+  assert (Hr7 : ok (errN M L (k + 9)) (e_r7 x) (Re_r7 rx)).
+  { unfold e_r7, Re_r7. replace (k + 9)%nat with (S (k + 8))%nat by lia.
+    eapply ok_mult_S with (m := m); try eassumption. apply Hrw; lia. }
+  (* the Taylor terms *)
+  assert (Hd2 : ok (errN M L (k + 10)) (e_d2 x) (Re_d2 rx)).
+  { unfold e_d2, Re_d2. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 4)%nat); [exact HM0 | exact HL1 | lia | exact Hr2].
+    - apply ok_const; [exact HM0 | exact HL1 | exact fin_two]. }
+  assert (Hd3 : ok (errN M L (k + 10)) (e_d3 x) (Re_d3 rx)).
+  { unfold e_d3, Re_d3. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 5)%nat); [exact HM0 | exact HL1 | lia | exact Hr3].
+    - apply ok_const; [exact HM0 | exact HL1 | exact fin_six]. }
+  assert (Hd4 : ok (errN M L (k + 10)) (e_d4 x) (Re_d4 rx)).
+  { unfold e_d4, Re_d4. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 6)%nat); [exact HM0 | exact HL1 | lia | exact Hr4].
+    - apply ok_const; [exact HM0 | exact HL1 | exact fin_twenty_four]. }
+  assert (Hd5 : ok (errN M L (k + 10)) (e_d5 x) (Re_d5 rx)).
+  { unfold e_d5, Re_d5. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 7)%nat); [exact HM0 | exact HL1 | lia | exact Hr5].
+    - apply ok_const; [exact HM0 | exact HL1 | exact fin_one_twenty]. }
+  assert (Hd6 : ok (errN M L (k + 10)) (e_d6 x) (Re_d6 rx)).
+  { unfold e_d6, Re_d6. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    - eapply ok_errN_mono with (n := (k + 8)%nat); [exact HM0 | exact HL1 | lia | exact Hr6].
+    - apply ok_const; [exact HM0 | exact HL1 | exact fin_seven_twenty]. }
+  assert (Hd7 : ok (errN M L (k + 10)) (e_d7 x) (Re_d7 rx)).
+  { unfold e_d7, Re_d7. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_div_S with (m := m); try eassumption.
+    apply ok_const; [exact HM0 | exact HL1 | exact fin_five_thousand_forty]. }
+  (* the nested sum *)
+  assert (Hp1 : ok (errN M L (k + 11)) (e_p1 x) (Re_p1 rx)).
+  { unfold e_p1, Re_p1. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_plus_S with (m := m); eassumption. }
+  assert (Hp2 : ok (errN M L (k + 12)) (e_p2 x) (Re_p2 rx)).
+  { unfold e_p2, Re_p2. replace (k + 12)%nat with (S (k + 11))%nat by lia.
     eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 7)%nat); [exact HM0 | exact HL1 | lia | exact Hd4]. }
-  assert (Hp3 : ok (errN M L (k + 10)) (e_p3 x) (Re_p3 rx)).
-  { unfold e_p3, Re_p3. replace (k + 10)%nat with (S (k + 9))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 10)%nat); [exact HM0 | exact HL1 | lia | exact Hd5]. }
+  assert (Hp3 : ok (errN M L (k + 13)) (e_p3 x) (Re_p3 rx)).
+  { unfold e_p3, Re_p3. replace (k + 13)%nat with (S (k + 12))%nat by lia.
     eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 7)%nat); [exact HM0 | exact HL1 | lia | exact Hd3]. }
-  assert (Hp4 : ok (errN M L (k + 11)) (e_p4 x) (Re_p4 rx)).
-  { unfold e_p4, Re_p4. replace (k + 11)%nat with (S (k + 10))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 10)%nat); [exact HM0 | exact HL1 | lia | exact Hd4]. }
+  assert (Hp4 : ok (errN M L (k + 14)) (e_p4 x) (Re_p4 rx)).
+  { unfold e_p4, Re_p4. replace (k + 14)%nat with (S (k + 13))%nat by lia.
     eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (k + 7)%nat); [exact HM0 | exact HL1 | lia | exact Hd2]. }
-  assert (Hp5 : ok (errN M L (k + 12)) (e_p5 x) (Re_p5 rx)).
-  { unfold e_p5, Re_p5. replace (k + 12)%nat with (S (k + 11))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 10)%nat); [exact HM0 | exact HL1 | lia | exact Hd3]. }
+  assert (Hp5 : ok (errN M L (k + 15)) (e_p5 x) (Re_p5 rx)).
+  { unfold e_p5, Re_p5. replace (k + 15)%nat with (S (k + 14))%nat by lia.
     eapply ok_plus_S with (m := m); try eassumption.
-    eapply ok_errN_mono with (n := (S k)%nat); [exact HM0 | exact HL1 | lia | exact Hr]. }
-  unfold e_poly, Re_poly. replace (k + 13)%nat with (S (k + 12))%nat by lia.
+    eapply ok_errN_mono with (n := (k + 10)%nat); [exact HM0 | exact HL1 | lia | exact Hd2]. }
+  assert (Hp6 : ok (errN M L (k + 16)) (e_p6 x) (Re_p6 rx)).
+  { unfold e_p6, Re_p6. replace (k + 16)%nat with (S (k + 15))%nat by lia.
+    eapply ok_plus_S with (m := m); try eassumption. apply Hrw; lia. }
+  unfold e_poly, Re_poly. replace (k + 17)%nat with (S (k + 16))%nat by lia.
   eapply ok_plus_S with (m := m); try eassumption.
   replace 1 with (B2R f32_one) by apply f32_one_correct.
   apply ok_const; [exact HM0 | exact HL1 | exact f32_one_finite].
+Qed.
+
+Lemma ok_exp_core : forall M m L k x rx,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  ok (errN M L k) x rx ->
+  exp_core_reg M m x rx ->
+  (-127 <= Re_k rx <= 127)%Z ->
+  ok (errN M L (k + 21)) (f32_exp_core x) (Re_exp_core rx).
+Proof.
+  intros M m L k x rx HM Hamp Hx Hreg Hkr.
+  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
+  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  pose proof (ok_exp_poly M m L k x rx HM Hamp Hx Hreg Hkr) as Hpoly.
+  assert (Hkeq : e_k x = f32_of_Z (Re_k rx))
+    by (apply B2SF_inj; exact (exr_kz _ _ _ _ Hreg)).
+  destruct (exp_k_facts (Re_k rx) Hkr) as (_ & _ & Hpfin & HpB).
+  (* the scale factor is an exact power of two *)
+  assert (Hpow : ok (errN M L (k + 17)) (f32_pow2 (e_k x)) (bpow radix2 (Re_k rx))).
+  { rewrite Hkeq, <- HpB. apply ok_const; [exact HM0 | exact HL1 | exact Hpfin]. }
+  unfold f32_exp_core, Re_exp_core.
+  apply ok_errN_mono with (n := S (k + 17)); [exact HM0 | exact HL1 | lia |].
+  eapply ok_mult_S with (m := m); try eassumption.
+  - exact (exr_bpoly _ _ _ _ Hreg).
+  - exact (exr_bpow _ _ _ _ Hreg).
+  - exact (exr_zscale _ _ _ _ Hreg).
 Qed.
 
 Lemma ok_exp_approx : forall M m L k x rx,
@@ -1946,12 +2305,10 @@ Lemma ok_exp_approx : forall M m L k x rx,
   ok (errN M L (k + 21)) (f32_exp_approx x) (Re_exp_approx rx).
 Proof.
   intros M m L k x rx HM Hamp Hx Hreg.
-  rewrite (f32_exp_approx_unclamped x (exr_hi _ _ _ _ Hreg) (exr_lo _ _ _ _ Hreg)).
-  rewrite sq8_iter. unfold Re_exp_approx.
-  replace (k + 21)%nat with ((k + 13) + 8)%nat by lia.
-  eapply ok_iter_sq with (m := m); try eassumption.
-  - eapply ok_exp_poly with (m := m); eassumption.
-  - exact (exr_sq _ _ _ _ Hreg).
+  rewrite f32_exp_approx_sat. unfold Re_exp_approx.
+  eapply ok_exp_core; try eassumption.
+  - apply ok_sat, Hx.
+  - apply Re_k_range, Rsat_range.
 Qed.
 
 (** * Sigmoid and GELU *)
@@ -1996,55 +2353,155 @@ Proof.
   eapply ok_div_S with (m := m); eassumption.
 Qed.
 
-Definition Rgelu_c : R := B2R (f32_div f32_gelu_coeff f32_gelu_scale).
+(** * tanh and GELU
 
-Definition Rgelu (rx : R) : R := rx * Rsigmoid (Rgelu_c * rx).
+    [f32_tanh] is [2 sigmoid(2y) - 1], and [f32_gelu] is the form GPT-2 is
+    trained with, [0.5 * x * (1 + tanh (c1 * (x + c2 * x^3)))]. *)
+
+Definition Rtanh (ry : R) : R := B2R f32_two * Rsigmoid (B2R f32_two * ry) - 1.
+
+Record tanh_reg (M m : R) (y : binary32) (ry : R) : Prop := {
+  thr_b2 : Rabs (B2R f32_two) <= M;
+  thr_bry : Rabs ry <= M;
+  thr_z2y : regz M (B2R f32_two * B2R y);
+  thr_sig : sig_reg M m (f32_mult f32_two y) (B2R f32_two * ry);
+  thr_bs : Rabs (Rsigmoid (B2R f32_two * ry)) <= M;
+  thr_z2s : regz M (B2R f32_two * B2R (f32_sigmoid (f32_mult f32_two y)));
+  thr_zm : regz M (B2R (f32_mult f32_two (f32_sigmoid (f32_mult f32_two y)))
+                   + B2R (f32_neg f32_one))
+}.
+
+Lemma ok_tanh : forall M m L k y ry,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  ok (errN M L k) y ry ->
+  tanh_reg M m y ry ->
+  ok (errN M L (k + 26)) (f32_tanh y) (Rtanh ry).
+Proof.
+  intros M m L k y ry HM Hamp Hy Hreg.
+  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
+  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  destruct Hreg as [Hb2 Hbry Hz2y Hsig Hbs Hz2s Hzm].
+  assert (Htwo : forall j, ok (errN M L j) f32_two (B2R f32_two))
+    by (intros j; apply ok_const; [exact HM0 | exact HL1 | exact fin_two]).
+  assert (Hone : forall j, ok (errN M L j) f32_one 1).
+  { intros j. replace 1 with (B2R f32_one) by apply f32_one_correct.
+    apply ok_const; [exact HM0 | exact HL1 | exact f32_one_finite]. }
+  pose proof (Htwo k) as Ht0.
+  assert (H2y : ok (errN M L (S k)) (f32_mult f32_two y) (B2R f32_two * ry))
+    by (eapply ok_mult_S with (m := m); eassumption).
+  assert (Hs : ok (errN M L (S k + 23)) (f32_sigmoid (f32_mult f32_two y))
+                  (Rsigmoid (B2R f32_two * ry)))
+    by (eapply ok_sigmoid with (m := m); eassumption).
+  pose proof (Htwo (S k + 23)%nat) as Ht1.
+  assert (H2s : ok (errN M L (S (S k + 23)))
+                   (f32_mult f32_two (f32_sigmoid (f32_mult f32_two y)))
+                   (B2R f32_two * Rsigmoid (B2R f32_two * ry)))
+    by (eapply ok_mult_S with (m := m); eassumption).
+  unfold f32_tanh, Rtanh.
+  replace (k + 26)%nat with (S (S (S k + 23)))%nat by lia.
+  eapply ok_minus_S with (m := m); try eassumption.
+  apply Hone.
+Qed.
+
+Definition Rgelu_inner (rx : R) : R :=
+  B2R f32_gelu_c1 * (rx + B2R f32_gelu_c2 * (rx * (rx * rx))).
+
+Definition Rgelu (rx : R) : R :=
+  (B2R f32_half * rx) * (1 + Rtanh (Rgelu_inner rx)).
+
+(** The argument [f32_tanh] receives, as the float computation forms it. *)
+Definition g_inner (x : binary32) : binary32 :=
+  f32_mult f32_gelu_c1 (f32_plus x (f32_mult f32_gelu_c2 (f32_mult x (f32_mult x x)))).
 
 Record gelu_reg (M m : R) (x : binary32) (rx : R) : Prop := {
-  glr_fin : is_finite (f32_div f32_gelu_coeff f32_gelu_scale) = true;
-  glr_bc : Rabs (B2R (f32_div f32_gelu_coeff f32_gelu_scale)) <= M;
-  glr_brx : Rabs rx <= M;
-  glr_zc : regz M (B2R (f32_div f32_gelu_coeff f32_gelu_scale) * B2R x);
-  glr_sig : sig_reg M m (f32_mult (f32_div f32_gelu_coeff f32_gelu_scale) x)
-                    (Rgelu_c * rx);
+  glr_fin1 : is_finite f32_gelu_c1 = true;
+  glr_fin2 : is_finite f32_gelu_c2 = true;
+  glr_finh : is_finite f32_half = true;
   glr_bx : Rabs (B2R x) <= M;
-  glr_bs : Rabs (Rsigmoid (Rgelu_c * rx)) <= M;
-  glr_zm : regz M (B2R x
-                   * B2R (f32_sigmoid (f32_mult
-                            (f32_div f32_gelu_coeff f32_gelu_scale) x)))
+  glr_brx : Rabs rx <= M;
+  glr_zxx : regz M (B2R x * B2R x);
+  glr_bxx : Rabs (rx * rx) <= M;
+  glr_zx3 : regz M (B2R x * B2R (f32_mult x x));
+  glr_bc2 : Rabs (B2R f32_gelu_c2) <= M;
+  glr_bx3 : Rabs (rx * (rx * rx)) <= M;
+  glr_zc2 : regz M (B2R f32_gelu_c2 * B2R (f32_mult x (f32_mult x x)));
+  glr_zs : regz M (B2R x + B2R (f32_mult f32_gelu_c2 (f32_mult x (f32_mult x x))));
+  glr_bc1 : Rabs (B2R f32_gelu_c1) <= M;
+  glr_bs : Rabs (rx + B2R f32_gelu_c2 * (rx * (rx * rx))) <= M;
+  glr_zc1 : regz M (B2R f32_gelu_c1
+                    * B2R (f32_plus x (f32_mult f32_gelu_c2 (f32_mult x (f32_mult x x)))));
+  glr_tanh : tanh_reg M m (g_inner x) (Rgelu_inner rx);
+  glr_zone : regz M (B2R f32_one + B2R (f32_tanh (g_inner x)));
+  glr_bh : Rabs (B2R f32_half) <= M;
+  glr_zh : regz M (B2R f32_half * B2R x);
+  glr_bhx : Rabs (B2R (f32_mult f32_half x)) <= M;
+  glr_bop : Rabs (1 + Rtanh (Rgelu_inner rx)) <= M;
+  glr_zm : regz M (B2R (f32_mult f32_half x)
+                   * B2R (f32_plus f32_one (f32_tanh (g_inner x))))
 }.
 
 Lemma ok_gelu : forall M m L k x rx,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) x rx ->
   gelu_reg M m x rx ->
-  ok (errN M L (k + 25)) (f32_gelu x) (Rgelu rx).
+  ok (errN M L (k + 33)) (f32_gelu x) (Rgelu rx).
 Proof.
   intros M m L k x rx HM Hamp Hx Hreg.
   assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
   assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
-  destruct Hreg as [Hfin Hbc Hbrx Hzc Hsig Hbx Hbs Hzm].
-  assert (Hc : ok (errN M L k) (f32_div f32_gelu_coeff f32_gelu_scale) Rgelu_c)
-    by (unfold Rgelu_c; apply ok_const; assumption).
-  assert (Hcx : ok (errN M L (S k))
-                   (f32_mult (f32_div f32_gelu_coeff f32_gelu_scale) x)
-                   (Rgelu_c * rx))
+  destruct Hreg as [Hf1 Hf2 Hfh Hbx Hbrx Hzxx Hbxx Hzx3 Hbc2 Hbx3 Hzc2 Hzs
+                    Hbc1 Hbs Hzc1 Htanh Hzone Hbh Hzh Hbhx Hbop Hzm].
+  assert (Hxx : ok (errN M L (S k)) (f32_mult x x) (rx * rx))
     by (eapply ok_mult_S with (m := m); eassumption).
-  assert (Hs : ok (errN M L (S k + 23))
-                  (f32_sigmoid (f32_mult (f32_div f32_gelu_coeff f32_gelu_scale) x))
-                  (Rsigmoid (Rgelu_c * rx)))
-    by (eapply ok_sigmoid with (m := m); eassumption).
-  unfold f32_gelu, Rgelu.
-  replace (k + 25)%nat with (S (S k + 23))%nat by lia.
-  eapply ok_mult_S with (m := m); try eassumption.
-  eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hx].
+  assert (Hx1 : ok (errN M L (S k)) x rx)
+    by (eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hx]).
+  assert (Hx3 : ok (errN M L (S (S k))) (f32_mult x (f32_mult x x)) (rx * (rx * rx)))
+    by (eapply ok_mult_S with (m := m); eassumption).
+  assert (Hc2 : ok (errN M L (S (S k))) f32_gelu_c2 (B2R f32_gelu_c2))
+    by (apply ok_const; assumption).
+  assert (Hc2x3 : ok (errN M L (S (S (S k))))
+                     (f32_mult f32_gelu_c2 (f32_mult x (f32_mult x x)))
+                     (B2R f32_gelu_c2 * (rx * (rx * rx))))
+    by (eapply ok_mult_S with (m := m); eassumption).
+  assert (Hx3' : ok (errN M L (S (S (S k)))) x rx)
+    by (eapply ok_errN_mono with (n := k); [exact HM0 | exact HL1 | lia | exact Hx]).
+  assert (Hs : ok (errN M L (S (S (S (S k)))))
+                  (f32_plus x (f32_mult f32_gelu_c2 (f32_mult x (f32_mult x x))))
+                  (rx + B2R f32_gelu_c2 * (rx * (rx * rx))))
+    by (eapply ok_plus_S with (m := m); eassumption).
+  assert (Hc1 : ok (errN M L (S (S (S (S k))))) f32_gelu_c1 (B2R f32_gelu_c1))
+    by (apply ok_const; assumption).
+  assert (Hin : ok (errN M L (k + 5)) (g_inner x) (Rgelu_inner rx)).
+  { unfold g_inner, Rgelu_inner.
+    replace (k + 5)%nat with (S (S (S (S (S k)))))%nat by lia.
+    eapply ok_mult_S with (m := m); eassumption. }
+  assert (Hth : ok (errN M L (k + 5 + 26)) (f32_tanh (g_inner x))
+                   (Rtanh (Rgelu_inner rx)))
+    by (eapply ok_tanh with (m := m); eassumption).
+  assert (Hone : ok (errN M L (k + 5 + 26)) f32_one 1).
+  { replace 1 with (B2R f32_one) by apply f32_one_correct.
+    apply ok_const; [exact HM0 | exact HL1 | exact f32_one_finite]. }
+  assert (Hop : ok (errN M L (S (k + 5 + 26)))
+                   (f32_plus f32_one (f32_tanh (g_inner x)))
+                   (1 + Rtanh (Rgelu_inner rx)))
+    by (eapply ok_plus_S with (m := m); eassumption).
+  assert (Hh : ok (errN M L k) f32_half (B2R f32_half))
+    by (apply ok_const; assumption).
+  assert (Hhx : ok (errN M L (S k)) (f32_mult f32_half x) (B2R f32_half * rx))
+    by (eapply ok_mult_S with (m := m); eassumption).
+  assert (Hhx' : ok (errN M L (S (k + 5 + 26))) (f32_mult f32_half x)
+                    (B2R f32_half * rx))
+    by (eapply ok_errN_mono with (n := S k); [exact HM0 | exact HL1 | lia | exact Hhx]).
+  unfold f32_gelu, Rgelu. fold (g_inner x).
+  replace (k + 33)%nat with (S (S (k + 5 + 26)))%nat by lia.
+  eapply ok_mult_S with (m := m); eassumption.
 Qed.
 
 Lemma ok_gelu_vec : forall M m L k xs rs,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   okv (errN M L k) xs rs ->
   Forall2 (gelu_reg M m) xs rs ->
-  okv (errN M L (k + 25)) (f32_gelu_vec xs) (List.map Rgelu rs).
+  okv (errN M L (k + 33)) (f32_gelu_vec xs) (List.map Rgelu rs).
 Proof.
   intros M m L k xs rs HM Hamp Hx Hreg.
   unfold f32_gelu_vec, okv in *.
@@ -2096,7 +2553,7 @@ Lemma ok_mlp_forward : forall M m L n k1 k2 cfw rcfw cfb rcfb cpw rcpw cpb rcpb 
   lin_reg M k2 cpw cpb
           (List.map f32_gelu_vec (f32_linear_forward_2d cfw cfb h))
           (List.map (List.map Rgelu) (Rlinear_forward_2d rcfw rcfb rh)) ->
-  okm (errN M L (S (S (n + 2 * k1) + 25 + 2 * k2)))
+  okm (errN M L (S (S (n + 2 * k1) + 33 + 2 * k2)))
       (f32_mlp_forward cfw cfb cpw cpb h)
       (Rmlp_forward rcfw rcfb rcpw rcpb rh).
 Proof.
@@ -2107,7 +2564,7 @@ Proof.
   assert (Hstep1 : okm (errN M L (S (n + 2 * k1))) (f32_linear_forward_2d cfw cfb h)
                        (Rlinear_forward_2d rcfw rcfb rh))
     by (eapply ok_linear2d with (m := m); eassumption).
-  assert (Hstep2 : okm (errN M L (S (n + 2 * k1) + 25))
+  assert (Hstep2 : okm (errN M L (S (n + 2 * k1) + 33))
                        (List.map f32_gelu_vec (f32_linear_forward_2d cfw cfb h))
                        (List.map (List.map Rgelu) (Rlinear_forward_2d rcfw rcfb rh))).
   { clear Hlin1 Hlin2. unfold okm in *.
@@ -2124,17 +2581,7 @@ Proof.
   - eapply okv_weaken; [exact Hcpb | apply errN_mono; auto; lia].
 Qed.
 
-(** * Comparison, and the maximum a softmax subtracts *)
-
-Lemma f32_lt_correct : forall x y,
-  is_finite x = true -> is_finite y = true ->
-  f32_lt x y = true <-> B2R x < B2R y.
-Proof.
-  intros x y Hx Hy. unfold f32_lt, f32_compare.
-  rewrite (Bcompare_correct prec32 emax32 x y Hx Hy).
-  destruct (Rcompare_spec (B2R x) (B2R y)) as [H|H|H]; split; intro Hc;
-    try discriminate; try lra; try reflexivity.
-Qed.
+(** * The maximum a softmax subtracts *)
 
 Definition Rmax_vec (rs : list R) : R :=
   match rs with
@@ -2350,106 +2797,119 @@ Proof.
   - apply IH; exact Hr2.
 Qed.
 
-(** * Scaling, masking, and causal attention *)
+(** * Attention, one query at a time
 
-Definition Rscale (d_k : nat) : R :=
-  B2R (f32_div f32_one (f32_sqrt (f32_of_Z (Z.of_nat d_k)))).
+    [f32_attend] scores a query against its keys, takes a softmax, and sums the
+    value rows under the weights, column by column. The real evaluation does
+    the same in exact arithmetic. *)
 
-Definition Rscale_scores (rm : list (list R)) (d_k : nat) : list (list R) :=
-  List.map (fun row => List.map (fun x => x * Rscale d_k) row) rm.
+Definition Rscale (d_k : nat) : R := B2R (f32_attn_scale d_k).
 
-Lemma ok_scale_scores : forall M m L k mm rm d_k,
-  M < bpow radix2 emax32 -> amp_ok M m L ->
-  okm (errN M L k) mm rm ->
-  is_finite (f32_div f32_one (f32_sqrt (f32_of_Z (Z.of_nat d_k)))) = true ->
-  Rabs (Rscale d_k) <= M ->
-  Forall2 (fun row rrow =>
-             Forall2 (fun x rx => Rabs (B2R x) <= M
-                                  /\ regz M (B2R x
-                                       * B2R (f32_div f32_one
-                                                (f32_sqrt (f32_of_Z (Z.of_nat d_k))))))
-                     row rrow) mm rm ->
-  okm (errN M L (S k)) (f32_scale_scores mm d_k) (Rscale_scores rm d_k).
-Proof.
-  intros M m L k mm rm d_k HM Hamp Hmm Hfin Hbs Hreg.
-  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
-  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
-  assert (Hs : ok (errN M L k) (f32_div f32_one (f32_sqrt (f32_of_Z (Z.of_nat d_k))))
-                  (Rscale d_k))
-    by (unfold Rscale; apply ok_const; assumption).
-  unfold f32_scale_scores, Rscale_scores, okm in *.
-  revert Hmm.
-  induction Hreg as [|row rrow mm' rm' Hr Hreg IH]; intros Hmm;
-    cbn [List.map]; [constructor|].
-  inversion Hmm as [|a b as' bs' Ha Has]; subst.
-  constructor.
-  - clear IH Hreg Has Hmm.
-    unfold okv in *.
-    revert Ha. induction Hr as [|x rx row' rrow' [Hbx Hz] Hr IH]; intros Ha;
-      cbn [List.map]; [constructor|].
-    inversion Ha as [|x' rx' r1 r2 Hxr Hxs]; subst.
-    constructor.
-    + eapply ok_mult_S with (m := m); eassumption.
-    + apply IH; exact Hxs.
-  - apply IH; exact Has.
-Qed.
+Definition att_scores (qrow : list binary32) (ks : list (list binary32)) (d_k : nat)
+                      : list binary32 :=
+  List.map (fun kj => f32_mult (f32_dot qrow kj) (f32_attn_scale d_k)) ks.
 
-Definition Rcausal_mask (n : nat) : list (list R) :=
-  List.map (fun row => List.map (fun col => B2R (f32_causal_mask_entry row col))
-                                (List.seq 0 n))
-           (List.seq 0 n).
+Definition Ratt_scores (rq : list R) (rks : list (list R)) (d_k : nat) : list R :=
+  List.map (fun rk => Rdot rq rk * Rscale d_k) rks.
 
-Lemma fin_mask_entry : forall r c, is_finite (f32_causal_mask_entry r c) = true.
-Proof.
-  intros r c. unfold f32_causal_mask_entry.
-  destruct (Nat.leb c r); vm_compute; reflexivity.
-Qed.
-
-Lemma ok_causal_mask : forall d n, 0 <= d -> okm d (f32_causal_mask n) (Rcausal_mask n).
-Proof.
-  intros d n Hd. unfold f32_causal_mask, Rcausal_mask, okm.
-  apply Forall2_map_seq. intros i.
-  unfold okv. apply Forall2_map_seq. intros j.
-  eapply ok_weaken; [apply ok_exact, fin_mask_entry | exact Hd].
-Qed.
-
-Definition Rapply_mask (rs rmask : list (list R)) : list (list R) :=
-  List.map (fun '(sr, mr) => List.map (fun '(s, mv) => s + mv) (List.combine sr mr))
-           (List.combine rs rmask).
-
-Lemma ok_apply_mask : forall M m L k ss rss mk rmk,
-  M < bpow radix2 emax32 -> amp_ok M m L ->
-  okm (errN M L k) ss rss -> okm (errN M L k) mk rmk ->
-  Forall2 (fun sr mr => Forall2 (fun s mv => regz M (B2R s + B2R mv)) sr mr) ss mk ->
-  okm (errN M L (S k)) (f32_apply_mask ss mk) (Rapply_mask rss rmk).
-Proof.
-  intros M m L k ss rss mk rmk HM Hamp Hs Hm Hreg.
-  unfold f32_apply_mask, Rapply_mask, okm in *.
-  revert rss rmk Hs Hm.
-  induction Hreg as [|sr mr ss' mk' Hrow Hreg IH]; intros rss rmk Hs Hm;
-    cbn [List.map List.combine].
-  - inversion Hs; subst. cbn [List.combine List.map]. constructor.
-  - inversion Hs as [|a ra ss'' rss' Ha Has]; subst.
-    inversion Hm as [|b rb mk'' rmk' Hb Hbs]; subst.
-    cbn [List.combine List.map]. constructor.
-    + clear IH Hreg Has Hbs Hs Hm.
-      unfold okv in *.
-      revert ra rb Ha Hb.
-      induction Hrow as [|s mv sr' mr' Hz Hrow IH]; intros ra rb Ha Hb;
-        cbn [List.combine List.map].
-      * inversion Ha; subst. cbn [List.combine List.map]. constructor.
-      * inversion Ha as [|s' rs1 sr'' ra' Har Has']; subst.
-        inversion Hb as [|m' rm1 mr'' rb' Hbr Hbs']; subst.
-        cbn [List.combine List.map]. constructor.
-        -- eapply ok_plus_S with (m := m); eassumption.
-        -- apply IH; assumption.
-    + apply IH; assumption.
-Qed.
+Definition Rattend (rq : list R) (rks rvs : list (list R)) (d_k : nat) : list R :=
+  List.map (fun rv => Rdot (Rsoftmax (Ratt_scores rq rks d_k)) rv) (Rmat_transpose rvs).
 
 Definition Rcausal_attention (rq rk rv : list (list R)) (d_k : nat) : list (list R) :=
-  let scores := Rscale_scores (Rmat_mul rq (Rmat_transpose rk)) d_k in
-  let masked := Rapply_mask scores (Rcausal_mask (List.length rq)) in
-  Rmat_mul (Rsoftmax_2d masked) rv.
+  List.map (fun p => let '(i, qrow) := p in
+              Rattend qrow (List.firstn (S i) rk) (List.firstn (S i) rv) d_k)
+           (List.combine (List.seq 0 (List.length rq)) rq).
+
+(** The side conditions of one query: the dot products against the keys and
+    their scaling, the softmax, and the dot products against the value
+    columns. [len] bounds the number of keys and [kq], [kv] the lengths the two
+    families of dot products run over. *)
+Record attend_reg (M m : R) (qrow : list binary32) (ks vs : list (list binary32))
+                  (rq : list R) (rks rvs : list (list R)) (d_k kq kv len : nat)
+                  : Prop := {
+  atr_len : (List.length ks <= len)%nat;
+  atr_wlen : (List.length ks <= kv)%nat;
+  atr_qlen : (List.length qrow <= kq)%nat;
+  atr_keys : Forall (fun kj => dotreg M qrow kj f32_zero) ks;
+  atr_keys_bnd : Forall (fun rk => Forall (fun r => Rabs r <= M) rk) rks;
+  atr_sc_fin : is_finite (f32_attn_scale d_k) = true;
+  atr_sc_bnd : Rabs (Rscale d_k) <= M;
+  atr_sc : Forall (fun kj => Rabs (B2R (f32_dot qrow kj)) <= M
+                             /\ regz M (B2R (f32_dot qrow kj) * B2R (f32_attn_scale d_k))) ks;
+  atr_sm : sm_reg M m (att_scores qrow ks d_k) (Ratt_scores rq rks d_k);
+  atr_vals : Forall (fun vcol => dotreg M (f32_softmax (att_scores qrow ks d_k)) vcol f32_zero)
+                    (f32_mat_transpose vs);
+  atr_vals_bnd : Forall (fun col => Forall (fun r => Rabs r <= M) col) (Rmat_transpose rvs)
+}.
+
+Definition attend_depth (n kq kv len : nat) : nat := sm_depth (S (n + 2 * kq)) len + 2 * kv.
+
+Lemma f32_attend_stages : forall qrow ks vs d_k,
+  f32_attend qrow ks vs d_k
+  = List.map (fun vcol => f32_dot (f32_softmax (att_scores qrow ks d_k)) vcol)
+             (f32_mat_transpose vs).
+Proof. intros. unfold f32_attend, att_scores. cbv zeta. reflexivity. Qed.
+
+Lemma ok_attend : forall M m L n qrow rq ks rks vs rvs d_k kq kv len,
+  M < bpow radix2 emax32 -> amp_ok M m L ->
+  okv (errN M L n) qrow rq -> okm (errN M L n) ks rks -> okm (errN M L n) vs rvs ->
+  attend_reg M m qrow ks vs rq rks rvs d_k kq kv len ->
+  okv (errN M L (attend_depth n kq kv len)) (f32_attend qrow ks vs d_k)
+      (Rattend rq rks rvs d_k).
+Proof.
+  intros M m L n qrow rq ks rks vs rvs d_k kq kv len HM Hamp Hq Hks Hvs Hreg.
+  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
+  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
+  destruct Hreg as [Hlen Hwlen Hqlen Hkeys Hkb Hfin Hsb Hsc Hsm Hvals Hvb].
+  assert (Hsl : List.length (att_scores qrow ks d_k) = List.length ks)
+    by (unfold att_scores; apply List.length_map).
+  (* the scores *)
+  assert (Hs : okv (errN M L (S (n + 2 * kq))) (att_scores qrow ks d_k)
+                   (Ratt_scores rq rks d_k)).
+  { unfold att_scores, Ratt_scores, okv, okm in *.
+    clear Hsm Hvals Hvb Hvs Hlen Hwlen Hsl.
+    revert Hkeys Hkb Hsc.
+    induction Hks as [|kj rk ks' rks' Hk Hks IH]; intros Hkeys Hkb Hsc;
+      cbn [List.map]; [constructor|].
+    inversion Hkeys as [|? ? Hk1 Hkeys']; subst.
+    inversion Hkb as [|? ? Hb1 Hkb']; subst.
+    inversion Hsc as [|? ? [Hsb1 Hsz] Hsc']; subst.
+    constructor.
+    - eapply ok_mult_S with (m := m); try eassumption.
+      + eapply ok_errN_mono with (n := (n + 2 * List.length qrow)%nat);
+          [exact HM0 | exact HL1 | lia |].
+        eapply ok_dot_n with (m := m); eassumption.
+      + unfold Rscale. apply ok_const; assumption.
+    - apply IH; assumption. }
+  (* the weights *)
+  assert (Hw : okv (errN M L (sm_depth (S (n + 2 * kq)) (List.length (att_scores qrow ks d_k))))
+                   (f32_softmax (att_scores qrow ks d_k))
+                   (Rsoftmax (Ratt_scores rq rks d_k)))
+    by (eapply ok_softmax with (m := m); eassumption).
+  rewrite Hsl in Hw.
+  assert (Hwl : List.length (f32_softmax (att_scores qrow ks d_k)) = List.length ks)
+    by (rewrite f32_softmax_length; exact Hsl).
+  (* the value columns *)
+  assert (Hvt : okm (errN M L (sm_depth (S (n + 2 * kq)) (List.length ks)))
+                    (f32_mat_transpose vs) (Rmat_transpose rvs)).
+  { apply ok_mat_transpose; [apply errN_nonneg; assumption|].
+    eapply okm_weaken; [exact Hvs | apply errN_mono; auto; unfold sm_depth; lia]. }
+  rewrite f32_attend_stages. unfold Rattend.
+  unfold okv, okm in *.
+  clear Hsm Hks Hkeys Hkb Hsc Hvs Hs.
+  revert Hvals Hvb.
+  induction Hvt as [|vc rvc vt rvt Hvc Hvt IH]; intros Hvals Hvb;
+    cbn [List.map]; [constructor|].
+  inversion Hvals as [|? ? Hv1 Hvals']; subst.
+  inversion Hvb as [|? ? Hb1 Hvb']; subst.
+  constructor.
+  - eapply ok_errN_mono
+      with (n := (sm_depth (S (n + 2 * kq)) (List.length ks)
+                  + 2 * List.length (f32_softmax (att_scores qrow ks d_k)))%nat);
+      [exact HM0 | exact HL1 | unfold attend_depth, sm_depth; rewrite Hwl; lia |].
+    eapply ok_dot_n with (m := m); eassumption.
+  - apply IH; assumption.
+Qed.
 
 (** * Head splitting and concatenation
 
@@ -2515,89 +2975,41 @@ Proof.
     intros a b Hab. eapply Forall2_nth; [exact Hab | constructor].
 Qed.
 
-Definition ca_s1 (q k : list (list binary32)) : list (list binary32) :=
-  f32_mat_mul q (f32_mat_transpose k).
-Definition ca_s2 (q k : list (list binary32)) (d_k : nat) : list (list binary32) :=
-  f32_scale_scores (ca_s1 q k) d_k.
-Definition ca_s3 (q k : list (list binary32)) (d_k : nat) : list (list binary32) :=
-  f32_apply_mask (ca_s2 q k d_k) (f32_causal_mask (f32_mat_rows q)).
-Definition ca_s4 (q k : list (list binary32)) (d_k : nat) : list (list binary32) :=
-  f32_softmax_2d (ca_s3 q k d_k).
+(** * Causal attention
 
-Definition Rca_s1 (rq rk : list (list R)) : list (list R) :=
-  Rmat_mul rq (Rmat_transpose rk).
-Definition Rca_s2 (rq rk : list (list R)) (d_k : nat) : list (list R) :=
-  Rscale_scores (Rca_s1 rq rk) d_k.
-Definition Rca_s3 (rq rk : list (list R)) (d_k len : nat) : list (list R) :=
-  Rapply_mask (Rca_s2 rq rk d_k) (Rcausal_mask len).
-Definition Rca_s4 (rq rk : list (list R)) (d_k len : nat) : list (list R) :=
-  Rsoftmax_2d (Rca_s3 rq rk d_k len).
+    Row [i] is one query attending over the first [i + 1] keys and values, so
+    the side conditions are those of [attend_reg], row by row. *)
 
-Definition Rcausal_attention' (rq rk rv : list (list R)) (d_k len : nat)
-                              : list (list R) :=
-  Rmat_mul (Rca_s4 rq rk d_k len) rv.
+Definition ca_reg (M m : R) (q k v : list (list binary32)) (rq rk rv : list (list R))
+                  (d_k kq kv len : nat) : Prop :=
+  Forall2 (fun p rp =>
+      attend_reg M m (snd p) (List.firstn (S (fst p)) k) (List.firstn (S (fst p)) v)
+                 (snd rp) (List.firstn (S (fst p)) rk) (List.firstn (S (fst p)) rv)
+                 d_k kq kv len)
+    (List.combine (List.seq 0 (List.length q)) q)
+    (List.combine (List.seq 0 (List.length rq)) rq).
 
-Record ca_reg (M m : R) (q k v : list (list binary32)) (rq rk rv : list (list R))
-              (d_k kq kv len : nat) : Prop := {
-  car_rows : f32_mat_rows q = len;
-  car_mm1_bnd : Forall (fun col => Forall (fun r => Rabs r <= M) col)
-                       (Rmat_transpose (Rmat_transpose rk));
-  car_mm1 : Forall (fun ar => Forall (fun bc => dotreg M ar bc f32_zero
-                                                /\ (List.length ar <= kq)%nat)
-                                     (f32_mat_transpose (f32_mat_transpose k))) q;
-  car_sc_fin : is_finite (f32_div f32_one (f32_sqrt (f32_of_Z (Z.of_nat d_k)))) = true;
-  car_sc_bnd : Rabs (Rscale d_k) <= M;
-  car_sc : Forall2 (fun row rrow =>
-             Forall2 (fun x rx => Rabs (B2R x) <= M
-                        /\ regz M (B2R x * B2R (f32_div f32_one
-                                     (f32_sqrt (f32_of_Z (Z.of_nat d_k)))))) row rrow)
-             (ca_s1 q k) (Rca_s1 rq rk);
-  car_mask : Forall2 (fun sr mr => Forall2 (fun s mv => regz M (B2R s + B2R mv)) sr mr)
-                     (ca_s2 q k d_k) (f32_causal_mask len);
-  car_sm_len : Forall (fun row => List.length row = len) (ca_s3 q k d_k);
-  car_sm : Forall2 (sm_reg M m) (ca_s3 q k d_k) (Rca_s3 rq rk d_k len);
-  car_mm2_bnd : Forall (fun col => Forall (fun r => Rabs r <= M) col)
-                       (Rmat_transpose rv);
-  car_mm2 : Forall (fun ar => Forall (fun bc => dotreg M ar bc f32_zero
-                                                /\ (List.length ar <= kv)%nat)
-                                     (f32_mat_transpose v)) (ca_s4 q k d_k)
-}.
-
-Definition ca_depth (n kq kv len : nat) : nat := sm_depth (n + 2 * kq + 2) len + 2 * kv.
+Definition ca_depth (n kq kv len : nat) : nat := attend_depth n kq kv len.
 
 Lemma ok_causal_attention : forall M m L n q rq k rk v rv d_k kq kv len,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   okm (errN M L n) q rq -> okm (errN M L n) k rk -> okm (errN M L n) v rv ->
   ca_reg M m q k v rq rk rv d_k kq kv len ->
   okm (errN M L (ca_depth n kq kv len))
-      (f32_causal_attention q k v d_k) (Rcausal_attention' rq rk rv d_k len).
+      (f32_causal_attention q k v d_k) (Rcausal_attention rq rk rv d_k).
 Proof.
   intros M m L n q rq k rk v rv d_k kq kv len HM Hamp Hq Hk Hv Hreg.
-  assert (HM0 : 0 <= M) by (destruct Hamp as (_ & H & _); lra).
-  assert (HL1 : 1 <= L) by (eapply amp_L_pos; eassumption).
-  destruct Hreg as [Hrows Hb1 Hd1 Hfin Hbs Hsc Hmask Hsmlen Hsm Hb2 Hd2].
-  assert (H1 : okm (errN M L (n + 2 * kq)) (ca_s1 q k) (Rca_s1 rq rk)).
-  { unfold ca_s1, Rca_s1. eapply ok_mat_mul with (m := m); try eassumption.
-    apply ok_mat_transpose; [apply errN_nonneg; assumption | exact Hk]. }
-  assert (H2 : okm (errN M L (S (n + 2 * kq))) (ca_s2 q k d_k) (Rca_s2 rq rk d_k)).
-  { unfold ca_s2, Rca_s2. eapply ok_scale_scores with (m := m); eassumption. }
-  assert (H3 : okm (errN M L (S (S (n + 2 * kq)))) (ca_s3 q k d_k)
-                   (Rca_s3 rq rk d_k len)).
-  { unfold ca_s3, Rca_s3. rewrite Hrows.
-    eapply ok_apply_mask with (m := m); try eassumption.
-    apply ok_causal_mask, errN_nonneg; assumption. }
-  assert (H4 : okm (errN M L (sm_depth (n + 2 * kq + 2) len)) (ca_s4 q k d_k)
-                   (Rca_s4 rq rk d_k len)).
-  { unfold ca_s4, Rca_s4.
-    replace (n + 2 * kq + 2)%nat with (S (S (n + 2 * kq)))%nat by lia.
-    eapply ok_softmax_2d with (m := m); eassumption. }
-  unfold f32_causal_attention, Rcausal_attention', ca_depth.
-  replace (f32_mat_mul (f32_softmax_2d
-             (f32_apply_mask (f32_scale_scores (f32_mat_mul q (f32_mat_transpose k)) d_k)
-                (f32_causal_mask (f32_mat_rows q)))) v)
-    with (f32_mat_mul (ca_s4 q k d_k) v) by reflexivity.
-  eapply ok_mat_mul with (m := m); try eassumption.
-  eapply okm_weaken; [exact Hv | apply errN_mono; auto; unfold sm_depth; lia].
+  unfold f32_causal_attention, Rcausal_attention, ca_depth, ca_reg in *.
+  pose proof (Forall2_combine_seq _ _ (okv (errN M L n)) q rq 0 Hq) as Hpairs.
+  pose proof (Forall2_conj _ _ _ _ _ _ Hpairs Hreg) as Hall.
+  unfold okm.
+  eapply Forall2_map2; [exact Hall|].
+  intros p rp [[Hidx Hrow] Hr].
+  destruct p as [i qrow]. destruct rp as [j rqrow]. cbn [fst snd] in *. subst j.
+  cbv beta iota.
+  eapply ok_attend with (m := m); try eassumption.
+  - apply Forall2_firstn, Hk.
+  - apply Forall2_firstn, Hv.
 Qed.
 
 (** * Multi-head attention *)
@@ -2708,17 +3120,17 @@ Definition af_outs (nh d hd : nat) (qkv : list (list binary32)) :=
   List.map (fun '(qh, (kh, vh)) => f32_causal_attention qh kh vh hd)
            (af_triples nh d qkv).
 
-Definition Raf_outs (nh d hd len : nat) (qkv : list (list R)) :=
-  List.map (fun '(qh, (kh, vh)) => Rcausal_attention' qh kh vh hd len)
+Definition Raf_outs (nh d hd : nat) (qkv : list (list R)) :=
+  List.map (fun '(qh, (kh, vh)) => Rcausal_attention qh kh vh hd)
            (Raf_triples nh d qkv).
 
 Definition Rattention_forward (n_embd n_head : nat)
     (rcaw : list (list R)) (rcab : list R)
     (rcpw : list (list R)) (rcpb : list R)
-    (rhidden : list (list R)) (len : nat) : list (list R) :=
+    (rhidden : list (list R)) : list (list R) :=
   let qkv := Rlinear_forward_2d rcaw rcab rhidden in
   Rlinear_forward_2d rcpw rcpb
-    (Rconcat_heads (Raf_outs n_head n_embd (Nat.div n_embd n_head) len qkv)).
+    (Rconcat_heads (Raf_outs n_head n_embd (Nat.div n_embd n_head) qkv)).
 
 Definition af_depth (n k1 kq kv len k2 : nat) : nat :=
   S (ca_depth (S (n + 2 * k1)) kq kv len + 2 * k2).
@@ -2740,11 +3152,11 @@ Lemma ok_attention_forward :
   lin_reg M k2 cpw cpb
     (f32_concat_heads (af_outs n_head n_embd (Nat.div n_embd n_head)
                                (f32_linear_forward_2d caw cab hidden)))
-    (Rconcat_heads (Raf_outs n_head n_embd (Nat.div n_embd n_head) len
+    (Rconcat_heads (Raf_outs n_head n_embd (Nat.div n_embd n_head)
                              (Rlinear_forward_2d rcaw rcab rhidden))) ->
   okm (errN M L (af_depth n k1 kq kv len k2))
       (f32_attention_forward n_embd n_head caw cab cpw cpb hidden)
-      (Rattention_forward n_embd n_head rcaw rcab rcpw rcpb rhidden len).
+      (Rattention_forward n_embd n_head rcaw rcab rcpw rcpb rhidden).
 Proof.
   intros M m L n n_embd n_head k1 k2 kq kv len
          caw rcaw cab rcab cpw rcpw cpb rcpb hidden rhidden
@@ -2779,7 +3191,7 @@ Proof.
   assert (Houts : Forall2 (okm (errN M L (ca_depth n1 kq kv len)))
     (af_outs n_head n_embd (Nat.div n_embd n_head)
              (f32_linear_forward_2d caw cab hidden))
-    (Raf_outs n_head n_embd (Nat.div n_embd n_head) len
+    (Raf_outs n_head n_embd (Nat.div n_embd n_head)
               (Rlinear_forward_2d rcaw rcab rhidden))).
   { unfold af_outs, Raf_outs.
     eapply Forall2_map2; [exact Hall|].
@@ -2790,7 +3202,7 @@ Proof.
   assert (Hcat : okm (errN M L (ca_depth n1 kq kv len))
     (f32_concat_heads (af_outs n_head n_embd (Nat.div n_embd n_head)
                                (f32_linear_forward_2d caw cab hidden)))
-    (Rconcat_heads (Raf_outs n_head n_embd (Nat.div n_embd n_head) len
+    (Rconcat_heads (Raf_outs n_head n_embd (Nat.div n_embd n_head)
                              (Rlinear_forward_2d rcaw rcab rhidden))))
     by (apply ok_concat_heads, Houts).
   assert (Heq : f32_attention_forward n_embd n_head caw cab cpw cpb hidden
@@ -2803,9 +3215,9 @@ Proof.
   rewrite Heq. unfold Rattention_forward, af_depth.
   eapply ok_linear2d with (m := m); try eassumption.
   - eapply okm_weaken; [exact Hcpw
-    | apply errN_mono; auto; unfold ca_depth, sm_depth, n1; lia].
+    | apply errN_mono; auto; unfold ca_depth, attend_depth, sm_depth, n1; lia].
   - eapply okv_weaken; [exact Hcpb
-    | apply errN_mono; auto; unfold ca_depth, sm_depth, n1; lia].
+    | apply errN_mono; auto; unfold ca_depth, attend_depth, sm_depth, n1; lia].
 Qed.
 
 (** * The transformer block
@@ -2822,7 +3234,7 @@ Definition Rblock_forward
     (reps : R) (n_embd n_head len : nat) (rhidden : list (list R))
     : list (list R) :=
   let ln1 := Rlayer_norm_2d rln1w rln1b reps len rhidden in
-  let attn := Rattention_forward n_embd n_head rcaw rcab rcpw rcpb ln1 len in
+  let attn := Rattention_forward n_embd n_head rcaw rcab rcpw rcpb ln1 in
   let hidden2 := Radd_matrices rhidden attn in
   let ln2 := Rlayer_norm_2d rln2w rln2b reps len hidden2 in
   let mlp := Rmlp_forward rcfw rcfb rmpw rmpb ln2 in
@@ -2833,7 +3245,7 @@ Definition blk_depth (n len k1 kq kv k2 km1 km2 : nat) : nat :=
   let d2 := af_depth d1 k1 kq kv len k2 in
   let d3 := S d2 in
   let d4 := ln_depth d3 len in
-  let d5 := S (S (d4 + 2 * km1) + 25 + 2 * km2) in
+  let d5 := S (S (d4 + 2 * km1) + 33 + 2 * km2) in
   S d5.
 
 Lemma ok_block_forward :
@@ -2887,7 +3299,7 @@ Lemma ok_block_forward :
           (f32_layer_norm_2d (f32_ln_weight (f32_block_ln_1 block))
                              (f32_ln_bias (f32_block_ln_1 block)) eps hidden))))
     (Rconcat_heads (Raf_outs (gpt2_inf_n_head cfg) (gpt2_inf_n_embd cfg)
-       (Nat.div (gpt2_inf_n_embd cfg) (gpt2_inf_n_head cfg)) len
+       (Nat.div (gpt2_inf_n_embd cfg) (gpt2_inf_n_head cfg))
        (Rlinear_forward_2d rcaw rcab (Rlayer_norm_2d rln1w rln1b reps len rhidden)))) ->
   (* first residual *)
   Forall2 (fun r1 r2 => Forall2 (fun x y => regz M (B2R x + B2R y)) r1 r2)
@@ -2922,7 +3334,7 @@ Lemma ok_block_forward :
                              (f32_ln_bias (f32_block_ln_1 block)) eps hidden)))
     (Radd_matrices rhidden
        (Rattention_forward (gpt2_inf_n_embd cfg) (gpt2_inf_n_head cfg)
-          rcaw rcab rcpw rcpb (Rlayer_norm_2d rln1w rln1b reps len rhidden) len)) ->
+          rcaw rcab rcpw rcpb (Rlayer_norm_2d rln1w rln1b reps len rhidden))) ->
   (* MLP *)
   lin_reg M km1 (f32_mlp_c_fc_weight (f32_block_mlp block))
                 (f32_mlp_c_fc_bias (f32_block_mlp block))
@@ -2939,7 +3351,7 @@ Lemma ok_block_forward :
     (Rlayer_norm_2d rln2w rln2b reps len
        (Radd_matrices rhidden
           (Rattention_forward (gpt2_inf_n_embd cfg) (gpt2_inf_n_head cfg)
-             rcaw rcab rcpw rcpb (Rlayer_norm_2d rln1w rln1b reps len rhidden) len))) ->
+             rcaw rcab rcpw rcpb (Rlayer_norm_2d rln1w rln1b reps len rhidden)))) ->
   Forall2 (Forall2 (gelu_reg M m))
     (f32_linear_forward_2d (f32_mlp_c_fc_weight (f32_block_mlp block))
        (f32_mlp_c_fc_bias (f32_block_mlp block))
@@ -2957,7 +3369,7 @@ Lemma ok_block_forward :
        (Rlayer_norm_2d rln2w rln2b reps len
           (Radd_matrices rhidden
              (Rattention_forward (gpt2_inf_n_embd cfg) (gpt2_inf_n_head cfg)
-                rcaw rcab rcpw rcpb (Rlayer_norm_2d rln1w rln1b reps len rhidden) len)))) ->
+                rcaw rcab rcpw rcpb (Rlayer_norm_2d rln1w rln1b reps len rhidden))))) ->
   lin_reg M km2 (f32_mlp_c_proj_weight (f32_block_mlp block))
                 (f32_mlp_c_proj_bias (f32_block_mlp block))
     (List.map f32_gelu_vec
@@ -2979,7 +3391,7 @@ Lemma ok_block_forward :
              (Radd_matrices rhidden
                 (Rattention_forward (gpt2_inf_n_embd cfg) (gpt2_inf_n_head cfg)
                    rcaw rcab rcpw rcpb
-                   (Rlayer_norm_2d rln1w rln1b reps len rhidden) len))))) ->
+                   (Rlayer_norm_2d rln1w rln1b reps len rhidden)))))) ->
   (* second residual *)
   Forall2 (fun r1 r2 => Forall2 (fun x y => regz M (B2R x + B2R y)) r1 r2)
     (f32_add_matrices hidden
@@ -3026,7 +3438,7 @@ Proof.
                 (f32_attn_c_proj_weight (f32_block_attn block))
                 (f32_attn_c_proj_bias (f32_block_attn block)) LN1) in *.
   set (RATT := Rattention_forward (gpt2_inf_n_embd cfg) (gpt2_inf_n_head cfg)
-                 rcaw rcab rcpw rcpb RLN1 len) in *.
+                 rcaw rcab rcpw rcpb RLN1) in *.
   set (HH2 := f32_add_matrices hidden ATT) in *.
   set (RHH2 := Radd_matrices rhidden RATT) in *.
   set (LN2 := f32_layer_norm_2d (f32_ln_weight (f32_block_ln_2 block))
@@ -3044,15 +3456,15 @@ Proof.
   assert (A3 : okm (errN M L d3) HH2 RHH2).
   { unfold d3, HH2, RHH2. eapply ok_add_matrices with (m := m); try eassumption.
     eapply okm_weaken; [exact Hh | apply errN_mono; auto;
-      unfold d2, af_depth, ca_depth, sm_depth, d1, ln_depth; lia]. }
+      unfold d2, af_depth, ca_depth, attend_depth, sm_depth, d1, ln_depth; lia]. }
   set (d4 := ln_depth d3 len).
   assert (A4 : okm (errN M L d4) LN2 RLN2).
   { unfold d4, LN2, RLN2. eapply ok_layer_norm_2d with (m := m); try eassumption;
       (eapply okv_weaken; [eassumption | apply errN_mono; auto;
-         unfold d3, d2, af_depth, ca_depth, sm_depth, d1, ln_depth; lia])
+         unfold d3, d2, af_depth, ca_depth, attend_depth, sm_depth, d1, ln_depth; lia])
       || (eapply ok_errN_mono with (n := n); [exact HM0 | exact HL1 |
-            unfold d3, d2, af_depth, ca_depth, sm_depth, d1, ln_depth; lia | eassumption]). }
-  set (d5 := S (S (d4 + 2 * km1) + 25 + 2 * km2)).
+            unfold d3, d2, af_depth, ca_depth, attend_depth, sm_depth, d1, ln_depth; lia | eassumption]). }
+  set (d5 := S (S (d4 + 2 * km1) + 33 + 2 * km2)).
   assert (A5 : okm (errN M L d5)
                  (f32_mlp_forward (f32_mlp_c_fc_weight (f32_block_mlp block))
                     (f32_mlp_c_fc_bias (f32_block_mlp block))
@@ -3061,9 +3473,9 @@ Proof.
                  (Rmlp_forward rcfw rcfb rmpw rmpb RLN2)).
   { unfold d5. eapply ok_mlp_forward with (m := m); try eassumption;
       (eapply okm_weaken; [eassumption | apply errN_mono; auto;
-         unfold d4, d3, d2, af_depth, ca_depth, sm_depth, d1, ln_depth; lia])
+         unfold d4, d3, d2, af_depth, ca_depth, attend_depth, sm_depth, d1, ln_depth; lia])
       || (eapply okv_weaken; [eassumption | apply errN_mono; auto;
-         unfold d4, d3, d2, af_depth, ca_depth, sm_depth, d1, ln_depth; lia]). }
+         unfold d4, d3, d2, af_depth, ca_depth, attend_depth, sm_depth, d1, ln_depth; lia]). }
   eapply ok_add_matrices with (m := m); try eassumption.
   eapply okm_weaken; [exact A3 | apply errN_mono; auto;
     unfold d5, d4, d3, ln_depth; lia].
@@ -5596,9 +6008,8 @@ Qed.
     the propagation relation can carry across: the two evaluations deliberately
     disagree there. The bounds below are therefore stated on the reduced
     argument, with whatever real value the reduction settled on supplied by
-    the caller, and they carry the Taylor polynomial from there. This is the
-    same treatment the exponential's saturation gets. Approx.v bounds the same
-    polynomials against [sin] and [cos] themselves. *)
+    the caller, and they carry the Taylor polynomial from there. Truth.v bounds
+    the same polynomials against [sin] and [cos] themselves. *)
 
 Definition s_r2 (r : binary32) : binary32 := f32_mult r r.
 Definition s_r3 (r : binary32) : binary32 := f32_mult (s_r2 r) (r).
@@ -6312,8 +6723,8 @@ Proof.
   - destruct IH as [alpha' [ts' (Hal & Hlen & Hts & Heq)]].
     (* the two roundoffs this step performs *)
     pose proof (f32_mult_correct x y Hb1) as HM.
-    destruct (f32_round_rel _ Hu1) as [m [Hm Hrm]].
-    destruct (f32_round_rel _ Hu2) as [e [He Hre]].
+    destruct (f32_round_relz _ Hu1) as [m [Hm Hrm]].
+    destruct (f32_round_relz _ Hu2) as [e [He Hre]].
     pose proof (f32_plus_correct a (f32_mult x y) Hfa Hfm Hb2) as HP.
     exists ((1 + e) * alpha'),
            ((1 + m) * ((1 + e) * alpha') :: ts').
@@ -6347,8 +6758,7 @@ Proof.
   unfold f32_dot. rewrite Heq, B2R_f32_zero. ring.
 Qed.
 
-(** The premise is the same one the running bound uses, and the same witness
-    satisfies it, so this statement is not vacuous either. *)
+(** The witness for the running bound's premise applies here too. *)
 Corollary f32_dot_backward_ones :
   exists ts,
     List.length ts = 1%nat
@@ -6735,64 +7145,10 @@ Qed.
     built from [B2R] of concrete binary32 values by [+], [*] and [/]. Such a
     value is a rational, so the conditions become decidable comparisons once
     the floats are read as rationals. [Qb] does that reading, [Qb_correct] says
-    it is faithful, and [regz_Q] turns one side condition into two comparisons
+    it is faithful, and [regz_Q] turns one side condition into one comparison
     a machine can check. *)
 
-Open Scope Q_scope.
-
-(** The exact value of a binary32, as a rational. *)
-Definition Qb (x : binary32) : Q :=
-  match x with
-  | B754_finite s m e _ =>
-      let n := cond_Zopp s (Zpos m) in
-      match e with
-      | Z0 => inject_Z n
-      | Zpos p => inject_Z (n * Zpower_pos 2 p)
-      | Zneg p => inject_Z n / inject_Z (Zpower_pos 2 p)
-      end
-  | _ => 0
-  end.
-
-Close Scope Q_scope.
-
-Lemma Q2R_inject : forall n, Q2R (inject_Z n) = IZR n.
-Proof. intros n. unfold Q2R, inject_Z. simpl. field. Qed.
-
-Lemma Zpower_pos_gt0 : forall p, (0 < Zpower_pos 2 p)%Z.
-Proof. intros p. apply Zpower_pos_gt_0. lia. Qed.
-
-Lemma Qb_correct : forall x : binary32, B2R x = Q2R (Qb x).
-Proof.
-  intros x. destruct x as [s|s| |s m e H]; simpl;
-    try (unfold Q2R; simpl; lra).
-  unfold F2R. simpl.
-  destruct e as [|p|p].
-  - rewrite Q2R_inject. simpl. lra.
-  - rewrite Q2R_inject, mult_IZR. reflexivity.
-  - rewrite Q2R_div by
-      (intro Hc; unfold Qeq, inject_Z in Hc; simpl in Hc;
-       pose proof (Zpower_pos_gt0 p); lia).
-    rewrite !Q2R_inject. unfold bpow. unfold Rdiv. reflexivity.
-Qed.
-
-Lemma u_le_one : f32_u <= 1.
-Proof.
-  unfold f32_u, prec32.
-  set (e := (- 24 + 1)%Z).
-  assert (H : bpow radix2 e <= 1).
-  { replace 1 with (bpow radix2 0) by reflexivity. apply bpow_le. unfold e. lia. }
-  assert (Hp : 0 < bpow radix2 e) by apply bpow_gt_0.
-  assert (Hi : / 2 <= 1).
-  { rewrite <- Rinv_1. apply Rinv_le_contravar; lra. }
-  apply Rle_trans with (1 * bpow radix2 e).
-  - apply Rmult_le_compat_r; [lra | exact Hi].
-  - lra.
-Qed.
-
 Lemma Q2R_0q : Q2R 0%Q = 0%R.
-Proof. unfold Q2R. simpl. lra. Qed.
-
-Lemma Q2R_two : Q2R (2 # 1) = 2%R.
 Proof. unfold Q2R. simpl. lra. Qed.
 
 Lemma Q2R_abs : forall q, Q2R (Qabs q) = Rabs (Q2R q).
@@ -6804,34 +7160,53 @@ Proof.
     apply Qle_Rle in H. rewrite Q2R_0q in H. lra.
 Qed.
 
-Lemma normal_lo_Q : f32_normal_lo = Q2R (1 # (2^126)%positive).
+Lemma u_le_half : f32_u <= / 2.
 Proof.
-  unfold f32_normal_lo, f32_emin, prec32, emax32.
-  replace (3 - 128 - 24 + 24 - 1)%Z with (-126)%Z by lia.
-  unfold Q2R. cbn [Qnum Qden]. rewrite Rmult_1_l.
-  unfold bpow.
-  replace (Z.pos (2^126)%positive) with (Zpower_pos 2 126)
-    by (vm_compute; reflexivity).
-  reflexivity.
+  unfold f32_u.
+  assert (H : bpow radix2 (- prec32 + 1) <= 1).
+  { replace 1 with (bpow radix2 0) by reflexivity.
+    apply bpow_le. unfold prec32. lia. }
+  apply Rmult_le_reg_l with 2; [lra|].
+  replace (2 * (/ 2 * bpow radix2 (- prec32 + 1)))
+    with (bpow radix2 (- prec32 + 1)) by field.
+  replace (2 * / 2) with 1 by field.
+  exact H.
 Qed.
 
-(** One side condition, as two comparisons on rationals. Doubling the magnitude
-    is a coarser bound than [1 + u], which is what lets the check avoid the
-    unit roundoff entirely. *)
+(** The absolute term is below the bottom of the normal range. *)
+Lemma two_eta_le_normal_lo : 2 * f32_eta <= f32_normal_lo.
+Proof.
+  unfold f32_eta, f32_normal_lo.
+  replace (2 * (/ 2 * bpow radix2 f32_emin))
+    with (bpow radix2 f32_emin) by field.
+  apply bpow_le. unfold f32_emin, prec32, emax32. lia.
+Qed.
+
+Lemma eta_Q : f32_eta = Q2R (1 # (2^150)%positive).
+Proof.
+  unfold f32_eta, f32_emin, prec32, emax32.
+  replace (3 - 128 - 24)%Z with (-149)%Z by lia.
+  unfold Q2R. cbn [Qnum Qden]. rewrite Rmult_1_l.
+  unfold bpow.
+  replace (Z.pos (2^150)%positive) with (2 * Zpower_pos 2 149)%Z
+    by (vm_compute; reflexivity).
+  rewrite mult_IZR, Rinv_mult. reflexivity.
+Qed.
+
+(** One side condition, as one comparison on rationals: [3/2] bounds [1 + u],
+    and [2^-150] is the absolute term, so a zero passes too. *)
 Lemma regz_Q : forall (q qM : Q),
-  Qle_bool (1 # (2^126)%positive) (Qabs q) = true ->
-  Qle_bool (Qabs q * (2 # 1)) qM = true ->
+  Qle_bool (Qabs q * (3 # 2) + (1 # (2^150)%positive)) qM = true ->
   regz (Q2R qM) (Q2R q).
 Proof.
-  intros q qM H1 H2. split.
-  - rewrite normal_lo_Q, <- Q2R_abs. apply Qle_Rle, Qle_bool_imp_le, H1.
-  - pose proof u_le_one as Hu.
-    assert (Habs : 0 <= Q2R (Qabs q)) by (rewrite Q2R_abs; apply Rabs_pos).
-    assert (H2' : Q2R (Qabs q) * 2 <= Q2R qM).
-    { replace (Q2R (Qabs q) * 2) with (Q2R (Qabs q * (2 # 1))).
-      - apply Qle_Rle, Qle_bool_imp_le, H2.
-      - rewrite Q2R_mult, Q2R_two. reflexivity. }
-    rewrite <- Q2R_abs. nra.
+  intros q qM H. unfold regz.
+  pose proof u_le_half as Hu.
+  apply Qle_bool_imp_le, Qle_Rle in H.
+  rewrite Q2R_plus, Q2R_mult, Q2R_abs, <- eta_Q in H.
+  assert (H32 : Q2R (3 # 2) = 3 / 2) by (unfold Q2R; simpl; lra).
+  rewrite H32 in H.
+  assert (Ha : 0 <= Rabs (Q2R q)) by apply Rabs_pos.
+  nra.
 Qed.
 
 (** A magnitude bound, likewise. *)
@@ -6849,19 +7224,6 @@ Proof.
   apply Qle_Rle, Qle_bool_imp_le, H.
 Qed.
 
-(** The exponential's reduced argument at one, checked rather than estimated:
-    the division is exact, so the reduced argument is two to the minus eight,
-    and every side condition about it reduces to arithmetic on rationals. *)
-Example regz_e_r2_one :
-  regz (Q2R (4 # 1)) (B2R (e_r f32_one) * B2R (e_r f32_one)).
-Proof.
-  rewrite !Qb_correct, <- Q2R_mult.
-  apply regz_Q; vm_compute; reflexivity.
-Qed.
-
-Example abs_e_r_one : Rabs (B2R (e_r f32_one)) <= Q2R (4 # 1).
-Proof. rewrite Qb_correct. apply abs_le_Q. vm_compute. reflexivity. Qed.
-
 (** The amplification budget is satisfiable. *)
 Lemma amp_ok_ones : amp_ok 1 1 2.
 Proof.
@@ -6875,18 +7237,8 @@ Proof.
   - rewrite Hs. replace (1 / (2 * 1)) with (/ 2) by field. lra.
 Qed.
 
-(** Two facts the remaining witnesses need. Squaring cannot leave the unit
-    disc, which bounds the exponential's eight iterations without evaluating
-    the rational they produce; and a square root whose radicand is a rational
-    square can be read off, which is what a witness needs where the relation
-    passes through [sqrt]. *)
-Lemma iter_sq_le_one : forall i v, Rabs v <= 1 -> Rabs (Nat.iter i Re_sq v) <= 1.
-Proof.
-  induction i as [|i IH]; intros v H; simpl; [exact H|].
-  unfold Re_sq at 1. rewrite Rabs_mult.
-  pose proof (IH v H). pose proof (Rabs_pos (Nat.iter i Re_sq v)). nra.
-Qed.
-
+(** A square root whose radicand is a rational square can be read off, which is
+    what a witness needs where the relation passes through [sqrt]. *)
 Lemma sqrt_of_sq : forall (t : binary32) (q : Q),
   (0 <= q)%Q -> (Qb t == q * q)%Q -> sqrt (B2R t) = Q2R q.
 Proof.

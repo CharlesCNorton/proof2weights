@@ -25,6 +25,8 @@ nul
 /theories/qwen_native.ml
 /theories/llama_inductive.ml
 /theories/qwen_inductive.ml
+/theories/runerr_native.ml
+/theories/runerr_inductive.ml
 /*.mli
 /phases1_15_complete.ml
 /phases1_15_native.ml
@@ -43,6 +45,7 @@ nul
 # Differential-testing harness output.
 /expbatch/
 /archbatch/
+/bound_out/
 /coq_out.txt
 *.w
 
@@ -51,6 +54,8 @@ nul
 /ref_logits
 /float_smoke
 /float_load_run
+/gpt2_bound_native
+/gpt2_bound_ref
 
 # Paper build artifacts and captured tool output.
 /paper/*.pdf
@@ -58,3 +63,8 @@ nul
 /paper/*.aux
 /paper/*.out
 /paper/audit_output.txt
+
+# coq_makefile output, regenerated from theories/_CoqProject by theories/Makefile.
+/theories/Makefile.coq
+/theories/Makefile.coq.conf
+/theories/.Makefile.coq.d

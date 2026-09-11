@@ -140,5 +140,5 @@ let () =
   Array.sort (fun i j -> compare a.(j) a.(i)) idx;
   Printf.printf "top-10 next-token logits (inductive, no FPU trusted):\n";
   for r = 0 to min 9 (topk - 1) do
-    let i = idx.(r) in Printf.printf "  %6d  %.4f\n" i a.(i)
+    let i = idx.(r) in Printf.printf "  %6d  %.9g\n" i a.(i)
   done

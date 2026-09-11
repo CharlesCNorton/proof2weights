@@ -9,8 +9,8 @@
     only a toy configuration is practical, which is what runners/qwen_ref.ml
     drives.
 
-    The directives come from Phases1_15_complete.v through the Require below;
-    nothing here overrides them, which is exactly the point. *)
+    The directives come from Phases1_15_complete.v through the Require below,
+    and nothing here overrides them. *)
 
 Require Import Phases1_15_complete.
 Require Import Llama.
@@ -22,7 +22,7 @@ Extraction "qwen_inductive.ml"
   binary32 f32_of_Z f32_zero f32_one f32_two f32_bytes_to_binary32
   f32_plus f32_minus f32_mult f32_div f32_neg f32_abs f32_sqrt
   f32_dot f32_mat_vec_mul f32_mat_transpose f32_vec_add f32_vec_mult
-  f32_sigmoid f32_exp_approx f32_sum f32_softmax
+  f32_sigmoid f32_exp_approx f32_sum f32_softmax f32_tanh f32_gelu
   f32_silu f32_silu_vec f32_rmsnorm f32_sin f32_cos
   f32_max2 f32_log_unit f32_softplus f32_l2norm f32_slice
   f32_rmsnorm_zc f32_rmsnorm_gated
@@ -38,4 +38,5 @@ Extraction "qwen_inductive.ml"
   f32_qwen_attn_mix f32_qwen_wrap f32_qwen_final f32_qwen_logits
   f32_qwen_stack f32_qwen_forward f32_qwen_next_token_logits
   f32_embed_tokens
-  f32_causal_attention f32_concat_heads f32_split_into_heads.
+  f32_attend f32_causal_attention f32_concat_heads f32_split_into_heads
+  json_tensor_offsets.

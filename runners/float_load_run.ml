@@ -41,5 +41,5 @@ let () =
   let logits = f32_gpt2_logits cfg f32_ln_eps model [0; 1; 2] in
   List.iter (fun row ->
     print_string "  ";
-    List.iter (fun x -> Printf.printf "%.6f " (b32_to_float x)) row;
+    List.iter (fun x -> Printf.printf "%.9g " (b32_to_float x)) row;
     print_newline ()) logits

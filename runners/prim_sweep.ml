@@ -1,19 +1,16 @@
 (* prim_sweep.ml - evaluate the extracted elementary functions on a sweep of
    inputs, against the INDUCTIVE extraction.
 
-   The differential harness in scripts/experiment_arch.py never calls
-   f32_sin or f32_cos: it hands the rotary tables to both sides as random
-   weight matrices. Neither of the two defects in the trigonometric path was
-   therefore reachable by any sweep row, which is how a sign flip survived 368
-   samples with no next-token disagreement. This driver closes that gap by
-   evaluating the primitives themselves.
+   The architecture sweep in scripts/experiment_arch.py hands the rotary tables
+   to both sides as data, so it does not evaluate f32_sin or f32_cos. This
+   driver evaluates the primitives themselves.
 
    Input is one unsigned 32-bit little-endian bit pattern per line on stdin.
-   Output is one line per input: the result of each primitive, printed as the
+   Output is one line per input: the result of the primitive, printed as the
    exact binary64 rendering of the binary32 value, so the comparison in
    scripts/prim_check.py is not mediated by a reimplementation.
 
-   usage: prim_sweep <sin|cos|exp|log|softplus|sigmoid|sqrt> < bits.txt *)
+   usage: prim_sweep <sin|cos|exp|log|softplus|sigmoid|tanh|gelu|sqrt> < bits.txt *)
 
 open Qwen_inductive
 
@@ -49,6 +46,8 @@ let () =
     | "log"      -> f32_log_unit
     | "softplus" -> f32_softplus
     | "sigmoid"  -> f32_sigmoid
+    | "tanh"     -> f32_tanh
+    | "gelu"     -> f32_gelu
     | "sqrt"     -> f32_sqrt
     | s -> failwith ("unknown primitive " ^ s) in
   (try

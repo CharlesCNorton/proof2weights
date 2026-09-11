@@ -8,12 +8,9 @@
     reading the flat buffer at stride [cols], and feed that to
     [f32_mat_vec_mul].
 
-    That substitution is the single place where the runners depart from the
-    definitions in a way that is not pure plumbing, and it was checked only on
-    fixtures. This file proves it: the transposed decode returns exactly
-    [f32_mat_transpose] of the reshape, so the runner's linear layer computes
-    the same binary32 values [f32_linear_forward] computes, operation for
-    operation. *)
+    The transposed decode returns exactly [f32_mat_transpose] of the reshape,
+    so the runner's linear layer computes the same binary32 values
+    [f32_linear_forward] computes, operation for operation. *)
 
 From Stdlib Require Import List.
 From Stdlib Require Import Lia.

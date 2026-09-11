@@ -13,7 +13,12 @@
    usage:
      llama_talk_native <path> d n_layer n_head n_kv ff vocab <tok,...>            (top-10)
      llama_talk_native <path> d n_layer n_head n_kv ff vocab <tok,...> <max_new> <eos>  (generate)
-     llama_talk_native <path> d n_layer n_head n_kv ff vocab serve <eos>          (persistent server) *)
+     llama_talk_native <path> d n_layer n_head n_kv ff vocab serve <eos>          (persistent server)
+     llama_talk_native <path> d n_layer n_head n_kv ff vocab dump <windows> <outdir> <first> <last>
+
+   dump reads one comma-separated window per line and, for each line index in
+   [first, last), writes <outdir>/<index>.f32: the logits of every position, as
+   little-endian binary32 bit patterns, positions in order. *)
 
 open Llama_native
 
@@ -41,6 +46,19 @@ let slice off len row = ftake len (fdrop off row)
 let rec map3 f a b c =
   match a, b, c with x :: a', y :: b', z :: c' -> f x y z :: map3 f a' b' c' | _, _, _ -> []
 
+let write_f32 oc (x : float) =
+  let bits = Int32.bits_of_float x in
+  for k = 0 to 3 do
+    output_byte oc (Int32.to_int (Int32.logand (Int32.shift_right_logical bits (8 * k)) 0xffl))
+  done
+
+let read_lines path =
+  let ic = open_in path in
+  let rec go acc = match input_line ic with
+    | l -> go (if String.trim l = "" then acc else String.trim l :: acc)
+    | exception End_of_file -> close_in ic; List.rev acc in
+  go []
+
 type layer = {
   ln1 : binary32 list; ln2 : binary32 list;
   qw : binary32 list list; kw : binary32 list list;
@@ -58,13 +76,16 @@ let () =
   let vocab = int_of_string Sys.argv.(7) in
   let toks_arg = Sys.argv.(8) in
   let serve = (toks_arg = "serve") in
+  let dump = (toks_arg = "dump") in
   let eos =
     if serve then (if Array.length Sys.argv > 9 then int_of_string Sys.argv.(9) else -1)
+    else if dump then -1
     else (if Array.length Sys.argv > 10 then int_of_string Sys.argv.(10) else -1) in
   let max_new =
-    if serve then 0
+    if serve || dump then 0
     else (if Array.length Sys.argv > 9 then int_of_string Sys.argv.(9) else 0) in
-  let prompt = if serve then [] else List.map int_of_string (String.split_on_char ',' toks_arg) in
+  let prompt =
+    if serve || dump then [] else List.map int_of_string (String.split_on_char ',' toks_arg) in
   let hd = d / nh in
   let group = nh / nkv in
   let kvd = nkv * hd in
@@ -108,19 +129,18 @@ let () =
     let outb = map3 (fun xaj xbj (c, s) -> f32_plus (f32_mult xbj c) (f32_mult xaj s)) xa xb cs in
     outa @ outb in
 
-  let attend qhead kcache vcache =
-    let inv = f32_div f32_one (f32_sqrt (f32_of_Z hd)) in
-    let scores = List.map (fun kj -> f32_mult (f32_dot qhead kj) inv) kcache in
-    let w = f32_softmax scores in
-    match f32_mat_mul [w] vcache with row :: _ -> row | [] -> [] in
+  (* A decode step: the new query attending over every cached key and value,
+     which is the last row of f32_causal_attention over the whole sequence. *)
+  let attend qhead kcache vcache = f32_attend qhead kcache vcache hd in
 
   let logits_of v = Array.init vocab (fun j -> f32_dot v emb.(j)) in
   let argmax a =
     let bi = ref 0 in
     for j = 1 to Array.length a - 1 do if a.(j) > a.(!bi) then bi := j done; !bi in
 
-  (* One query with a fresh key/value cache. Returns (first-position logits,
-     generated token ids). Streams "TOK <id>" per generated token if stream. *)
+  (* One query with a fresh key/value cache. Returns (the normalised final
+     hidden rows of the prompt, first-position logits, generated token ids).
+     Streams "TOK <id>" per generated token if stream. *)
   let run_query toks max_new stream =
     let kc = Array.make_matrix nl nkv [] in
     let vc = Array.make_matrix nl nkv [] in
@@ -149,8 +169,7 @@ let () =
         hidden := List.map2 f32_vec_add hidden2 down;
         if stream then Printf.printf "PFL %d\n%!" (i + 1)
       done;
-      let final = List.map (fun row -> f32_rmsnorm normw eps row) !hidden in
-      logits_of (List.nth final (List.length toks - 1)) in
+      List.map (fun row -> f32_rmsnorm normw eps row) !hidden in
     let decode_step pos token =
       let hv = ref emb.(token) in
       for i = 0 to nl - 1 do
@@ -175,7 +194,8 @@ let () =
         hv := f32_vec_add hidden2 down
       done;
       logits_of (f32_rmsnorm normw eps !hv) in
-    let logits0 = prefill toks in
+    let final = prefill toks in
+    let logits0 = logits_of (List.nth final (List.length toks - 1)) in
     let gen = ref [] in
     if max_new > 0 then begin
       let cur = ref (argmax logits0) in
@@ -191,9 +211,24 @@ let () =
         done
       with Exit -> ())
     end;
-    (logits0, List.rev !gen) in
+    (final, logits0, List.rev !gen) in
 
-  if serve then begin
+  if dump then begin
+    let windows = Array.of_list (read_lines Sys.argv.(9)) in
+    let outdir = Sys.argv.(10) in
+    let first = int_of_string Sys.argv.(11) and last = int_of_string Sys.argv.(12) in
+    for w = first to min last (Array.length windows) - 1 do
+      let toks = List.map int_of_string (String.split_on_char ',' windows.(w)) in
+      let (final, _, _) = run_query toks 0 false in
+      let tmp = Printf.sprintf "%s/%d.f32.tmp" outdir w in
+      let oc = open_out_bin tmp in
+      List.iter (fun hrow -> Array.iter (write_f32 oc) (logits_of hrow)) final;
+      close_out oc;
+      Sys.rename tmp (Printf.sprintf "%s/%d.f32" outdir w);
+      Printf.eprintf "window %d done\n%!" w
+    done
+  end
+  else if serve then begin
     Printf.printf "CKSUM %d\nREADY\n%!" cksum;
     (try
       while true do
@@ -202,7 +237,7 @@ let () =
           match String.split_on_char ' ' line with
           | ids_csv :: mn :: _ ->
               let qtoks = List.map int_of_string (String.split_on_char ',' ids_csv) in
-              let (_, g) = run_query qtoks (int_of_string mn) true in
+              let (_, _, g) = run_query qtoks (int_of_string mn) true in
               Printf.printf "END %s\n%!" (String.concat "," (List.map string_of_int g))
           | _ -> Printf.printf "END \n%!"
         end
@@ -210,13 +245,13 @@ let () =
     with End_of_file -> ())
   end
   else if max_new > 0 then begin
-    let (_, g) = run_query prompt max_new false in
+    let (_, _, g) = run_query prompt max_new false in
     print_string (String.concat " " (List.map string_of_int g)); print_newline ()
   end
   else begin
-    let (logits0, _) = run_query prompt 0 false in
+    let (_, logits0, _) = run_query prompt 0 false in
     let idx = Array.init vocab (fun i -> i) in
     Array.sort (fun i j -> compare logits0.(j) logits0.(i)) idx;
     Printf.printf "top-10 next-token logits:\n";
-    for r = 0 to 9 do let i = idx.(r) in Printf.printf "  %6d  %.4f\n" i logits0.(i) done
+    for r = 0 to 9 do let i = idx.(r) in Printf.printf "  %6d  %.9g\n" i logits0.(i) done
   end

@@ -1,34 +1,40 @@
 """numpy float32 mirrors of the Llama and Qwen3.5 forward passes.
 
-These use the SAME elementwise math the Rocq definitions specify (the
-range-reduced exponential, the arctanh logarithm, x * sigmoid(x) for SiLU,
-RMSNorm over the mean square, causal attention with a max-shifted softmax) but
-NATURAL numpy reductions (@, sum, mean, max) rather than the left folds the
-definitions perform. The extracted verified forward is the canonical oracle;
-this measures how far numpy's reduction order lands from it.
+These use the same elementwise math the Rocq definitions specify (the scaled
+exponential, the arctanh logarithm, x * sigmoid(x) for SiLU, RMSNorm over the
+mean square, causal attention where each row attends over its prefix with a
+max-shifted softmax) but natural numpy reductions (@, sum, mean, max) rather
+than the left folds the definitions perform. The extracted forward is the
+reference; this measures how far numpy's reduction order lands from it.
 """
 import numpy as np
 
 f32 = np.float32
 
+EXP_HI = f32(88)
+EXP_LO = f32(-88)
+LN2_HI = f32(355) / f32(512)
+LN2_LO = f32(14581891) / f32(68719476736)
+INV_LN2 = f32(12102203) / f32(8388608)
+MAGIC = f32(12582912)
+
 
 def my_exp(x):
-    """exp(x) = exp(x/256)^256, matching f32_exp_approx exactly."""
+    """exp(x) = 2^k exp(r) with r = x - k log 2, matching f32_exp_approx."""
     x = np.asarray(x, dtype=f32)
-    xc = np.clip(x, f32(-88.0), f32(88.0)).astype(f32)
-    r = (xc / f32(256.0)).astype(f32)
+    xc = np.where(EXP_HI < x, EXP_HI, np.where(x < EXP_LO, EXP_LO, x)).astype(f32)
+    k = (((xc * INV_LN2).astype(f32) + MAGIC).astype(f32) - MAGIC).astype(f32)
+    r = ((xc - (k * LN2_HI).astype(f32)).astype(f32) + (k * LN2_LO).astype(f32)).astype(f32)
     r2 = (r * r).astype(f32); r3 = (r2 * r).astype(f32); r4 = (r3 * r).astype(f32)
-    r5 = (r4 * r).astype(f32); r6 = (r5 * r).astype(f32)
-    i = (r6 / f32(720.0)).astype(f32)
-    i = (r5 / f32(120.0) + i).astype(f32)
-    i = (r4 / f32(24.0) + i).astype(f32)
-    i = (r3 / f32(6.0) + i).astype(f32)
-    i = (r2 / f32(2.0) + i).astype(f32)
-    i = (r + i).astype(f32)
-    s = (f32(1.0) + i).astype(f32)
-    for _ in range(8):
-        s = (s * s).astype(f32)
-    return s.astype(f32)
+    r5 = (r4 * r).astype(f32); r6 = (r5 * r).astype(f32); r7 = (r6 * r).astype(f32)
+    s = (r6 / f32(720) + r7 / f32(5040)).astype(f32)
+    s = (r5 / f32(120) + s).astype(f32)
+    s = (r4 / f32(24) + s).astype(f32)
+    s = (r3 / f32(6) + s).astype(f32)
+    s = (r2 / f32(2) + s).astype(f32)
+    s = (r + s).astype(f32)
+    s = (f32(1) + s).astype(f32)
+    return (s * np.ldexp(f32(1), k.astype(np.int32))).astype(f32)
 
 
 def sigmoid(x):
@@ -102,16 +108,16 @@ def rope(x, cos, sin, rd):
 
 
 def causal_attention(q, k, v, hd):
-    """Scaled dot-product causal attention over the whole sequence."""
+    """Scaled dot-product causal attention: row i attends over rows 0..i."""
     n = q.shape[0]
     s = (f32(1.0) / np.sqrt(f32(hd))).astype(f32)
-    scores = ((q @ k.T).astype(f32) * s).astype(f32)
-    mask = np.triu(np.ones((n, n), dtype=bool), 1)
-    scores = np.where(mask, (scores + f32(-1000000000.0)).astype(f32), scores).astype(f32)
-    mx = scores.max(axis=-1, keepdims=True)
-    e = my_exp((scores - mx).astype(f32))
-    w = (e / e.sum(axis=-1, keepdims=True).astype(f32)).astype(f32)
-    return (w @ v).astype(f32)
+    out = np.zeros((n, v.shape[1]), dtype=f32)
+    for i in range(n):
+        scores = ((k[:i + 1] @ q[i]).astype(f32) * s).astype(f32)
+        e = my_exp((scores - scores.max()).astype(f32))
+        w = (e / e.sum().astype(f32)).astype(f32)
+        out[i] = (w @ v[:i + 1]).astype(f32)
+    return out
 
 
 def swiglu(wg, wu, wd, x):

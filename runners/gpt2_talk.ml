@@ -144,4 +144,4 @@ let () =
       let idx = Array.init vocab (fun i -> i) in
       Array.sort (fun i j -> compare a.(j) a.(i)) idx;
       Printf.printf "top-10 next-token logits:\n";
-      for r = 0 to 9 do let i = idx.(r) in Printf.printf "  %6d  %.4f\n" i a.(i) done
+      for r = 0 to 9 do let i = idx.(r) in Printf.printf "  %6d  %.9g\n" i a.(i) done

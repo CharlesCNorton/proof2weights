@@ -66,8 +66,8 @@ Definition f32_thirteen : binary32 := f32_of_Z 13.
 
     For [m] in (1, 2], with [u = (m-1)/(m+1)] in [0, 1/3), the series
     [log m = 2 * (u + u^3/3 + u^5/5 + ...)] converges quickly. Seven terms hold
-    the absolute error below 2e-7 across the interval, which is where softplus
-    always evaluates it. *)
+    the truncation error below 2e-8 across the interval (Series.v), which is
+    where softplus always evaluates it. *)
 
 Definition f32_log_unit (m : binary32) : binary32 :=
   let u := f32_div (f32_minus m f32_one) (f32_plus m f32_one) in

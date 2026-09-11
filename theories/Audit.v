@@ -1,58 +1,112 @@
-(** * Audit: assumption report for the headline theorems
+(** * Assumption report for the headline theorems
 
-    Compile from this directory, after the files it reports on:
+    Compile from this directory, after the files it reports on. Each
+    [Print Assumptions] below prints either "Closed under the global context"
+    or the axioms the proof term depends on.
 
-      rocq compile -R . "" Phases1_15_complete.v
-      rocq compile -R . "" Float_error.v
-      rocq compile -R . "" Audit.v
-
-    Each [Print Assumptions] below prints either "Closed under the global
-    context" or the list of axioms the proof term depends on. The integer
-    pipeline reports the former. The float results report the four classical
-    axioms that [Coq.Reals] introduces and that Flocq's [binary_float]
-    operations inherit; nothing in this development adds an axiom of its
-    own. *)
+    Two axiom families appear in the output. Results about real numbers carry
+    the classical axioms of [Coq.Reals], which Flocq's operations inherit:
+    [classic], [functional_extensionality_dep],
+    [ClassicalDedekindReals.sig_forall_dec] and [sig_not_dec]. The bounds
+    discharged by CoqInterval in Series.v, and the theorems composed from
+    them in Truth.v and AnnExp.v, carry in addition the primitive-float and
+    primitive-integer interface CoqInterval computes with: [PrimFloat],
+    [FloatAxioms], [PrimInt63], [Uint63Axioms], [Sint63Axioms] and
+    [PrimArray]. *)
 
 From Stdlib Require Import String.
 Require Import Phases1_15_complete.
+Require Import Llama.
+Require Import Qwen.
 Require Import Float_error.
+Require Import Dot.
+Require Import Cache.
+Require Import Cache_attn.
+Require Import Causal.
+Require Import Runner.
+Require Import Loader.
+Require Import Series.
+Require Import Truth.
+Require Import Witness.
+Require Import RoundChk.
+Require Import Receipt.
+Require Import Bound64.
+Require Import Annot.
+Require Import AnnExp.
+Require Import RunErr.
 
-(** Serialization and quantization: constructive. *)
+(** * Serialization, quantization and storage *)
+
 Print Assumptions roundtrip_z.
 Print Assumptions roundtrip_f32.
 Print Assumptions roundtrip_f16.
-
-(** Integer inference: constructive. *)
 Print Assumptions softmax_entry_range.
-
-(** Storage layer, chunking, compression, sharding: constructive. *)
 Print Assumptions reassemble_split_into_chunks.
 Print Assumptions rle_roundtrip.
 Print Assumptions decompress_compress_tensor.
 Print Assumptions decompress_compress_network.
 Print Assumptions unshard_shard_network.
 
-(** Float forward pass: classical, through Flocq's dependency on Reals. *)
+(** * Shape preservation through the float forward pass *)
+
 Print Assumptions f32_gpt2_forward_rows.
 Print Assumptions f32_gpt2_logits_rows.
 Print Assumptions f32_gpt2_logits_row_width.
 
-(** The native build's rounding step: classical, same inheritance. *)
+(** * The native build's rounding step *)
+
 Print Assumptions f32_double_round_plus.
 Print Assumptions f32_double_round_mult.
 Print Assumptions f32_double_round_div.
 Print Assumptions f32_double_round_sqrt.
 
-(** The composed dot-product error bound: classical, same inheritance. *)
+(** * The rounding model *)
+
+Print Assumptions f32_round_mixed.
+Print Assumptions f32_round_relz.
+Print Assumptions regz_zero.
+Print Assumptions round_err_le.
+Print Assumptions no_overflow.
+
+(** * The dot product *)
+
 Print Assumptions f32_mac_step_error.
 Print Assumptions f32_dot_error.
-Print Assumptions f32_dot_regular_ones.
-
-(** The backward-error form of the same computation. *)
+Print Assumptions f32_mac_step_mixed.
+Print Assumptions f32_dot_error_mixed.
 Print Assumptions f32_dot_backward.
 Print Assumptions f32_dot_backward_ones.
+Print Assumptions f32_dot_regular_ones.
+Print Assumptions dot_regular_with_zero.
+Print Assumptions dot_ok_with_zero.
+Print Assumptions dotreg_with_zero.
 
-(** The Llama primitives, and the same chain up to its logits. *)
+(** * The forward bound, stage by stage up to the logits *)
+
+Print Assumptions ok_plus.
+Print Assumptions ok_mult.
+Print Assumptions ok_div.
+Print Assumptions ok_sqrt.
+Print Assumptions ok_dot.
+Print Assumptions ok_layer_norm_2d.
+Print Assumptions ok_sat.
+Print Assumptions ok_exp_approx.
+Print Assumptions ok_sigmoid.
+Print Assumptions ok_tanh.
+Print Assumptions ok_gelu.
+Print Assumptions ok_gelu_vec.
+Print Assumptions ok_mlp_forward.
+Print Assumptions ok_softmax_2d.
+Print Assumptions ok_attend.
+Print Assumptions ok_causal_attention.
+Print Assumptions ok_attention_forward.
+Print Assumptions ok_block_forward.
+Print Assumptions ok_blocks_forward.
+Print Assumptions ok_gpt2_forward.
+Print Assumptions ok_gpt2_logits_full.
+
+(** * The Llama primitives, and the same chain up to its logits *)
+
 Print Assumptions ok_rmsnorm.
 Print Assumptions ok_silu_vec.
 Print Assumptions ok_sin.
@@ -63,37 +117,8 @@ Print Assumptions ok_llama_stack.
 Print Assumptions ok_llama_forward.
 Print Assumptions ok_llama_logits_full.
 
-(** The backward error through the linear layers and the logit projection. *)
-Print Assumptions f32_mat_vec_mul_backward.
-Print Assumptions logits_backward.
-Print Assumptions f32_gpt2_logits_backward.
-Print Assumptions f32_qwen_logits_backward.
-Print Assumptions f32_llama_logits_backward.
+(** * The Qwen3.5 primitives, and the same chain up to its logits *)
 
-(** Checking a side condition by computation, and the satisfiable budget. *)
-Print Assumptions Qb_correct.
-Print Assumptions regz_Q.
-Print Assumptions amp_ok_ones.
-
-(** The forward-pass bound, stage by stage up to the logits. *)
-Print Assumptions ok_plus.
-Print Assumptions ok_mult.
-Print Assumptions ok_div.
-Print Assumptions ok_sqrt.
-Print Assumptions ok_dot.
-Print Assumptions ok_layer_norm_2d.
-Print Assumptions ok_exp_approx.
-Print Assumptions ok_gelu_vec.
-Print Assumptions ok_mlp_forward.
-Print Assumptions ok_softmax_2d.
-Print Assumptions ok_causal_attention.
-Print Assumptions ok_attention_forward.
-Print Assumptions ok_block_forward.
-Print Assumptions ok_blocks_forward.
-Print Assumptions ok_gpt2_forward.
-Print Assumptions ok_gpt2_logits_full.
-
-(** The Qwen3.5 primitives, and the same chain up to its logits. *)
 Print Assumptions ok_log_unit.
 Print Assumptions ok_softplus.
 Print Assumptions ok_rmsnorm_zc.
@@ -111,3 +136,148 @@ Print Assumptions ok_qwen_wrap.
 Print Assumptions ok_qwen_stack.
 Print Assumptions ok_qwen_forward.
 Print Assumptions ok_qwen_logits_full.
+
+(** * Satisfiable premises *)
+
+Print Assumptions amp_ok_witness.
+Print Assumptions exp_reg_zero.
+Print Assumptions exp_reg_masked.
+Print Assumptions gelu_reg_zero.
+Print Assumptions exp_at_zero.
+Print Assumptions exp_at_masked.
+Print Assumptions sigmoid_at_zero.
+Print Assumptions gelu_at_zero.
+
+(** * Backward error through the linear layers and the logit projection *)
+
+Print Assumptions f32_mat_vec_mul_backward.
+Print Assumptions logits_backward.
+Print Assumptions f32_gpt2_logits_backward.
+Print Assumptions f32_qwen_logits_backward.
+Print Assumptions f32_llama_logits_backward.
+
+(** * A forward pass that carries its own bound *)
+
+Print Assumptions up_plus_spec.
+Print Assumptions up_mult_spec.
+Print Assumptions up_div_spec.
+Print Assumptions dn_plus_spec.
+Print Assumptions dn_mult_spec.
+Print Assumptions dn_sqrt_spec.
+Print Assumptions b64_of_f32_spec.
+Print Assumptions round_err_out.
+Print Assumptions f32_round_int_integer.
+Print Assumptions aok_plus.
+Print Assumptions aok_mult.
+Print Assumptions aok_div.
+Print Assumptions aok_sqrt.
+Print Assumptions aok_max.
+Print Assumptions em1_up_spec.
+Print Assumptions ae_core.
+Print Assumptions aok_exp.
+Print Assumptions g_gpt2_logits_f32.
+Print Assumptions gpt2_logits_bounded.
+Print Assumptions gpt2_logit_bounded.
+
+(** * Cached decoding equals full recomputation *)
+
+Print Assumptions delta_scan_app.
+Print Assumptions delta_scan_snoc.
+Print Assumptions delta_state_app.
+Print Assumptions delta_markov.
+Print Assumptions conv_window_cached_correct.
+Print Assumptions conv_hist_step.
+Print Assumptions causal_attention_nth.
+Print Assumptions causal_attention_app.
+Print Assumptions causal_attention_prefix.
+Print Assumptions causal_attention_snoc.
+Print Assumptions transpose_involutive.
+
+(** * Causality of the forward passes *)
+
+Print Assumptions causal_attention_causal.
+Print Assumptions causal_conv1d.
+Print Assumptions causal_delta_scan.
+Print Assumptions causal_llama_forward.
+Print Assumptions causal_qwen_forward.
+Print Assumptions causal_gpt2_forward.
+Print Assumptions llama_forward_prefix.
+Print Assumptions qwen_forward_prefix.
+Print Assumptions gpt2_logits_prefix.
+
+(** * The transposed decode the checkpoint runners perform *)
+
+Print Assumptions decode_transposed_correct.
+Print Assumptions runner_linear_correct.
+Print Assumptions runner_linear_2d_correct.
+
+(** * What a named load returns, and validation *)
+
+Print Assumptions f32_load_named_length.
+Print Assumptions f32_load_named_nth.
+Print Assumptions f32_load_named_absent.
+Print Assumptions f32_load_named_checked_sound.
+Print Assumptions f32_load_named_checked_rejects.
+Print Assumptions validated_logits_shape.
+Print Assumptions loaded_model_blocks.
+
+(** * The elementary functions against the mathematical functions *)
+
+Print Assumptions sin_series_bound.
+Print Assumptions cos_series_bound.
+Print Assumptions log_series_bound.
+Print Assumptions exp_series_bound.
+Print Assumptions ln2_split_bound.
+Print Assumptions Qb_correct.
+Print Assumptions sin_poly_actual.
+Print Assumptions cos_poly_actual.
+Print Assumptions ok_sin_true.
+Print Assumptions ok_cos_true.
+Print Assumptions exp_core_vs_true.
+Print Assumptions exp_approx_vs_true.
+Print Assumptions ok_exp_true.
+Print Assumptions ok_exp_true_in_range.
+Print Assumptions log_unit_vs_true.
+Print Assumptions ok_log_true.
+Print Assumptions ok_sqrt_true.
+Print Assumptions ok_reduce_2pi.
+Print Assumptions reduce_vs_true.
+Print Assumptions ok_sin_true_full.
+Print Assumptions ok_cos_true_full.
+Print Assumptions sigmoid_vs_true.
+Print Assumptions tanh_vs_true.
+Print Assumptions silu_vs_true.
+Print Assumptions softplus_vs_true.
+Print Assumptions gelu_vs_true.
+Print Assumptions ok_sigmoid_true.
+Print Assumptions ok_tanh_true.
+Print Assumptions ok_silu_true.
+Print Assumptions ok_softplus_true.
+Print Assumptions ok_gelu_true.
+
+(** The constants the series divide by, and those that are not the factorial
+    they approximate. *)
+Print Assumptions B2R_fac19.
+Print Assumptions fac14_not_exact.
+Print Assumptions fac15_not_exact.
+Print Assumptions fac19_not_exact.
+
+(** * Checking a side condition by computation *)
+
+Print Assumptions regz_Q.
+Print Assumptions u_le_half.
+Print Assumptions two_eta_le_normal_lo.
+
+(** * Rounding to the nearest integer *)
+
+Print Assumptions round_neg_04.
+Print Assumptions round_neg_06.
+Print Assumptions round_neg_126.
+Print Assumptions round_2p23_differs.
+
+(** * Inference receipts *)
+
+Print Assumptions verify_receipt_sound.
+Print Assumptions verify_receipt_complete.
+Print Assumptions receipt_output_extends_prompt.
+Print Assumptions checksum_detects_single_byte.

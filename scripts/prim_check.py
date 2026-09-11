@@ -1,16 +1,13 @@
 """Differential test of the extracted elementary functions.
 
-The architecture sweep in experiment_arch.py hands the rotary tables to both
-sides as data, so f32_sin and f32_cos are never evaluated by any of its rows.
-This script evaluates them, and the other transcendentals, directly: it feeds
-binary32 bit patterns to runners/prim_sweep built against the inductive
+Feeds binary32 bit patterns to runners/prim_sweep, built against the inductive
 extraction, reads the results back, and compares them against the mathematical
 function computed in double precision.
 
-Two quantities are reported per primitive. The maximum error against the true
-function is what the definitions approximate; the fraction of inputs whose sign
-disagrees is what catches a broken argument reduction, which an error norm
-alone can hide behind a small average.
+Two quantities are reported per primitive: the maximum error against the true
+function, and the number of inputs whose sign disagrees with it. The second
+detects an argument reduction that lands on the wrong multiple of the period.
+GELU is compared against the tanh form GPT-2 is trained with.
 
   python prim_check.py [--bin DIR] [--remote HOST]
 """
@@ -29,6 +26,11 @@ CASES = {
     "cos":      ((-4000.0, 4000.0), np.cos,                       "abs"),
     "exp":      ((-80.0, 80.0),     np.exp,                       "rel"),
     "sigmoid":  ((-40.0, 40.0),     lambda x: 1.0 / (1.0 + np.exp(-x)), "abs"),
+    "tanh":     ((-20.0, 20.0),     np.tanh,                      "abs"),
+    "gelu":     ((-20.0, 20.0),
+                 lambda x: 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi)
+                                                    * (x + 0.044715 * x ** 3))),
+                 "abs"),
     "log":      ((1.0, 2.0),        np.log,                       "abs"),
     "softplus": ((-30.0, 30.0),     lambda x: np.logaddexp(0.0, x), "abs"),
     "sqrt":     ((0.0, 1e6),        np.sqrt,                      "rel"),

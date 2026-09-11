@@ -41,7 +41,7 @@ Extract Inductive binary_float => "float"
   [ "(fun s -> if s then (-0.0) else 0.0)"
     "(fun s -> if s then neg_infinity else infinity)"
     "nan"
-    "(fun s m e -> let v = ldexp (float_of_int m) e in if s then (-. v) else v)" ]
+    "(fun (s, m, e) -> let v = ldexp (float_of_int m) e in if s then (-. v) else v)" ]
   "(fun _ _ _ _ _ -> failwith ""binary_float match in native build"")".
 
 (* Round a binary64 result to nearest binary32 via the Int32 bit round-trip. *)
@@ -71,11 +71,37 @@ Extraction "phases1_15_native.ml"
 
 Extraction "llama_native.ml"
   binary32 f32_bytes_to_binary32
-  f32_plus f32_minus f32_mult f32_dot f32_vec_add f32_vec_mult f32_mat_vec_mul
+  f32_plus f32_minus f32_mult f32_div f32_sqrt f32_one
+  f32_dot f32_vec_add f32_vec_mult f32_mat_vec_mul
   f32_of_Z f32_sin f32_cos
   f32_rmsnorm f32_silu_vec
-  f32_causal_attention f32_concat_heads
+  f32_attend f32_causal_attention f32_concat_heads
   json_tensor_offsets.
+
+(* The annotated forward pass of RunErr.v. Its bounds are binary64 values, which
+   are OCaml floats as they stand; the outward operations are the host's
+   binary64 arithmetic followed by [Float.succ] or [Float.pred]. *)
+Require Import Float_error Bound64 Annot AnnExp RunErr.
+
+Extract Constant b64_plus => "( +. )".
+Extract Constant b64_mult => "( *. )".
+Extract Constant b64_div => "( /. )".
+Extract Constant b64_sqrt => "sqrt".
+Extract Constant b64_succ => "Float.succ".
+Extract Constant b64_pred => "Float.pred".
+Extract Constant b64_neg => "(fun a -> (-. a))".
+Extract Constant b64_abs => "abs_float".
+Extract Constant b64_finite => "Float.is_finite".
+Extract Constant b64_lt => "(fun (a:float) (b:float) -> a < b)".
+Extract Constant b64_le => "(fun (a:float) (b:float) -> a <= b)".
+Extract Constant b64_of_f32 => "(fun a -> a)".
+Extract Constant f32_finite => "Float.is_finite".
+
+Extraction "runerr_native.ml"
+  binary32 f32_bytes_to_binary32 json_tensor_offsets f32_ln_eps
+  ann ann_const ann_ops ann_dot
+  g_layer_norm_2d g_vec_add g_mat_vec_mul g_add_matrices
+  g_split_into_heads g_causal_attention g_concat_heads g_gelu_vec.
 
 Extraction "qwen_native.ml"
   binary32 f32_bytes_to_binary32
@@ -88,5 +114,5 @@ Extraction "qwen_native.ml"
   f32_conv_window f32_conv_step f32_causal_conv1d
   f32_delta_step f32_delta_scan f32_delta_state0 f32_delta_decay f32_delta_prep_q
   f32_partial_rope f32_swiglu f32_gate_sigmoid
-  f32_causal_attention f32_concat_heads f32_split_into_heads
+  f32_attend f32_causal_attention f32_concat_heads f32_split_into_heads
   json_tensor_offsets.

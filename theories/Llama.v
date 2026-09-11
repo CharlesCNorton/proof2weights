@@ -2,16 +2,12 @@
     development: RMSNorm, SiLU, and the trigonometric functions RoPE needs.
 
     RMSNorm and SiLU compose existing verified f32 operations. f32_sin and
-    f32_cos are defined here by argument reduction modulo 2*pi (nearest-integer
-    rounding via the add-then-subtract magic-constant trick) followed by a
-    Taylor polynomial. Extract.v emits the native build and does NOT substitute
-    the host libm for them: they are compositions of f32_plus, f32_minus,
-    f32_mult and f32_div, so both builds run the same reduction and the same
-    polynomial, operation for operation.
-
-    The magic constant used below is 2^23, which rounds a negative argument to
-    the nearest half-integer rather than the nearest integer; Approx.v and
-    RoundChk.v diagnose that and supply the corrected reduction. *)
+    f32_cos are defined here by argument reduction modulo 2*pi, using the
+    nearest-integer rounding [f32_round_int] of the core development, followed
+    by a Taylor polynomial. Extract.v emits the native build and does not
+    substitute the host libm for them: they are compositions of f32_plus,
+    f32_minus, f32_mult and f32_div, so both builds run the same reduction and
+    the same polynomial, operation for operation. *)
 
 From Stdlib Require Import ZArith.
 From Stdlib Require Import List.
@@ -46,15 +42,6 @@ Qed.
 Definition f32_pi : binary32 := f32_div (f32_of_Z 31415927) (f32_of_Z 10000000).
 Definition f32_2pi : binary32 := f32_mult f32_two f32_pi.
 Definition f32_inv2pi : binary32 := f32_div f32_one f32_2pi.
-(** [1.5 * 2^23]. The plain [2^23] is wrong for a negative argument: the sum
-    then lands in [2^22, 2^23), where the unit in the last place is one half,
-    so the result is the nearest half-integer and the reduction below shifts
-    the argument by pi. RoundChk.v checks both behaviours by computation. *)
-Definition f32_magic : binary32 := f32_of_Z 12582912.
-
-(** Nearest integer of y, as a binary32, valid for |y| < 2^22. *)
-Definition f32_round_int (y : binary32) : binary32 :=
-  f32_minus (f32_plus y f32_magic) f32_magic.
 
 (** Cody-Waite split of [2*pi]. The high part is [201/32], eight significant
     bits, so [k * f32_2pi_hi] is exact for every [k] the reduction produces and
@@ -88,10 +75,9 @@ Definition f32_fac17 : binary32 := f32_of_Z 355687428096000.
 Definition f32_fac18 : binary32 := f32_of_Z 6402373705728000.
 Definition f32_fac19 : binary32 := f32_of_Z 121645100408832000.
 
-(** sin via Taylor on the reduced argument, through r^19. The truncation
-    error of the degree-19 series over a full reduced period is below 1e-9;
-    stopping at r^11, as this development previously did, leaves 4.7e-4.
-    Approx.v carries both bounds. *)
+(** sin via Taylor on the reduced argument, through r^19. Over the reduced
+    interval the series is within 2e-9 of sin, on the divisors as binary32
+    stores them (Series.v, Truth.v). *)
 Definition f32_sin (x : binary32) : binary32 :=
   let r := f32_reduce_2pi x in
   let r2 := f32_mult r r in
@@ -114,7 +100,7 @@ Definition f32_sin (x : binary32) : binary32 :=
   let a := f32_minus a (f32_div r3 f32_fac3) in
   f32_plus r a.
 
-(** cos likewise, through r^18. *)
+(** cos likewise, through r^18, within 2e-8 of cos. *)
 Definition f32_cos (x : binary32) : binary32 :=
   let r := f32_reduce_2pi x in
   let r2 := f32_mult r r in

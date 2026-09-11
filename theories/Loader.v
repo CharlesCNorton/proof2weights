@@ -1,21 +1,17 @@
 (** * What the loader returns, and what validation guarantees
 
-    The safetensors loader had no specification: [f32_load_named] scoped to
-    the first occurrence of a quoted tensor name, read the next
-    [data_offsets], sliced, and decoded, with nothing said about the values it
-    produced and no check that the tensor's [dtype] was [F32] at all. This
-    file supplies both.
+    [f32_load_named] scopes to the first occurrence of a quoted tensor name,
+    reads the next [data_offsets], slices the data section, and decodes. The
+    first half of this file fixes the meaning of such a load: the [i]-th value
+    of a named tensor is the binary32 that the four little-endian bytes at
+    offset [a + 4i] of the data section denote, where [a] is the tensor's start
+    offset. The offsets the header parser returns are taken as given, and the
+    slice is what is characterised. [f32_load_named_checked] adds a check that
+    the tensor's [dtype] is [F32].
 
-    The first half fixes the meaning of a load: the [i]-th value of a named
-    tensor is the binary32 that the four little-endian bytes at offset
-    [a + 4i] of the data section denote, where [a] is the tensor's start
-    offset. Nothing about the header parser is assumed; the offsets it
-    returns are taken as given and the slice is what is characterised.
-
-    The second half connects the shape validators, which the loader never
-    called, to the hypotheses the forward-pass shape theorems require, so
-    those theorems apply to a model that passed validation rather than to an
-    abstract well-shaped one. *)
+    The second half connects the shape validators to the hypotheses the
+    forward-pass shape theorems require, so those theorems apply to a model
+    that passed validation. *)
 
 From Stdlib Require Import ZArith.
 From Stdlib Require Import List.
@@ -86,7 +82,7 @@ Proof.
   intros header data tname [H | [a H]]; unfold f32_load_named; rewrite H; reflexivity.
 Qed.
 
-(** * The dtype check the loader never performed *)
+(** * The dtype check *)
 
 Definition json_tensor_dtype (header tname : string) : string :=
   match json_find_after (String.length header) (json_quoted tname) header with
@@ -123,9 +119,8 @@ Qed.
 
 (** * From validation to the shape hypotheses
 
-    [f32_validate_model] was defined but never connected to anything. These
-    lemmas discharge, from a successful validation, the facts the forward-pass
-    shape theorems need. *)
+    These lemmas discharge, from a successful [f32_validate_model], the facts
+    the forward-pass shape theorems need. *)
 
 Lemma validate_model_wte : forall cfg model,
   f32_validate_model cfg model = true ->

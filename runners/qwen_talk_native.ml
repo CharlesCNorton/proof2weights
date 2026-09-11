@@ -30,7 +30,11 @@
      qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck <tok,...> <max_new> <eos>
        -> greedy continuation, one token id per line
      qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck serve <eos>
-       -> persistent server *)
+       -> persistent server
+     qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck dump <windows> <outdir> <first> <last>
+       -> for each line index in [first, last) of the windows file, writes
+          <outdir>/<index>.f32: the logits of every position, as little-endian
+          binary32 bit patterns, positions in order *)
 
 open Qwen_native
 
@@ -57,6 +61,19 @@ let rec fdrop n l = if n <= 0 then l else match l with [] -> [] | _ :: r -> fdro
 let slice off len row = ftake len (fdrop off row)
 let last_n n l = let k = List.length l in if k <= n then l else fdrop (k - n) l
 
+let write_f32 oc (x : float) =
+  let bits = Int32.bits_of_float x in
+  for k = 0 to 3 do
+    output_byte oc (Int32.to_int (Int32.logand (Int32.shift_right_logical bits (8 * k)) 0xffl))
+  done
+
+let read_lines path =
+  let ic = open_in path in
+  let rec go acc = match input_line ic with
+    | l -> go (if String.trim l = "" then acc else String.trim l :: acc)
+    | exception End_of_file -> close_in ic; List.rev acc in
+  go []
+
 let () =
   let path  = Sys.argv.(1) in
   let d     = int_of_string Sys.argv.(2) in    (* hidden size            *)
@@ -72,13 +89,15 @@ let () =
   let ck    = int_of_string Sys.argv.(12) in   (* conv kernel            *)
   let toks_arg = Sys.argv.(13) in
   let serve = (toks_arg = "serve") in
+  let dump = (toks_arg = "dump") in
   let prompt =
-    if serve then [] else List.map int_of_string (String.split_on_char ',' toks_arg) in
+    if serve || dump then [] else List.map int_of_string (String.split_on_char ',' toks_arg) in
   let max_new =
-    if serve then 0
+    if serve || dump then 0
     else (if Array.length Sys.argv > 14 then int_of_string Sys.argv.(14) else 0) in
   let eos =
     if serve then (if Array.length Sys.argv > 14 then int_of_string Sys.argv.(14) else -1)
+    else if dump then -1
     else (if Array.length Sys.argv > 15 then int_of_string Sys.argv.(15) else -1) in
 
   let group = nh / nkv in
@@ -153,7 +172,6 @@ let () =
           let ow  = dec_mat b (off (lname i "self_attn.o_proj.weight")) d (nh * hd) in
           let qnw = dec_vec b (off (lname i "self_attn.q_norm.weight")) hd in
           let knw = dec_vec b (off (lname i "self_attn.k_norm.weight")) hd in
-          let inv = f32_div f32_one (f32_sqrt (f32_of_Z hd)) in
           List.map2 (fun pos h ->
             let qg = f32_mat_vec_mul qw h in
             let kraw = f32_mat_vec_mul kw h in
@@ -170,11 +188,7 @@ let () =
             let heads = List.init nh (fun hh ->
               let q = f32_partial_rope rd cosv sinv
                         (f32_rmsnorm_zc qnw eps (slice (hh * hd * 2) hd qg)) in
-              let kcache = kc.(i).(hh / group) and vcache = vc.(i).(hh / group) in
-              let scores = List.map (fun kj -> f32_mult (f32_dot q kj) inv) kcache in
-              let w = f32_softmax scores in
-              List.init hd (fun j ->
-                f32_dot w (List.map (fun vj -> List.nth vj j) vcache))) in
+              f32_attend q kc.(i).(hh / group) vc.(i).(hh / group) hd) in
             f32_mat_vec_mul ow (f32_gate_sigmoid gate (List.concat heads)))
             poss hn
         end else begin
@@ -259,7 +273,29 @@ let () =
     end;
     (logits0, List.rev !gen) in
 
-  if serve then begin
+  if dump then begin
+    let windows = Array.of_list (read_lines Sys.argv.(14)) in
+    let outdir = Sys.argv.(15) in
+    let first = int_of_string Sys.argv.(16) and stop = int_of_string Sys.argv.(17) in
+    for w = first to min stop (Array.length windows) - 1 do
+      let toks = List.map int_of_string (String.split_on_char ',' windows.(w)) in
+      reset_caches ();
+      let finals = Array.of_list (run (List.mapi (fun p t -> (p, t)) toks)) in
+      (* Each embedding row is decoded once and projected onto every position. *)
+      let logits = Array.map (fun _ -> Array.make vocab 0.0) finals in
+      for j = 0 to vocab - 1 do
+        let e = emb_row j in
+        Array.iteri (fun p v -> logits.(p).(j) <- f32_dot v e) finals
+      done;
+      let tmp = Printf.sprintf "%s/%d.f32.tmp" outdir w in
+      let oc = open_out_bin tmp in
+      Array.iter (Array.iter (write_f32 oc)) logits;
+      close_out oc;
+      Sys.rename tmp (Printf.sprintf "%s/%d.f32" outdir w);
+      Printf.eprintf "window %d done\n%!" w
+    done
+  end
+  else if serve then begin
     Printf.printf "CKSUM %d\nREADY\n%!" cksum;
     (try
       while true do
@@ -282,6 +318,6 @@ let () =
     Array.sort (fun i j -> compare logits0.(j) logits0.(i)) idx;
     Printf.printf "top-10 next-token logits:\n";
     for r = 0 to 9 do
-      let i = idx.(r) in Printf.printf "  %7d  %.4f\n" i logits0.(i)
+      let i = idx.(r) in Printf.printf "  %7d  %.9g\n" i logits0.(i)
     done
   end

@@ -1,612 +1,568 @@
 # proof2weights
 
-proof2weights defines a neural network, up to and including a GPT-2 transformer,
-in the Rocq prover, with arithmetic in IEEE-754 binary32 through the Flocq
-library, and extracts it to OCaml. The extracted program loads a `.safetensors`
-file and performs inference using the rounding behavior the proofs specify. The
-development loads the published 124-million-parameter GPT-2 weights, runs the
-forward pass over all twelve transformer blocks, and produces the same
-next-token prediction as the PyTorch reference implementation. The same approach
-extends to the Llama architecture: the development also runs SmolLM2, an
-instruction-tuned model, and the verified forward generates a coherent chat
-response. It also runs Qwen3.5, whose layers are mostly linear-attention state
-recurrences rather than softmax attention, and reproduces the reference's
-next-token ranking there too. The weights written to disk are computed by the
-same definitions the proofs concern, and the floating-point arithmetic executed
-at inference time is the arithmetic the development reasons about.
+proof2weights defines the forward passes of three language-model architectures
+in the Rocq prover, with every floating-point operation in IEEE-754 binary32
+through the Flocq library, and extracts the definitions to OCaml. The extracted
+programs load published `.safetensors` checkpoints and run inference on GPT-2
+(124M parameters), SmolLM2-135M-Instruct and Qwen3.5-0.8B, whose layers are
+mostly gated DeltaNet linear-attention recurrences. On all three, the extracted
+forward pass returns the same next-token ranking as the PyTorch reference, with
+logits within 7.3e-5 absolute. On SmolLM2 and Qwen3.5, greedy generation
+reproduces PyTorch's continuation token for token. Over 300 windows of held-out
+text per model, 4,800 next-token distributions each, PyTorch in float32 returns
+the extracted pass's top-1 token at every position, with every logit within
+1.6e-3.
 
-The core development is contained in a single file,
-`theories/Phases1_15_complete.v`. It compiles under Rocq 9 with `coq-flocq` and
-extracts to standalone OCaml. `theories/Audit.v` runs `Print Assumptions` over
-the headline theorems: the integer serialization, storage, and inference results
-report "Closed under the global context", and the float results report the four
-classical axioms that `Coq.Reals` introduces and that Flocq's operations
-inherit. A second file, `theories/Extract.v`, re-extracts the same development
-with floating-point arithmetic mapped to the host's hardware float, which
-reduces the time for one forward pass from minutes to seconds.
+The arithmetic executed at inference time is the arithmetic the proofs concern.
+The development proves that cached autoregressive decoding computes exactly the
+values full recomputation computes, that each of the three forward passes is
+causal, that the native build's double rounding through binary64 is harmless,
+a composed rounding-error bound from the arithmetic primitives to the logits of
+all three architectures, and a bound from each elementary function the models
+use to the corresponding mathematical function.
 
-## Motivation
+A paper describing the development is in `paper/paper.tex`.
 
-A common approach to verifying a neural network establishes a property in a
-proof assistant and then implements the weights and inference code separately in
-Python or C for deployment. The deployed numbers are a transcription of the
-proven numbers, and the deployed arithmetic is a separate implementation of the
-proven arithmetic. The two are not guaranteed to agree, and in floating point
-they frequently differ.
+## Arithmetic
 
-In proof2weights the weights are defined in Rocq, serialized by a Rocq function,
-and that serializer is extracted and executed, so the bytes written to disk are
-produced by the definitions the proofs concern. The reader is also Rocq: a
-function parses `.safetensors`, decodes IEEE-754 values, and assembles a typed
-model, and the forward pass that consumes the model is extracted from the same
-source. No separate implementation is introduced.
+`binary32` is Flocq's `binary_float` at precision 24 and exponent bound 128.
+Addition, multiplication, division, square root, negation, absolute value and
+comparison are Flocq's `Bplus`, `Bmult`, `Bdiv`, `Bsqrt`, `Bopp`, `Babs` and
+`Bcompare` under round-to-nearest, ties-to-even. Every scalar the networks
+compute comes from one of these operations; everything else is list plumbing.
+A weight is decoded from its four little-endian bytes through Flocq's
+`b32_of_bits`, so a loaded value is the IEEE-754 value its bytes denote.
 
-```
-        Rocq definitions + Flocq IEEE-754
-                     |
-              extraction (verbatim)
-                     |
-                 OCaml binary
-                 /          \
-   write .safetensors      read .safetensors, run inference
-```
+The elementary functions are compositions of those operations, and their
+constants are quotients of integers.
 
-## Integer-exact core
+- `f32_exp_approx` saturates its argument to [-88, 88], writes it as
+  `k log 2 + r` with `k` the nearest integer to `x / log 2`, evaluates the
+  degree-seven Taylor polynomial at `|r| <= 0.35`, and multiplies by `2^k`,
+  which is exact. `log 2` is split as `355/512 - 14581891/2^36`, so `k * 355/512` is
+  exact for every `k` the reduction produces.
+- `f32_round_int` rounds to the nearest integer by adding and subtracting
+  `1.5 * 2^23`, which for arguments of either sign below `2^22` in magnitude
+  keeps the sum in the binade whose unit in the last place is one.
+- `f32_sin` and `f32_cos` reduce the argument by the nearest integer multiple
+  of a split `2 pi = 201/32 + 8312081/2^32` and evaluate Taylor polynomials
+  through degree 19 and 18. The divisors are the factorials as binary32 stores
+  them; from 14! upward those differ from the factorials.
+- `f32_log_unit` evaluates `log m = 2 artanh ((m-1)/(m+1))` by a seven-term
+  series on (1, 2].
+- `f32_sigmoid` is `1 / (1 + exp (-x))`, `f32_tanh` is `2 sigmoid (2x) - 1`,
+  `f32_gelu` is the form GPT-2 is trained with,
+  `x/2 (1 + tanh (sqrt (2/pi) (x + 0.044715 x^3)))`, SiLU is `x sigmoid x`,
+  `f32_softplus` is `max x 0 + log (1 + exp (-|x|))`, and `f32_softmax`
+  subtracts the row maximum before exponentiating.
 
-The foundation is exact integer serialization. Tensors are records of a name, a
-shape (`list nat`), and data (`list Z`); a network is a list of tensors. Values
-serialize to little-endian `i32`, and the round trip is proved: decoding the
-encoding of any 32-bit integer returns that integer (`roundtrip_z`). On top of
-this sits a safetensors writer (an 8-byte little-endian header length, a JSON
-header, then the concatenated tensor bytes) and the inverse readers.
+## Architectures
 
-The development also includes the serialization and validation machinery a
-deployment uses, each with its definitions and the lemmas that state their
-properties: shape and bounds validation with sound boolean checkers, signed
-`int8` and packed `int4` quantization with proved range containment, lazy
-tensors whose force-after-defer is the identity, and JSON proof certificates
-with attestations and provenance chains.
+The GPT-2 path (`theories/Phases1_15_complete.v`) is a pre-norm decoder stack:
+layer normalization, fused query/key/value projection, multi-head causal
+attention, residual, layer normalization, GELU feed-forward, residual, a final
+layer normalization and a tied-embedding logit projection. Causal attention
+computes row `i` by attending the `i`-th query over the first `i + 1` key and
+value rows with a max-shifted softmax. Parameter counts are pinned by
+reflection: `gpt2_total_params gpt2_small` reduces to 124,439,808.
 
-The three storage transformations are proved to round trip on every input.
-Splitting a tensor into fixed-size chunks and reassembling them returns the
-original data (`reassemble_split_into_chunks`). Run-length decoding inverts
-run-length encoding (`rle_roundtrip`), and that lifts to whole tensors and
-whole networks (`decompress_compress_tensor`, `decompress_compress_network`).
-Splitting a network into shards under a byte budget and unsharding them returns
-the original network (`unshard_shard_network`).
+The Llama path (`theories/Llama.v`) replaces layer normalization with RMSNorm,
+learned positions with rotary embeddings, multi-head with grouped-query
+attention, and the GELU feed-forward with SwiGLU. `f32_llama_layer`,
+`f32_llama_stack` and `f32_llama_forward` name the composition.
 
-## IEEE-754 floating point
-
-The floating-point type is binary32, not a fixed-point approximation. The
-`binary32` type is Flocq's `binary_float` at precision 24 and exponent bound
-128, and the arithmetic (`f32_plus`, `f32_mult`, `f32_div`, `f32_neg`,
-`f32_abs`, `f32_compare`, and square root via Flocq's `Bsqrt`) is
-round-to-nearest, ties-to-even. Bit patterns convert both ways for binary32,
-binary16, and bfloat16, and the encode/decode round trips are proved
-(`roundtrip_f32`, `roundtrip_f16`), as is `B2R f32_one = 1`.
-
-The transcendentals are built from these primitives. The exponential is range
-reduced: the argument is saturated to the binary32 exponential range, divided by
-256 so it lands where a short Taylor series is accurate, evaluated by a six-term
-Taylor series, and squared eight times, which remains finite across the input
-range. Sigmoid is `1 / (1 + exp(-x))`, GELU is `x * sigmoid(1.702 x)`, `tanh` is
-`2 sigmoid(2x) - 1`, ReLU is a clamp, and softmax subtracts the row maximum
-before exponentiating. These run in binary32 and preserve vector and matrix
-dimensions, which is proved for each.
-
-## Neural-network library
-
-The library includes the following components, each with a dimension-
-preservation lemma:
-
-- Dense layers, residual blocks, and bottleneck blocks.
-- Convolution weight records with `im2col`-style flattening, max and average
-  pooling with non-negativity bounds.
-- Batch, layer, and group normalization; token and learned position embeddings
-  and their sum.
-- Vanilla RNN, LSTM, and GRU cells, their sequence unrollings (output length
-  equals input length, proved), bidirectional wrapping, and an RNN sequence
-  classifier.
-- Scaled dot-product attention, multi-head attention with head splitting and
-  concatenation, causal masking, and cross-attention, each shown to preserve
-  sequence length.
-- Pre-norm and post-norm transformer blocks, feed-forward sublayers, full
-  encoder and decoder layers, and assembled GPT-style, BERT-style, and full
-  encoder-decoder models.
-
-Both an integer fixed-point path and an IEEE-754 float path exist for the
-transformer operations; the float path is used for the GPT-2 model below.
-
-## The float GPT-2
-
-The transformer is assembled end to end in binary32. The configuration record
-matches the published GPT-2 family, and the parameter counts are proved by
-reflection: `gpt2_total_params gpt2_small` reduces to `124439808`, with the
-medium, large, and XL counts likewise pinned, alongside head-dimension and
-feed-forward-expansion checks.
-
-A typed weight model (`f32_model_weights`) holds the token and position
-embeddings, a list of per-block weights (two layer norms, the fused QKV and
-output attention projections, and the two MLP projections), and the final layer
-norm. The forward pass embeds tokens and positions, runs the pre-norm decoder
-stack (layer norm, multi-head causal attention, residual, layer norm, MLP,
-residual), applies the final layer norm, and projects through the tied embedding
-to logits. Greedy generation decodes over those logits, and the generated
-sequence is proved to always extend the prompt, so the prompt is a prefix of the
-output. A finiteness certificate checks that an output contains no NaN or
-infinity, with a soundness lemma that a passing check implies every entry is a
-finite IEEE-754 value, and shape validators reject weights whose dimensions do
-not match the configuration.
-
-## The safetensors loader
-
-The loader is implemented in Rocq. The header length is read as a little-endian
-`u64`, the JSON header is parsed into a string, and a JSON scanner (whitespace,
-natural numbers, quoted strings, integer arrays, and a substring key search)
-extracts each tensor's `dtype`, `shape`, and `data_offsets`. A named tensor is
-loaded by scoping to its key, reading its byte offsets, slicing the data
-section, and decoding little-endian f32 into `binary32`. The model loader
-constructs every GPT-2 tensor name (including the per-layer `h.<i>.` prefixes,
-built with a verified `nat`-to-string), loads and reshapes each, and assembles
-`f32_model_weights`. The token-embedding matrix is proved to have `vocab_size`
-rows and the assembled model to have exactly `n_layer` blocks. Decoding bytes to
-`binary32` goes through Flocq's `b32_of_bits` composed with the single-NaN
-collapse, so the loaded value is the IEEE-754 value the bytes denote.
-
-## Inference on GPT-2 weights
-
-The development loads the published 124-million-parameter GPT-2 base weights,
-runs the IEEE-754 forward over all twelve blocks, projects every one of the
-50257 logits through the tied embedding, and predicts a next token. For the
-prompt "The quick brown" the greedy next token is "ie" (token 494), which
-matches the prediction of the PyTorch reference for the same prompt, and the top
-five candidates are returned in the same order. The logits computed here are
-offset from the reference's by approximately one unit, because the MLP uses the
-`x * sigmoid(1.702 x)` form of GELU while GPT-2 was trained with the tanh-based
-`gelu_new`; the offset is uniform and does not change the ranking or the argmax.
-
-Applying the verified definitions to a model of this size requires addressing
-two performance constraints. The list-based loader cannot ingest a file of
-roughly 500 MB, because representing it as a `list byte` builds a linked list of
-hundreds of millions of boxed values, and the extracted matrix transpose inside
-the linear layer is quadratic in the output dimension through list indexing,
-which is acceptable at small dimensions but not at 768 and 3072. The GPT-2
-runner therefore reads the file bytes natively, decodes each value with the
-verified `f32_bytes_to_binary32`, and composes the verified primitives
-(`f32_mat_vec_mul`, `f32_dot`, `f32_layer_norm_2d`, `f32_causal_attention`,
-`f32_concat_heads`, `f32_gelu_vec`, `f32_add_matrices`) in the order the proven
-block specifies, decoding each weight matrix already transposed so the verified
-matrix-vector product computes the same dot products the verified linear layer
-would. Weights are streamed block by block, so memory remains in the low
-gigabytes. Every floating-point value is produced by the verified operators;
-only the byte addressing is native. In a mode that prints the full logit matrix,
-the runner produces output bit-identical to the top-level verified
-`f32_gpt2_logits` on a small fixture, confirming the composition agrees with the
-verified forward.
-
-## Inference and generation on a Llama model
-
-The same approach extends to the Llama architecture, which differs from GPT-2 in
-four respects: RMSNorm in place of layer normalization, rotary position
-embeddings (RoPE) in place of learned position embeddings, grouped-query
-attention, and a SwiGLU feed-forward network. `theories/Llama.v` adds the primitives
-these require on top of the binary32 development. RMSNorm and SiLU compose
-existing operations; `f32_sin` and `f32_cos`, which RoPE needs, are defined by
-argument reduction modulo 2*pi and a Taylor polynomial. The runner loads
-SmolLM2-135M-Instruct (576 hidden, 30 layers, 9 query and 3 key/value heads,
-intermediate 1536, tied embeddings) and composes these primitives into the
-forward pass: RMSNorm, the query/key/value projections, RoPE applied to the
-per-head query and key vectors, grouped-query causal attention, the output
-projection, and the SwiGLU block, with weights streamed per layer.
-
-On the chat prompt for "What is the capital of France?", the verified forward
-reproduces the PyTorch reference's full top-eight next-token ranking, with logits
-agreeing to four decimal places. Greedy generation over the verified logits
-produces "The capital of France is Paris." Generation uses a key/value cache: the
-prompt is processed once, its per-layer rotary keys and values are stored, and
-each new token is computed as a single position attending over the cache, which
-is bit-identical to a full recompute and removes the per-token cost of
-reprocessing the prefix. `scripts/chat.py` drives an interactive session against
-either model: it applies the model's chat template, sends the token ids to the
-runner, and decodes the generated ids, so each reply is produced entirely by the
-verified operators.
-`theories/Llama.v` also names the composition itself, so the layer, the stack
-and the forward pass are Rocq functions rather than only an order the runner
-follows: `f32_llama_layer` is RMSNorm, the projections, rotary embedding,
-grouped-query causal attention, the output projection and SwiGLU inside their
-two residuals, and `f32_llama_forward` embeds, runs the stack and applies the
-final norm. `runners/llama_ref.ml` executes exactly that against the inductive
-extraction, where no floating-point boundary is trusted at all.
-
-`f32_sin` and `f32_cos` are compositions of the four arithmetic primitives, so
-the native build extracts them structurally rather than calling the host libm:
-it runs the same argument reduction and the same Taylor polynomial the
-definitions specify, on the same trusted hardware-float boundary as the rest of
-the development, with no library substitution anywhere in the forward.
-
-## Inference on a hybrid SSM model
-
-Qwen3.5 does not follow the Llama decoder pattern, and running it verified
-needed a new family of primitives rather than a change of dimensions. Of its
-twenty-four layers, eighteen are gated DeltaNet blocks: linear attention
-carrying a per-head state matrix through the sequence, decayed and corrected at
-every token, with no softmax anywhere. The remaining six are full attention,
-gated on the output and rotating only a quarter of each head.
-
-`theories/Qwen.v` adds what that requires. The DeltaNet decay term is
-`-exp(A_log) * softplus(a + dt_bias)`, so a logarithm is needed, and it is the
-one genuinely new transcendental in the development. Written in the stable form
-`softplus x = max x 0 + log (1 + exp (-|x|))`, the logarithm is only ever taken
-on (1, 2], where the arctanh series `log m = 2 * artanh ((m-1)/(m+1))`
-converges quickly with no range reduction, which keeps the new function
-branch-free. Alongside it are Euclidean normalisation for the query and key,
-the two RMSNorm variants Qwen uses that Llama does not (one storing its weight
-zero-centred and applying `1 + w`, one multiplying by `silu` of a separate
-gate), the depthwise causal convolution the DeltaNet input passes through, the
-gated delta rule itself, and partial rotary embedding. For text-only input the
-interleaved multimodal RoPE collapses to ordinary RoPE, because the three
-positional axes carry identical indices, so rotating the prefix is the whole
-story.
-
-The runner streams one layer of weights at a time and never holds the
-embedding, decoding its rows on demand for the lookup and streaming them for
-the logit projection, so a three-gigabyte model runs in about four gigabytes of
-memory. On the chat prompt for "What is the capital of France?" the verified
-forward returns the same eight highest-scoring next tokens as the PyTorch
-reference, in the same order, with logits agreeing to four decimal places:
-token 760 at 25.6649, then 57590, 3733, 332, 61445, 7732, 16 and 47358.
-
-Greedy generation carries three caches, so a decode step costs one token of
-arithmetic rather than a re-run of the prefix: the keys and values of the
-full-attention layers, the recurrent state matrix of each DeltaNet head, and
-the trailing convolution window. Over eight tokens it emits
-`760, 6511, 314, 9338, 369, 2972, 57590, 159034`, which is byte-identical to
-the reference and decodes to "The capital of France is **Paris**." The prompt
-and those eight tokens together take five and a half minutes.
-
-`runners/qwen_ref.ml` runs the same composition against the inductive
-extraction on a small configuration, calling `f32_qwen_forward` directly rather
-than composing the primitives itself, so the definitions the error bound is
-stated about are the ones executed.
-
-The primitives are defined in Rocq with their shape lemmas and extracted, so
-the arithmetic that runs is the arithmetic the definitions specify.
-`theories/Float_error.v` carries the propagation relation over every one of
-them and on to the logits: the logarithm and softplus, both RMSNorm variants,
-the depthwise convolution and its window, the gated delta step and the scan
-that threads its state, partial rotary embedding, SwiGLU, and the query
-preparation. `theories/Qwen.v` then assembles the layers those primitives make
-up, and the error file bounds the two mixers, the residual pair they sit in,
-the alternating stack and the tied-embedding projection, so the composed bound
-reaches the Qwen logits the way it reaches the GPT-2 logits.
-
-## Proof-carrying receipts
-
-A generation can emit a receipt that binds the result to the exact weights (by
-checksum), the prompt, the full output token sequence, and the IEEE-754
-semantics. `theories/Receipt.v` defines the receipt, a checker `verify_receipt`, and its
-soundness and completeness theorems; the prompt-preservation guarantee follows
-from the proven generation property `gpt2_generation_preserves_prompt`. A receipt
-is checked without trusting the producer: recompute the weight checksum from the
-file, re-run the deterministic verified generation, and compare both against the
-receipt. `scripts/receipt.py emit` writes a receipt for an answer and
-`scripts/receipt.py verify` recomputes and re-runs to confirm it. Both the
-SmolLM2 and the Qwen3.5 runner print the checksum of the weight file they
-loaded, so either model can be receipted. Because the
-forward is a pure verified function, the regeneration is reproducible, so anyone
-holding the weights and the receipt can confirm that the recorded output is
-exactly what the model produces under the proven semantics.
+The Qwen3.5 path (`theories/Qwen.v`) alternates three gated DeltaNet layers
+with one gated full-attention layer. A DeltaNet layer projects to a fused
+query/key/value triple, applies a depthwise causal convolution, normalizes
+query and key, and runs a recurrence over a per-head state matrix: the state
+is decayed by `exp g` with `g = -exp(A_log) softplus(a + dt_bias)`, corrected
+towards the value by `beta = sigmoid(b)`, and read out by the query. The
+full-attention layers gate their output elementwise by the sigmoid of a stream
+carried in the query projection and rotate a quarter of each head. For
+text-only input the multimodal rotary embedding coincides with ordinary
+rotation on that prefix.
 
 ## Two extraction modes
 
-The development supports two extraction modes from the same source.
+The inductive extraction (`Phases1_15_complete.v`, `Llama_inductive.v`,
+`Qwen_inductive.v`) keeps `binary32` as Flocq's inductive `binary_float` and
+`Z` and `positive` as inductive datatypes, so every float operation is the
+computational content of its definition and no floating-point hardware is
+trusted. Only `nat`, which carries indices, dimensions and token identifiers,
+extracts to machine `int`.
 
-The default mode, from `theories/Phases1_15_complete.v`, keeps `binary32` as Flocq's
-inductive `binary_float` and keeps `Z` and `positive` as their Coq inductive
-datatypes, so every integer operation, and therefore every float operation built
-on it, is the computational content of its proof. `Z` is not mapped to native
-machine `int`, because that mapping is unsound when a mantissa-alignment shift or
-an intermediate product exceeds the representable range, in which case binary32
-addition of operands with a large exponent gap produces an incorrect result.
-`nat`, used only for indices, dimensions, and token identifiers and always
-small, extracts to native OCaml `int`, and `ascii` extracts to OCaml `char` with
-a destructuring matcher. This mode introduces no trusted floating-point
-boundary; the arithmetic is exactly Flocq's. Its bignum arithmetic runs at
-microseconds per operation, so a full GPT-2 forward pass takes tens of minutes.
+The native extraction (`Extract.v`) maps `binary32` to OCaml `float`: each
+operation is the binary64 result rounded to binary32 through an `Int32` bit
+round-trip. `Float_error.v` proves, by instantiating Flocq's double-rounding
+theorems at the two formats, that for binary32 operands rounding the exact
+result of `+`, `-`, `*`, `/` or `sqrt` to binary64 and then to binary32 equals
+rounding it directly to binary32. The trusted boundary of this mode is that the
+host float is binary64 with round-to-nearest-even and that
+`Int32.bits_of_float` rounds to nearest. The elementary functions extract
+structurally in both modes, as the same compositions of the primitives.
 
-The native mode, from `theories/Extract.v`, re-extracts the same development with
-`binary32` mapped to the host's hardware float, in the manner CompCert extracts
-its verified floats and treats the IEEE-754 agreement as a trusted boundary at
-the OCaml level. Each operation is the binary64 result rounded to binary32
-through an `Int32` bit round-trip. That the second rounding is harmless is
-proved in `theories/Float_error.v`: for operands representable in binary32, rounding the
-exact real result of `+`, `-`, `*`, `/` or `sqrt` to binary64 and then to
-binary32 gives the same value as rounding it straight to binary32, so the
-extracted value is the binary32 value Flocq specifies. The proofs instantiate
-Flocq's double-rounding development at the two formats, where the width
-conditions hold because binary64's 53 bits of significand exceed binary32's 24
-by the required margin. Decoding reads the four little-endian bytes directly to
-a binary32 with `Int32.float_of_bits`. What this mode assumes rather than proves
-is the OCaml boundary itself, that the host's `float` is IEEE-754 binary64 with
-round-to-nearest-ties-even and that `Int32.bits_of_float` rounds to nearest
-binary32. It runs approximately three hundred times faster.
+## Results on published checkpoints
 
-The two modes were compared directly. On a small fixture their logits are
-bit-identical to nine digits. On the full 124-million-parameter GPT-2 they
-produce identical token identifiers and logits that agree to four decimals, the
-inductive mode in tens of minutes and the native mode in approximately seven
-seconds.
+Agreement is against PyTorch in float32 on the same prompt. Timings are wall
+clock on an i9-12900H, single-threaded.
+
+| | GPT-2 | SmolLM2-135M-Instruct | Qwen3.5-0.8B |
+|---|---|---|---|
+| Prompt | "The quick brown" | chat: "What is the capital of France?" (37 tokens) | same question (19 tokens) |
+| Ranking | top 10 identical | top 10 identical | top 8 identical |
+| Max logit difference | 7.3e-5 (relative 1.2e-6) | 3.2e-5 (1.2e-6) | 2.7e-5 (1.5e-6) |
+| Greedy continuation | | 12 tokens identical: "The capital of France is Paris." | 12 tokens identical: "The capital of France is **Paris**." |
+| Native forward | 10.3 s, 1.1 GB | 51.3 s, 6.3 GB | 244.6 s, 4.1 GB |
+| Inductive forward | 58.8 min, 7.1 GB | 4.17 h, 2.8 GB | 11.1 h, 3.5 GB |
+
+The inductive runs return top-ten logits identical to the native ones at nine
+significant digits, which determines a binary32 value. On a small GPT-2
+fixture, the verified list-based loader followed by `f32_gpt2_logits`, the
+GPT-2 runner in both modes, and a step-by-step numpy float32 reference all
+return the same fifteen logits.
 
 ## What is proved
 
-The development proves:
+Serialization and storage. Decoding the encoding of any 32-bit integer returns
+it (`roundtrip_z`), the binary32 and binary16 bit layouts round trip
+(`roundtrip_f32`, `roundtrip_f16`), and chunking, run-length compression and
+sharding under a byte budget invert on every input
+(`reassemble_split_into_chunks`, `rle_roundtrip`,
+`decompress_compress_network`, `unshard_shard_network`).
 
-- Serialization round trips: `i32`, and the binary32 and binary16 bit-pattern
-  encode/decode identities.
-- Storage round trips on every input: chunked split and reassembly, run-length
-  compression at the value, tensor, and network level, and network sharding
-  under a byte budget.
-- Dimension preservation through the stack: dense, attention (per-head and the
-  masked path), softmax, layer norm, the transformer blocks, the RNN family, and
-  the float linear-algebra and attention primitives.
-- Soundness bridges from boolean checkers to propositions: shape validity, value
-  bounds, network verification, and the float finiteness certificate.
-- GPT-2 parameter counts and configuration validity by reflection.
-- Quantization range containment, pooling bounds, lazy-tensor round trip, and
-  reflexivity of network equality.
-- Prompt preservation under greedy generation, for both the integer and float
-  models.
-- Correct rounding and a half-ULP accuracy bound for each float primitive:
-  multiplication, addition, division, and square root each return the
-  round-to-nearest, ties-to-even result of the exact real operation and differ
-  from it by at most half a ULP (`theories/Float_error.v`).
-- Shape preservation end to end for the float model: the forward pass returns
-  one row per input token, and the logit matrix has one row per token and
-  `vocab_size` columns (`f32_gpt2_forward_rows`, `f32_gpt2_logits_rows`,
-  `f32_gpt2_logits_row_width`).
-- Harmlessness of the native build's intermediate rounding: for binary32
-  operands, rounding the exact real result of `+`, `-`, `*`, `/` or `sqrt` to
-  binary64 and then to binary32 equals rounding it directly to binary32
-  (`theories/Float_error.v`).
-- A composed error bound for the dot product: under an explicit regularity
-  premise, the extracted `f32_dot` differs from the exact real inner product of
-  its operands by at most a running sum of per-step roundoffs
-  (`theories/Float_error.v`).
-- A worst-case error bound for the whole float forward pass, from the five
-  primitives through layer normalization, the exponential, softmax, causal
-  attention, the transformer block and the block stack, to the logits
-  (`theories/Float_error.v`).
-- The same bound over the Qwen3.5 primitives and up to its logits: the
-  logarithm, softplus, both RMSNorm variants, the depthwise causal convolution,
-  the gated delta step and scan, partial rotary embedding, SwiGLU and the query
-  preparation, then the two mixers, the residual pair, the alternating stack
-  and the tied-embedding projection (`theories/Float_error.v`).
-- The Llama primitives under the same relation: RMSNorm, SiLU over a vector,
-  and the sine and cosine Taylor polynomials. The argument reduction is where
-  the two evaluations deliberately part company, because adding and subtracting
-  the magic constant is the identity in exact arithmetic and the rounding step
-  in binary32, so the trigonometric bounds are stated on the reduced argument
-  (`theories/Float_error.v`).
-- The Llama layer, stack and logits under the same relation, so all three
-  architectures carry a bound from their primitives to their logits
-  (`ok_llama_wrap`, `ok_llama_stack`, `ok_llama_logits_full`).
-- A backward-error statement for the dot product: the computed value is exactly
-  the real inner product of the same operands with each product scaled by a
-  factor within `(1 + u)^(n+1) - 1` of one, so the perturbation is relative and
-  its size is set by the length of that one dot product rather than by the depth
-  of the surrounding network (`f32_dot_backward`). The same statement carries to
-  the matrix-vector product and to the tied-embedding projection of all three
-  models (`f32_mat_vec_mul_backward`, `logits_backward`), which is where the
-  longest dot products are.
-- That a side condition of the composed bounds can be checked by computation
-  rather than estimated: `Qb` reads a binary32 as the rational it exactly
-  denotes, `Qb_correct` proves that reading faithful, and `regz_Q` turns one
-  condition into two rational comparisons. `amp_ok_ones` witnesses the
-  amplification budget.
+Shapes and loading. The float forward pass returns one row per token and each
+logit row has one entry per vocabulary item (`f32_gpt2_forward_rows`,
+`f32_gpt2_logits_rows`, `f32_gpt2_logits_row_width`), and a model that passes
+validation has logit rows of the configured width (`validated_logits_shape`).
+Entry `i` of a named tensor is the binary32 value of the four bytes at offset
+`a + 4i` of the data section (`f32_load_named_nth`, `Loader.v`).
 
-The float arithmetic is exactly Flocq's, and each operation is proved to land
-within half a ULP of the exact real result, so the extracted executable is a
-faithful binary32 computation with a per-operation accuracy bound.
-`theories/Float_error.v` composes those per-operation facts along the dot product, the
-primitive every linear layer and every attention score is built from, and bounds
-the distance between the extracted `f32_dot` and the exact real inner product of
-the same values. Because each step is measured against the exact sum using the
-float accumulator the previous step produced, the per-step errors add rather
-than compounding geometrically, and the bound is a running sum over the
-intermediates the computation itself visits. The premise, that every step has a
-finite accumulator and that neither the product nor the sum overflows or falls
-below the smallest normal binary32 magnitude, is recorded explicitly as
-`f32_dot_regular` rather than left implicit, and a witness is exhibited so the
-bound is not vacuous.
+Per operation. Each primitive returns the correctly rounded result of the exact
+operation and lies within half a ULP of it (`f32_mult_correct`,
+`f32_plus_error` and the others in `Float_error.v`), and double rounding
+through binary64 is harmless (`f32_double_round_plus`, `_minus`, `_mult`,
+`_div`, `_sqrt`).
 
-The same file carries that composition through the rest of the network, to
-the logits. The method is uniform because the forward pass is: every scalar the
-network computes comes from one of five primitives, and everything else is list
-plumbing that performs no arithmetic. So the file proves one propagation lemma
-per primitive, a handful of structural lemmas for the plumbing, and then walks
-the stack: dot products and linear layers, layer normalization, the
-range-reduced exponential and its Taylor series, sigmoid and GELU, the MLP, the
-row maximum and softmax, scaled dot-product causal attention with head splitting
-and concatenation, the transformer block, the block stack, the embeddings, and
-the logit projection. The relation carried is that a binary32 value is finite
-and within `d` of the real number exact arithmetic would have produced; each
-primitive turns `d`-close inputs into a result that is `u * M + L * d`-close,
-where `M` bounds the magnitudes in play and `L` bounds how much an operation can
-amplify an existing error, and a stage of arithmetic depth `k` iterates that
-affine map `k` times.
+The composed forward bound. Rounding is modeled as `z (1 + d) + e` with
+`|d| <= 2^-24` and `|e| <= 2^-150`, which holds for every real `z`, zero and the
+subnormal range included (`f32_round_mixed`, from Flocq's `error_N_FLT`). The
+relation `ok d x r` states that a float `x` is finite and within `d` of the
+real value `r`; each primitive maps inputs within `d` to an output within
+`u M + eta + L d`, where `M` bounds magnitudes and `L` bounds how much an
+operation can amplify an existing error. One lemma per primitive and structural
+lemmas for the plumbing carry the relation through layer normalization, the
+exponential, softmax, causal attention, the transformer block and stack
+(`ok_block_forward`, `ok_blocks_forward`) to the GPT-2 logits
+(`ok_gpt2_logits_full`); through RMSNorm, rotary embedding, SwiGLU and the Llama
+layer to its logits (`ok_llama_logits_full`); and through the logarithm,
+softplus, both extra RMSNorm variants, the depthwise convolution, the gated
+delta step and scan, and both Qwen3.5 mixers to its logits
+(`ok_qwen_logits_full`). The side conditions are collected per stage in
+records, and `Witness.v` discharges the records of the exponential, sigmoid,
+tanh and GELU at an exact zero, and that of the exponential at an argument it
+saturates, deciding every binary32 comparison by computation on the rational
+the float denotes (`Qb`, `Qb_correct`). `Dot.v` gives the sharper running bound for the
+dot product (`f32_dot_error_mixed`) and witnesses it on a product that is
+exactly zero.
 
-The hypotheses are explicit rather than buried: magnitudes stay under `M`,
-denominators and radicands stay above `m`, no intermediate falls below the
-smallest normal binary32 magnitude, and the exponential's saturation is not
-engaged, so the float and the real evaluation follow the same path. The bound is
-worst-case, so it compounds with depth and is far larger at GPT-2 scale than the
-divergence `RESULTS.md` measures; what it establishes is that the divergence is
-bounded at all, by a quantity computed from the network's own dimensions.
+Backward error. The computed dot product equals the exact inner product of its
+operands with each product scaled by a factor within `(1 + u)^(n+1) - 1` of one
+(`f32_dot_backward`), and the statement lifts to the matrix-vector product and
+the tied-embedding projection of all three models
+(`f32_mat_vec_mul_backward`, `logits_backward`).
 
-## Use as an IEEE-754 reference
+A forward pass that carries its bound. `RunErr.v` writes the GPT-2 forward pass
+once over an abstract arithmetic of nine operations and instantiates it at
+binary32, where it is `f32_gpt2_logits` by conversion (`g_gpt2_logits_f32`), at
+exact real arithmetic with the exponential taken on its argument saturated to
+[-88, 88], and at the annotated arithmetic of `Annot.v` and `AnnExp.v`, where
+each value is a binary32 result paired with a binary64 bound. The bound is
+computed with outward rounding (`Bound64.v`); a condition the analysis needs is
+tested on the values the pass computes, and a failed test returns an infinite
+bound, so every annotated operation preserves the relation "when the bound is
+finite, the value is finite and within the bound of the real result" with no
+hypothesis (`aok_plus`, `aok_mult`, `aok_div`, `aok_sqrt`, `aok_exp`). The
+exponential's bound holds for whatever integer the float reduction selects,
+provided it is at most 127 in magnitude and the widened reduced argument lies
+within 179/512 of zero, both of which are tested. One relational theorem gives
+`gpt2_logits_bounded`: the binary32 parts of the annotated pass are the logits
+`f32_gpt2_logits` returns, and each lies within its bound of the logit exact
+real arithmetic produces from the same weights and tokens. The bound is computed
+from the values the pass produces, so it holds for the input the pass was run
+on.
 
-Because the extracted forward pass is deterministic and pins every rounding and
-every reduction order, it is a fixed reference against which other inference
-implementations can be measured. Production float32 implementations differ from
-each other and across hardware because of fused multiply-add contraction, BLAS
-summation order, and GPU nondeterminism; this development fixes a single
-evaluation and proves it is the one the IEEE-754 semantics, as formalized by
-Flocq, specify. The repository includes a differential-testing harness that runs
-the same network through this reference and through a numpy float32
-implementation of the identical operations and reports the divergence and any
-next-token disagreements. The sweep in `RESULTS.md` moves one dimension at a
-time off a base model and finds that the divergence tracks the model width: mean
-absolute logit error rises by a factor of about nineteen from `d_model` 8 to 64
-at fixed depth, while depth contributes mildly across one to eight layers and
-sequence length and vocabulary size hardly at all, which is what accumulating
-longer dot products in a different reduction order predicts. No configuration
-produced a next-token disagreement. At full scale, the reference produces the
-same next-token prediction as the PyTorch implementation on GPT-2 weights, as
-described above.
+Elementary functions against mathematics. `Series.v` bounds each series the
+code evaluates, with its stored divisors, against the function it approximates,
+using CoqInterval, and `Truth.v` composes those bounds with the propagation
+relation. The real evaluation of the exponential is within a relative `1.6e-8`
+of `exp` on [-88, 88] (`exp_core_vs_true`). For `|x| <= 4000` the reduction
+lands within 3.15 of zero, the stored split of `2 pi` costs at most `1.3e-8`,
+and the extracted sine and cosine are within `1.5e-8` and `3.3e-8` of `sin x`
+and `cos x` beyond the rounding term (`ok_sin_true_full`, `ok_cos_true_full`).
+The logarithm is within `2e-8` of `ln` on (1, 2] (`ok_log_true`), sigmoid
+within `1.6e-8` (`ok_sigmoid_true`), tanh within `3.2e-8` (`ok_tanh_true`),
+softplus within `4e-8` of `ln (1 + exp x)` (`ok_softplus_true`), GELU within
+`5e-5` of the tanh form on [-8, 8] (`ok_gelu_true`), and square root within
+half a ULP (`ok_sqrt_true`).
 
-The Llama and Qwen3.5 paths carry the same harness, against the inductive
-extraction of `f32_llama_forward` and `f32_qwen_forward` rather than the native
-build, so the oracle there trusts no floating-point boundary at all. Weights are
-handed to both sides as raw binary32 bit patterns, so the reference and the
-mirror start from identical values and the only difference is the reduction
-order. Sixteen samples per configuration, as in the GPT-2 sweep, put the Llama
-divergence in the same range as GPT-2's and the Qwen divergence about an order
-of magnitude higher, which is what a recurrence carrying a state matrix across
-the sequence, on top of a logarithm and a convolution, predicts. The Qwen rows
-include the layer pattern the real model uses, three gated DeltaNet blocks to
-one gated full-attention block. No configuration produced a next-token
-disagreement there either.
+Cached decoding. The gated delta scan decomposes at any split point into a
+prefill and a continuation from the state the prefill produced
+(`delta_scan_app`); extending the sequence by one token appends exactly the
+output of one step (`delta_scan_snoc`); outputs after a split depend on the
+prefix only through the state (`delta_markov`); the runner's incrementally
+maintained convolution window is the window the definition reads
+(`conv_window_cached_correct`, `conv_hist_step`); and a decode step of causal
+attention appends the new query attending over every cached key and value
+(`causal_attention_snoc`). These are equalities of binary32 values.
+
+Causality. A sequence function is causal when it preserves length and its rows
+for a sequence are the first rows of its output on every extension. Row-wise
+maps, causal attention, the convolution and the delta scan are causal, and
+causality is closed under composition, zipping and stacking, so the three
+forward passes are causal (`causal_gpt2_forward`, `causal_llama_forward`,
+`causal_qwen_forward`): running a model on a longer sequence reproduces bit for
+bit every row it produced for the shorter one (`gpt2_logits_prefix`,
+`llama_forward_prefix`, `qwen_forward_prefix`).
+
+Runners, generation and receipts. The GPT-2 runners decode each weight matrix
+directly in transposed order, and that decode equals `f32_mat_transpose` of the
+reshape, so their linear layer is `f32_linear_forward`
+(`decode_transposed_correct`, `runner_linear_correct`).
+Greedy generation always extends the prompt
+(`gpt2_generation_preserves_prompt`, `f32_generation_preserves_prompt`). An
+inference receipt is checked by recomputing the weight checksum and
+regenerating the output (`verify_receipt_sound`, `verify_receipt_complete`), and
+the checksum changes whenever a single byte of the weight file changes
+(`checksum_detects_single_byte`).
+
+`theories/Audit.v` prints the assumptions of 187 of these results. Seventeen
+are closed under the global context. Another 138 rest on the four classical
+axioms of the Rocq real-number library (`classic`,
+`functional_extensionality_dep`, `sig_forall_dec`, `sig_not_dec`), which Flocq
+inherits. The remaining 32, `gpt2_logits_bounded` among them, use CoqInterval
+and rest in addition on the axiomatization of primitive floats, 63-bit integers
+and primitive arrays that CoqInterval computes with.
+
+## Bounds computed during a forward pass
+
+`runners/gpt2_bound_ref` runs the inductive extraction of the annotated forward
+pass `gpt2_logits_bounded` is stated about, on models loaded through the verified
+loader. Over the 160 random GPT-2 models of the differential sweep, the bound is
+compared with the actual error, the distance from the binary32 logit to a
+float64 evaluation of the reference network; evaluating one sample per
+configuration at 50 digits moves that reference by at most 3.1e-16. No logit
+exceeds its bound. `RESULTS.md` holds every configuration.
+
+| layers | d_model | seq | logits bounded | max bound | max actual error | median bound/error |
+|---|---|---|---|---|---|---|
+| 1 | 8 | 8 | 2048/2048 | 1.8e-5 | 3.4e-8 | 970 |
+| 2 | 8 | 8 | 2048/2048 | 6.3e-4 | 2.6e-8 | 2.0e4 |
+| 4 | 8 | 8 | 1664/2048 | 1.9 | 3.1e-8 | 7.3e6 |
+| 4 | 8 | 32 | 7248/8192 | 1.0 | 3.4e-8 | 8.2e6 |
+| 4 | 16 | 8 | 0/2048 | | | |
+| 8 | 8 | 8 | 0/2048 | | | |
+
+The bound grows thirty- to fifty-fold per layer. On GPT-2 small,
+`runners/gpt2_bound_native` reports the bound after each stage: 2.7e-7 on the
+embeddings, then through the first block 8.7e-6 after layer normalization,
+4.3e-4 after the query/key/value projection, 1.5e-2 after attention, 0.49 after
+the output projection, 0.20 after the second layer normalization and 17 after
+the feed-forward projection, whose values reach 11.5. The exponentials inside
+the first GELU then return infinite bounds, and every later bound is infinite.
+
+## Agreement on held-out text
+
+For each model, the WikiText-2 raw test split, tokenized by the model's own
+tokenizer, is cut into blocks of 64 tokens, and the first 16 tokens of 300
+blocks spread evenly over the split form the windows. Each window runs through
+the native extraction, through PyTorch in float32 on an i9-13900KF and an RTX
+6000 Ada with eager attention and TF32 off, and through llama.cpp from a float32
+GGUF on the same CPU and GPU with flash attention off and otherwise its
+defaults. Every implementation returns the logits of all 16 positions, 4,800
+next-token distributions per model. Against the extracted pass, where top-1
+differs counts positions of 4,800, KL is D(p_extracted || p) averaged over
+positions, and perplexity covers the 4,500 positions with a following token:
+
+| model | implementation | top-1 differs | median abs diff | max abs diff | mean KL | perplexity |
+|---|---|---|---|---|---|---|
+| GPT-2 | extracted | | | | | 246.928477 |
+| | PyTorch CPU | 0 | 3.9e-5 | 1.57e-3 | 6.6e-10 | 246.928159 |
+| | PyTorch GPU | 0 | 4.7e-5 | 1.51e-3 | 7.7e-10 | 246.928159 |
+| | llama.cpp CPU | 2 | 6.6e-3 | 0.312 | 3.9e-7 | 246.929787 |
+| | llama.cpp GPU | 7 | 2.5e-2 | 1.70 | 1.9e-5 | 246.898478 |
+| SmolLM2 | extracted | | | | | 272.438622 |
+| | PyTorch CPU | 0 | 1.3e-5 | 5.10e-4 | 4.8e-11 | 272.438619 |
+| | PyTorch GPU | 0 | 1.2e-5 | 6.93e-4 | 5.0e-11 | 272.438619 |
+| | llama.cpp CPU | 3 | 1.9e-3 | 9.33e-2 | 7.7e-7 | 272.428655 |
+| | llama.cpp GPU | 7 | 6.5e-3 | 0.225 | 5.9e-6 | 272.325178 |
+| Qwen3.5 | extracted | | | | | 213.216541 |
+| | PyTorch CPU | 0 | 4.8e-6 | 1.55e-4 | 4.2e-11 | 213.216586 |
+| | PyTorch GPU | 0 | 4.8e-6 | 1.55e-4 | 4.3e-11 | 213.216562 |
+| | llama.cpp CPU | 0 | 2.7e-4 | 2.16e-2 | 1.1e-7 | 213.219491 |
+| | llama.cpp GPU | 6 | 1.5e-3 | 5.55e-2 | 2.2e-6 | 213.199794 |
+
+`RESULTS.md` adds the fraction of positions whose ten highest tokens agree in
+order, the fraction of bit-identical logits, the 99.9th percentile of the
+absolute difference and the largest KL.
+
+## Differential testing
+
+Because the extracted forward pass fixes every rounding and every reduction
+order, it serves as a reference against which other float32 implementations
+can be measured. The harness builds random small models, runs each through the
+inductive extraction and through a numpy float32 implementation of the same
+elementwise operations with numpy's own reductions, and reports the divergence
+and any final-position next-token disagreement. Weights cross as raw binary32
+bit patterns, so both sides start from identical values. `RESULTS.md` holds the
+sweep: 368 models across GPT-2, Llama and Qwen3.5 configurations, with no
+next-token disagreement. Divergence tracks width: moving `d_model` from 8 to 64
+at four layers raises the mean absolute logit error by a factor of 12.5, while
+moving from one layer to eight at width 8 raises it by 1.4.
+
+The architecture sweep supplies the rotary tables as data, so it does not
+evaluate `f32_sin` or `f32_cos`. `runners/prim_sweep.ml` and
+`scripts/prim_check.py` evaluate the elementary functions themselves on the
+inductive extraction at 20,001 points each and compare them with the
+mathematical functions in double precision, reporting the maximum error and
+the number of sign disagreements:
+
+| primitive | range | max error | sign disagreements |
+|---|---|---|---|
+| sin | [-4000, 4000] | 5.6e-7 abs | 0 |
+| cos | [-4000, 4000] | 3.7e-7 abs | 0 |
+| exp | [-80, 80] | 7.8e-8 rel | 0 |
+| sigmoid | [-40, 40] | 8.4e-8 abs | 0 |
+| tanh | [-20, 20] | 1.7e-7 abs | 0 |
+| GELU | [-20, 20] | 5.1e-7 abs | 0 |
+| log | [1, 2] | 9.4e-8 abs | 0 |
+| softplus | [-30, 30] | 5.4e-7 abs | 0 |
+| sqrt | [0, 1e6] | 5.9e-8 rel | 0 |
+
+On the checkpoints the same reference attributes llama.cpp's divergence to four
+choices: the float16 key/value cache it uses by default, ggml-cpu's float16 GELU
+table (`GGML_GELU_FP16`), the TF32 math mode ggml-cuda sets for cuBLAS, and
+ggml-cuda's `mul_mat_f` kernel, which for batches of at most 16 tokens
+multiplies float32 weight matrices of suitable shape on the GPU's tensor cores
+outside cuBLAS, where `NVIDIA_TF32_OVERRIDE=0` does not reach. `RESULTS.md`
+crosses the four on every model. Each alone, with the other three removed,
+multiplies the largest logit difference by about 90 to 1,000 on every model it
+applies to. With all four removed, llama.cpp agrees with the extracted pass as
+closely as PyTorch on both backends, every logit within 1.8e-3, with one top-1
+difference, on SmolLM2 on the GPU, where the two highest extracted logits are
+3.2e-5 apart.
+
+## Scope
+
+The agreement with PyTorch is measured, not proved; the development is itself
+the specification of what these models compute in binary32. The checkpoint
+runners compose the verified primitives in OCaml, reading bytes natively and
+streaming weights layer by layer. The transposed decode and the caches, which
+regroup the arithmetic, are proved to compute the values the definitions
+compute; the rest of the composition is ordinary OCaml, checked by the fixture
+comparison above and by the inductive references, which call
+`f32_llama_forward` and `f32_qwen_forward` directly. The composed error bound
+holds under its side-condition records, which are hypotheses about the inputs;
+they are discharged at specific points, not for a checkpoint. The bound the
+annotated forward pass computes needs no hypothesis, but it propagates
+intervals: it is informative on one- and two-layer models and infinite on GPT-2
+small from the first GELU on, and it is proved for the GPT-2 path only. The
+receipt checksum detects any single-byte change but is not collision resistant.
 
 ## Building and running
 
-Requires Rocq 9 with `coq-flocq`, and OCaml (4.14 or later). The GPT-2 fetch and
-the differential harness additionally use Python with `torch`, `transformers`,
-`numpy`, and `safetensors`.
+The theories need Rocq 9.0 with `coq-flocq` and `coq-interval`; the runners need
+OCaml 4.14 or later; the setup scripts and the harness need Python with `torch`,
+`transformers`, `numpy` and `safetensors`.
 
 ```bash
-# Everything Coq lives in theories/, and extraction output lands beside it.
-cd theories
+# Compile every theory in dependency order. Extraction output
+# (phases1_15_complete, phases1_15_native, llama_native, qwen_native,
+# llama_inductive, qwen_inductive, runerr_native, runerr_inductive, each .ml and
+# .mli) lands in theories/.
+make -C theories
 
-# Compile the development and extract the inductive OCaml
-# (phases1_15_complete.{ml,mli}).
-rocq compile -R . "" Phases1_15_complete.v
-
-# The Llama and Qwen3.5 primitives.
-rocq compile -R . "" Llama.v
-rocq compile -R . "" Qwen.v
-
-# The numerical semantics: correct rounding per operation, the native build's
-# rounding step, and the composed error bounds up to the logits.
-rocq compile -R . "" Float_error.v
-
-# The native re-extraction. One compile emits phases1_15_native.{ml,mli},
-# llama_native.{ml,mli} and qwen_native.{ml,mli}.
-rocq compile -R . "" Extract.v
-
-# Report the assumptions behind the headline theorems.
-rocq compile -R . "" Audit.v
-cd ..
-
-# Build the inductive (exact) and native (fast) GPT-2 runners.
-ocamlopt -rectypes -w -a -I theories theories/phases1_15_complete.mli theories/phases1_15_complete.ml runners/gpt2_talk.ml -o gpt2_talk
+# Runners against the native extraction.
 ocamlopt -rectypes -w -a -I theories theories/phases1_15_native.mli theories/phases1_15_native.ml runners/gpt2_talk_native.ml -o gpt2_talk_native
-
-# Fetch GPT-2, save f32 weights with the loader's tensor names, and print the
-# PyTorch reference prediction.
-python scripts/gpt2_setup.py
-
-# Predict the next token. Arguments: mode (full|next), file, n_embd, n_head,
-# n_layer, n_inner, vocab, n_positions, then the comma-separated token ids.
-./gpt2_talk_native next gpt2.safetensors 768 12 12 3072 50257 1024 464,2068,7586
-
-# Llama path: build the runner against the native extraction.
 ocamlopt -rectypes -w -a -I theories theories/llama_native.mli theories/llama_native.ml runners/llama_talk_native.ml -o llama_talk_native
-
-# Fetch SmolLM2, save f32 weights and the rotary frequencies, capture the oracle.
-python scripts/smollm_setup.py
-
-# Qwen3.5 path: build the runner against the same native extraction.
 ocamlopt -rectypes -w -a -I theories theories/qwen_native.mli theories/qwen_native.ml runners/qwen_talk_native.ml -o qwen_talk_native
 
-# Fetch Qwen3.5-0.8B, save the text decoder as f32 weights, capture the oracle.
+# Runners against the inductive extraction.
+ocamlopt -rectypes -w -a -I theories theories/phases1_15_complete.mli theories/phases1_15_complete.ml runners/gpt2_talk.ml -o gpt2_talk
+ocamlopt -rectypes -w -a -I theories theories/llama_inductive.mli theories/llama_inductive.ml runners/llama_talk_inductive.ml -o llama_talk_inductive
+ocamlopt -rectypes -w -a -I theories theories/qwen_inductive.mli theories/qwen_inductive.ml runners/qwen_talk_inductive.ml -o qwen_talk_inductive
+
+# Fetch each model, save f32 weights under the names the runners look up, and
+# print the PyTorch reference.
+python scripts/gpt2_setup.py
+python scripts/smollm_setup.py
 python scripts/qwen_setup.py
 
-# Next-token logits. Arguments: file, d, n_layer, n_head, n_kv, head_dim,
-# rotary_dim, ff, vocab, deltanet heads, deltanet head_dim, conv kernel, ids.
+# GPT-2: mode (full|next), file, n_embd, n_head, n_layer, n_inner, vocab,
+# n_positions, token ids.
+./gpt2_talk_native next gpt2.safetensors 768 12 12 3072 50257 1024 464,2068,7586
+
+# SmolLM2: file, d, n_layer, n_head, n_kv, ff, vocab, token ids, then optionally
+# max_new and eos for greedy generation.
+./llama_talk_native smollm.safetensors 576 30 9 3 1536 49152 <ids> 12 2
+
+# Qwen3.5: file, d, n_layer, n_head, n_kv, head_dim, rotary_dim, ff, vocab,
+# DeltaNet heads, DeltaNet head_dim, conv kernel, token ids, then optionally
+# max_new and eos.
 ./qwen_talk_native qwen.safetensors 1024 24 8 2 256 64 3584 248320 16 128 4 <ids>
 
-# Chat against either model. Tokenization runs in the script; the verified
-# forward runs in the built runner.
+# Chat against either model; tokenization runs in the script.
 python scripts/chat.py smollm "What is the capital of France?"
 python scripts/chat.py qwen "What is the capital of France?"
 
-# The inductive references for the two later architectures, which trust no
-# floating-point boundary, and the differential sweep that measures a numpy
-# float32 implementation of the same operations against them.
-cd theories
-rocq compile -R . "" Llama_inductive.v
-rocq compile -R . "" Qwen_inductive.v
-cd ..
-ocamlopt -rectypes -w -a -I theories theories/llama_inductive.mli theories/llama_inductive.ml runners/llama_ref.ml -o llama_ref
-ocamlopt -rectypes -w -a -I theories theories/qwen_inductive.mli theories/qwen_inductive.ml runners/qwen_ref.ml -o qwen_ref
-python scripts/experiment_arch.py
+# Emit a receipt for an answer, then verify it by recomputation.
+python scripts/receipt.py emit qwen "What is the capital of France?" 8
+python scripts/receipt.py verify
 ```
 
-The integer path has its own build. `make -C tools` compiles the development,
-builds the OCaml wrapper around the extracted serializer, and writes the two
-example networks to `.safetensors`, checking each file against the bytes Coq's
-own `serialize_list` produces; `make -C tools verify` then reads them back with
-the Python `safetensors` library and checks the values.
+The native runners also accept `serve <eos>` in place of the token ids, which
+keeps the weights resident and answers one query per line on standard input,
+and `dump <windows> <outdir> <first> <last>`, which runs each line of a file of
+comma-separated windows and writes the logits of every position to
+`<outdir>/<index>.f32` as little-endian binary32 (GPT-2 takes `dump` as its
+mode argument, ahead of the file).
 
-`runners/ref_logits.ml` is a smaller runner that uses the verified list-based loader on
-toy `.safetensors` files: it reads file bytes as inductive `Z`, calls
-`parse_header_size` and `parse_header_string` to split the header from the data,
-calls `f32_load_model` to assemble the typed weights, and calls
-`f32_gpt2_logits`.
+The differential harness:
+
+```bash
+ocamlopt -rectypes -w -a -I theories theories/phases1_15_complete.mli theories/phases1_15_complete.ml runners/ref_logits.ml -o ref_logits
+ocamlopt -rectypes -w -a -I theories theories/llama_inductive.mli theories/llama_inductive.ml runners/llama_ref.ml -o llama_ref
+ocamlopt -rectypes -w -a -I theories theories/qwen_inductive.mli theories/qwen_inductive.ml runners/qwen_ref.ml -o qwen_ref
+ocamlopt -rectypes -w -a -I theories theories/qwen_inductive.mli theories/qwen_inductive.ml runners/prim_sweep.ml -o prim_sweep
+
+python scripts/experiment_gen.py     # GPT-2 models and numpy logits in expbatch/
+bash scripts/run_batch.sh            # reference logits into coq_out.txt
+python scripts/experiment_cmp.py     # GPT-2 section of RESULTS.md
+python scripts/experiment_arch.py    # Llama and Qwen3.5 sections
+python scripts/prim_check.py         # the elementary functions
+```
+
+The annotated forward pass:
+
+```bash
+ocamlopt -rectypes -w -a -I theories theories/runerr_native.mli theories/runerr_native.ml runners/gpt2_bound_native.ml -o gpt2_bound_native
+ocamlopt -rectypes -w -a -I theories theories/runerr_inductive.mli theories/runerr_inductive.ml runners/gpt2_bound_ref.ml -o gpt2_bound_ref
+
+# Per-stage bounds on a checkpoint: file, n_embd, n_head, n_layer, n_inner,
+# vocab, token ids.
+./gpt2_bound_native gpt2.safetensors 768 12 12 3072 50257 464,2068,7586
+
+bash scripts/run_bound_batch.sh      # bounds for every model of the GPT-2 sweep
+python scripts/bound_cmp.py --write  # bound against actual error, into RESULTS.md
+```
+
+Agreement on held-out text. `agree_setup.py` writes the windows of the reported
+evaluation by default. The extracted dumps take about 2, 1.5 and 18 hours of
+CPU time for GPT-2, SmolLM2 and Qwen3.5, and each runner takes a range of window
+indices, so the 300 windows split across processes. PyTorch, llama.cpp and the
+report are shown for GPT-2; SmolLM2 and Qwen3.5 take the same commands with
+`smollm` or `qwen`, their own GGUF, and vocabulary sizes 49152 and 248320.
+`scripts/llamacpp_logits` builds against a llama.cpp checkout, and the GGUF
+comes from llama.cpp's `convert_hf_to_gguf.py` with `--outtype f32`, run on a
+directory holding the checkpoint's configuration and tokenizer files beside a
+weight file without the attention-mask buffers (`gpt2_setup.py` saves one).
+
+```bash
+python scripts/agree_setup.py gpt2 agree/gpt2_windows.txt
+python scripts/agree_setup.py smollm agree/smollm_windows.txt
+python scripts/agree_setup.py qwen agree/qwen_windows.txt
+./gpt2_talk_native dump gpt2.safetensors 768 12 12 3072 50257 1024 agree/gpt2_windows.txt agree/gpt2 0 300
+./llama_talk_native smollm.safetensors 576 30 9 3 1536 49152 dump agree/smollm_windows.txt agree/smollm 0 300
+./qwen_talk_native qwen.safetensors 1024 24 8 2 256 64 3584 248320 16 128 4 dump agree/qwen_windows.txt agree/qwen 0 300
+
+python scripts/agree_torch.py gpt2 agree/gpt2_windows.txt agree/torch_cpu_gpt2 cpu
+python scripts/agree_torch.py gpt2 agree/gpt2_windows.txt agree/torch_cuda_gpt2 cuda
+
+cmake -S scripts/llamacpp_logits -B build -DLLAMA_CPP=<llama.cpp checkout>
+cmake --build build --config Release --target llamacpp_logits
+cmake -S scripts/llamacpp_logits -B build_cuda -DLLAMA_CPP=<llama.cpp checkout> -DGGML_CUDA=ON
+cmake --build build_cuda --config Release --target llamacpp_logits
+# model, windows, outdir, first, last, GPU layers, threads, cache type
+./build/llamacpp_logits gpt2-f32.gguf agree/gpt2_windows.txt agree/llamacpp_cpu_gpt2 0 300 0 16
+./build_cuda/llamacpp_logits gpt2-f32.gguf agree/gpt2_windows.txt agree/llamacpp_cuda_gpt2 0 300 99 8
+
+python scripts/agree_cmp.py gpt2 agree/gpt2_windows.txt 50257 extracted=agree/gpt2 \
+  "PyTorch CPU=agree/torch_cpu_gpt2" "PyTorch CUDA=agree/torch_cuda_gpt2" \
+  "llama.cpp CPU=agree/llamacpp_cpu_gpt2" "llama.cpp CUDA=agree/llamacpp_cuda_gpt2" \
+  --pair "PyTorch CPU:PyTorch CUDA" --write
+```
+
+The configuration report, written with
+`--title "llama.cpp configurations against the extracted forward pass"`, crosses
+the cache type (`f16` or `f32` as the last argument) with, on the CPU, a build
+whose `ggml/src/ggml-cpu/vec.h` has no `#define GGML_GELU_FP16`, and on the GPU,
+`NVIDIA_TF32_OVERRIDE=0` in the environment and a build whose
+`ggml_cuda_mul_mat` in `ggml/src/ggml-cuda/ggml-cuda.cu` has no
+`ggml_cuda_should_use_mmf` branch, all at llama.cpp commit 8172e65.
+
+`scripts/run_float_demo.sh` builds the small float drivers and runs the fixture
+comparison against `scripts/tiny_gpt2_ref.py`. The integer export path has its
+own build: `make -C tools` writes the two example integer networks to
+`.safetensors` and checks each file against the bytes `serialize_list` produces,
+and `make -C tools verify` reads them back with the Python `safetensors`
+library.
 
 ## Repository layout
 
 | Path | Contents |
 |------|----------|
-| `theories/Phases1_15_complete.v` | The development: definitions, proofs, and the inductive extraction. |
-| `theories/Float_error.v` | Numerical semantics: correct rounding per operation, the native build's rounding step, and the composed error bounds for the dot product and the whole forward pass. |
-| `theories/Llama.v` | Llama primitives: RMSNorm, SiLU, `f32_sin`/`f32_cos` for RoPE, rotary embedding, slicing and SwiGLU; then the layer, the stack and the forward pass. |
-| `theories/Qwen.v` | Qwen3.5 primitives: the logarithm and softplus the DeltaNet decay needs, Euclidean normalisation, the two extra RMSNorm variants, the depthwise causal convolution, the gated delta rule, and partial RoPE; then the layers they assemble into, the stack and the forward pass. |
-| `theories/Extract.v` | Native re-extraction mapping `binary32` to hardware float; emits the GPT-2, Llama and Qwen3.5 targets. |
-| `theories/Llama_inductive.v`, `theories/Qwen_inductive.v` | Inductive extraction of the two later architectures, with no trusted float boundary; the oracle the differential harness measures against. |
-| `theories/Receipt.v` | Inference receipt, the checker `verify_receipt`, and its soundness and completeness. |
-| `theories/Audit.v` | `Print Assumptions` report for the headline theorems. |
-| `runners/gpt2_talk.ml` | GPT-2 runner against the inductive extraction (exact). |
-| `runners/gpt2_talk_native.ml` | The same runner against the native extraction (fast). |
-| `runners/llama_talk_native.ml` | SmolLM2 runner: the verified Llama forward and greedy generation. |
-| `runners/qwen_talk_native.ml` | Qwen3.5 runner: the verified gated-DeltaNet and gated-attention forward. |
-| `runners/ref_logits.ml` | Smaller runner using the verified list-based loader on toy models. |
-| `runners/llama_ref.ml`, `runners/qwen_ref.ml` | The Llama and Qwen3.5 forwards against the inductive extraction, on small models. |
+| `theories/Phases1_15_complete.v` | Serialization, binary32 arithmetic, the elementary functions, the layer library, GPT-2, the safetensors loader, generation, and the inductive extraction. |
+| `theories/Llama.v` | RMSNorm, SiLU, sine and cosine, slicing, partial rotary embedding, SwiGLU, and the Llama layer, stack and forward pass. |
+| `theories/Qwen.v` | The logarithm and softplus, Euclidean normalization, the two extra RMSNorm variants, the depthwise causal convolution, the gated delta rule, and the Qwen3.5 mixers, layer wrapper, stack and forward pass. |
+| `theories/Float_error.v` | Correct rounding per operation, double rounding through binary64, the rounding model, and the composed error bounds up to the logits of all three architectures, with the backward-error statements. |
+| `theories/Dot.v` | The running bound for the dot product and its witnesses at an exact zero. |
+| `theories/Series.v` | CoqInterval bounds on each series and constant the code evaluates. |
+| `theories/Truth.v` | The elementary functions against the mathematical functions. |
+| `theories/Witness.v` | Side-condition records discharged by computation at an exact zero and at a saturated argument. |
+| `theories/Bound64.v` | Binary64 arithmetic with outward rounding, and what each operation bounds. |
+| `theories/Annot.v`, `theories/AnnExp.v` | Annotated binary32 operations carrying a binary64 bound against real arithmetic, the exponential included. |
+| `theories/RunErr.v` | The GPT-2 forward pass over an abstract arithmetic, its binary32, real and annotated instances, and `gpt2_logits_bounded`. |
+| `theories/Cache.v`, `theories/Cache_attn.v` | Prefill and decode for the delta scan, the convolution window, and causal attention; transposition. |
+| `theories/Causal.v` | Causality of the three forward passes. |
+| `theories/Runner.v` | The transposed decode the checkpoint runners perform. |
+| `theories/Loader.v` | What a named load returns, the dtype check, and validation connected to the shape theorems. |
+| `theories/RoundChk.v` | Rounding to the nearest integer, checked by computation. |
+| `theories/Receipt.v` | Inference receipts, their checker, and what the checksum detects. |
+| `theories/Extract.v` | The native extraction of the GPT-2, Llama and Qwen3.5 targets and of the annotated GPT-2 forward pass. |
+| `theories/Llama_inductive.v`, `theories/Qwen_inductive.v`, `theories/RunErr_inductive.v` | The inductive extraction of the Llama and Qwen3.5 definitions and of the annotated GPT-2 forward pass. |
+| `theories/Audit.v` | `Print Assumptions` for the headline results. |
+| `theories/_CoqProject`, `theories/Makefile` | Build order and build. |
+| `runners/gpt2_talk.ml`, `runners/gpt2_talk_native.ml` | GPT-2 on the inductive and native extractions; the native runner also dumps the logits of every position of a file of windows. |
+| `runners/llama_talk_native.ml`, `runners/llama_talk_inductive.ml` | SmolLM2 with a key/value cache, a serve mode and a dump mode; the inductive forward streams one layer at a time. |
+| `runners/qwen_talk_native.ml`, `runners/qwen_talk_inductive.ml` | Qwen3.5 with attention, recurrent-state and convolution caches, a serve mode and a dump mode; the inductive forward decodes one projection row at a time. |
+| `runners/gpt2_bound_native.ml`, `runners/gpt2_bound_ref.ml` | The annotated GPT-2 forward pass on the native extraction, with per-stage bound statistics, and on the inductive extraction through the verified loader. |
+| `runners/ref_logits.ml`, `runners/llama_ref.ml`, `runners/qwen_ref.ml` | References for the differential harness on the inductive extraction; `ref_logits` goes through the verified list-based loader, and the other two call `f32_llama_forward` and `f32_qwen_forward`. |
+| `runners/prim_sweep.ml` | The elementary functions on the inductive extraction. |
 | `runners/float_smoke.ml`, `runners/float_load_run.ml`, `runners/test_bplus.ml` | Small drivers for the float path. |
-| `scripts/gpt2_setup.py` | Fetches GPT-2, saves f32 weights with the loader's tensor names, prints the PyTorch reference. |
-| `scripts/smollm_setup.py` | Fetches SmolLM2, saves f32 weights and rotary frequencies, prints the PyTorch oracle. |
-| `scripts/qwen_setup.py` | Fetches Qwen3.5-0.8B, saves the text decoder as f32 weights, prints the PyTorch oracle. |
-| `scripts/models.py` | The models the runners can be driven against, and how to reach one. |
-| `scripts/chat.py` | Interactive chat against either model: local tokenization, verified forward in the runner. |
-| `scripts/receipt.py` | Emit and verify proof-carrying receipts for generated answers. |
-| `scripts/tiny_gpt2_ref.py` | numpy reference of the identical computation, and a tiny `.safetensors` generator. |
-| `scripts/experiment_gen.py`, `scripts/experiment_cmp.py` | Differential-testing harness for GPT-2: generate models, compare the reference against numpy. |
-| `scripts/arch_ref.py`, `scripts/experiment_arch.py` | numpy mirrors of the Llama and Qwen3.5 forwards, and the sweep that compares them against the inductive reference. |
-| `scripts/run_batch.sh`, `scripts/run_float_demo.sh` | Drive the harness and the toy-model demo. |
-| `tools/` | Makefile and OCaml I/O wrapper that export the integer example networks to `.safetensors`. |
+| `scripts/gpt2_setup.py`, `scripts/smollm_setup.py`, `scripts/qwen_setup.py` | Fetch a model, save f32 weights, print the PyTorch reference. |
+| `scripts/models.py`, `scripts/chat.py`, `scripts/receipt.py` | The model registry, interactive chat, and receipts. |
+| `scripts/tiny_gpt2_ref.py`, `scripts/experiment_gen.py`, `scripts/experiment_cmp.py`, `scripts/run_batch.sh` | The GPT-2 fixture and the GPT-2 sweep. |
+| `scripts/arch_ref.py`, `scripts/experiment_arch.py` | numpy mirrors of the Llama and Qwen3.5 forwards, and their sweep. |
+| `scripts/prim_check.py` | The elementary-function sweep. |
+| `scripts/run_bound_batch.sh`, `scripts/bound_cmp.py` | The annotated forward pass over the GPT-2 sweep, and its bounds against the actual error. |
+| `scripts/agree_setup.py`, `scripts/agree_torch.py`, `scripts/llamacpp_logits/`, `scripts/agree_cmp.py` | Held-out windows, PyTorch and llama.cpp logit dumps, and the agreement report. |
+| `scripts/run_float_demo.sh` | The fixture demonstration. |
+| `tools/` | Export of the integer example networks. |
+| `paper/paper.tex` | The paper. |
 
 ## Related work
 
-- [Flocq](https://flocq.gitlabpages.inria.fr/) provides the IEEE-754
-  formalization this development computes in.
+- [Flocq](https://flocq.gitlabpages.inria.fr/) is the IEEE-754 formalization the
+  development computes in, and its double-rounding results are instantiated in
+  `Float_error.v`.
 - [CompCert's verified floating point](https://xavierleroy.org/publi/floating-point-compcert.pdf)
-  is the model for extracting Flocq arithmetic to a real executable, and for the
-  trusted native-float boundary in the native build.
+  is the model for extracting Flocq arithmetic and for the native float
+  boundary.
+- [CoqInterval](https://coqinterval.gitlabpages.inria.fr/) discharges the series
+  bounds.
+- [LAProof](https://github.com/VeriNum/LAProof) proves forward and mixed backward
+  error bounds for dot products and matrix-vector products.
 - [MLCert](https://github.com/OUPL/MLCert) certifies generalization bounds for
-  machine learning in Coq and extracts; its focus is bounds rather than a
-  transformer running real weights.
-- [verinncoq/converter](https://github.com/verinncoq/converter) verifies
-  properties of externally trained networks.
+  extracted machine-learning programs in Coq.
 - [Cheerios](https://github.com/uwplse/cheerios) is verified serialization for
   Coq.
 

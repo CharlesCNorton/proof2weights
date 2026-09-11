@@ -21,11 +21,11 @@ From Stdlib Require Import ExtrOcamlNatInt.
 Import ListNotations.
 Open Scope Z_scope.
 
-(** Fully inductive numerics: nat, positive, and Z all extract to their Coq
-    inductive datatypes, so every integer and float operation is the verbatim
-    extraction of its Coq definition. No native-int mappings, hence no
-    soundness side condition. ascii is destructured through a char matcher
-    (below) so it needs no native override. *)
+(** [positive] and [Z] extract to their inductive datatypes, so every integer
+    operation, and every float operation built on one, is the extraction of its
+    Coq definition. [nat] extracts to OCaml [int]; it carries only indices,
+    dimensions and token identifiers. [ascii] is destructured through a char
+    matcher (below). *)
 
 (** * Core Types *)
 
@@ -526,65 +526,91 @@ Definition f32_six : binary32 := f32_of_Z 6.
 Definition f32_twenty_four : binary32 := f32_of_Z 24.
 Definition f32_one_twenty : binary32 := f32_of_Z 120.
 Definition f32_seven_twenty : binary32 := f32_of_Z 720.
+Definition f32_five_thousand_forty : binary32 := f32_of_Z 5040.
 
-(** Float exp approximation via Taylor series: e^x ≈ 1 + x + x²/2! + ... + x⁶/6!
-    Clamped to [exp(-10), exp(10)] range to avoid overflow.
-    For sigmoid, inputs outside this range saturate to 0 or 1 anyway. *)
-Definition f32_exp_taylor (x : binary32) : binary32 :=
-  let x2 := f32_mult x x in
-  let x3 := f32_mult x2 x in
-  let x4 := f32_mult x3 x in
-  let x5 := f32_mult x4 x in
-  let x6 := f32_mult x5 x in
-  let term0 := f32_one in
-  let term1 := x in
-  let term2 := f32_div x2 f32_two in
-  let term3 := f32_div x3 f32_six in
-  let term4 := f32_div x4 f32_twenty_four in
-  let term5 := f32_div x5 f32_one_twenty in
-  let term6 := f32_div x6 f32_seven_twenty in
-  f32_plus (f32_plus (f32_plus (f32_plus (f32_plus (f32_plus term0 term1) term2) term3) term4) term5) term6.
+(** ** Rounding to the nearest integer
 
-(** Clamped exp: for large positive x return a large value, for large negative x return ~0.
-    The clamp thresholds ±10 keep Taylor accurate and prevent overflow. *)
-Definition f32_ten : binary32 := f32_of_Z 10.
-Definition f32_neg_ten : binary32 := f32_of_Z (-10).
-Definition f32_exp_large : binary32 := f32_of_Z 22026. (* ~e^10, close enough for saturation *)
-Definition f32_exp_small : binary32 := f32_of_Z 0. (* e^(-large) ≈ 0, but we use a tiny value *)
+    [f32_magic] is [1.5 * 2^23]. For [|y| < 2^22] the sum [y + f32_magic] lies
+    in [[2^23, 2^24)], where the unit in the last place is one, so rounding the
+    sum and subtracting the constant again yields the nearest integer to [y]
+    for arguments of either sign. *)
+Definition f32_magic : binary32 := f32_of_Z 12582912.
 
-(** Range-reduced exponential: exp(x) = exp(x/256)^256. The input is saturated
-    to [-88, 88] (the binary32 exponential range), divided by 256 so the
-    argument lands in [-0.35, 0.35] where a 6-term Taylor series is accurate,
-    then squared 8 times. Sound over the whole range, no overflow to NaN. *)
+Definition f32_round_int (y : binary32) : binary32 :=
+  f32_minus (f32_plus y f32_magic) f32_magic.
+
+(** ** Powers of two
+
+    [f32_pow2 k] is [2^k] for a [k] holding an integer in [[-127, 127]],
+    assembled from the binary expansion of [|k|]. Every intermediate is a power
+    of two, so every multiplication and the final division are exact. *)
+Definition f32_p4 : binary32 := f32_mult f32_two f32_two.
+Definition f32_p16 : binary32 := f32_mult f32_p4 f32_p4.
+Definition f32_p256 : binary32 := f32_mult f32_p16 f32_p16.
+Definition f32_p65536 : binary32 := f32_mult f32_p256 f32_p256.
+Definition f32_p2_32 : binary32 := f32_mult f32_p65536 f32_p65536.
+Definition f32_p2_64 : binary32 := f32_mult f32_p2_32 f32_p2_32.
+
+Definition f32_pow2_step (c p : binary32) (st : binary32 * binary32)
+  : binary32 * binary32 :=
+  let (a, acc) := st in
+  if f32_le c a then (f32_minus a c, f32_mult acc p) else (a, acc).
+
+Definition f32_pow2_nat (a : binary32) : binary32 :=
+  snd (f32_pow2_step f32_one f32_two
+      (f32_pow2_step f32_two f32_p4
+      (f32_pow2_step (f32_of_Z 4) f32_p16
+      (f32_pow2_step (f32_of_Z 8) f32_p256
+      (f32_pow2_step (f32_of_Z 16) f32_p65536
+      (f32_pow2_step (f32_of_Z 32) f32_p2_32
+      (f32_pow2_step (f32_of_Z 64) f32_p2_64 (a, f32_one)))))))).
+
+Definition f32_pow2 (k : binary32) : binary32 :=
+  if f32_lt k f32_zero then f32_div f32_one (f32_pow2_nat (f32_neg k))
+  else f32_pow2_nat k.
+
+(** ** The exponential
+
+    The input is saturated to [[-88, 88]], the binary32 exponential range, and
+    written as [x = k log 2 + r] with [k] the nearest integer to [x / log 2],
+    so that [|r|] is at most about [log 2 / 2]. The Taylor polynomial of
+    degree seven evaluates [exp r], and multiplying by [2^k] restores the
+    scale. The
+    constants are quotients whose numerators have at most twenty-four
+    significant bits over power-of-two denominators, so each is exact. [log 2]
+    is split Cody-Waite style: [f32_ln2_hi] is [355/512], nine significant
+    bits, so [k * f32_ln2_hi] is exact for every [k] the reduction produces, and
+    [f32_ln2_hi - f32_ln2_lo] lies within [2e-12] of [log 2]. *)
 Definition f32_exp_hi : binary32 := f32_of_Z 88.
 Definition f32_exp_lo : binary32 := f32_of_Z (-88).
-Definition f32_exp_div : binary32 := f32_of_Z 256.
+Definition f32_ln2_hi : binary32 := f32_div (f32_of_Z 355) (f32_of_Z 512).
+Definition f32_ln2_lo : binary32 :=
+  f32_div (f32_of_Z 14581891) (f32_of_Z 68719476736).
+Definition f32_inv_ln2 : binary32 := f32_div (f32_of_Z 12102203) (f32_of_Z 8388608).
+
+Definition f32_exp_k (xc : binary32) : binary32 :=
+  f32_round_int (f32_mult xc f32_inv_ln2).
 
 Definition f32_exp_approx (x : binary32) : binary32 :=
   let xc := if f32_lt f32_exp_hi x then f32_exp_hi
             else if f32_lt x f32_exp_lo then f32_exp_lo else x in
-  let r := f32_div xc f32_exp_div in
+  let k := f32_exp_k xc in
+  let r := f32_plus (f32_minus xc (f32_mult k f32_ln2_hi)) (f32_mult k f32_ln2_lo) in
   let r2 := f32_mult r r in
   let r3 := f32_mult r2 r in
   let r4 := f32_mult r3 r in
   let r5 := f32_mult r4 r in
   let r6 := f32_mult r5 r in
+  let r7 := f32_mult r6 r in
   let s := f32_plus f32_one
             (f32_plus r
               (f32_plus (f32_div r2 f32_two)
                 (f32_plus (f32_div r3 f32_six)
                   (f32_plus (f32_div r4 f32_twenty_four)
                     (f32_plus (f32_div r5 f32_one_twenty)
-                              (f32_div r6 f32_seven_twenty)))))) in
-  let s := f32_mult s s in
-  let s := f32_mult s s in
-  let s := f32_mult s s in
-  let s := f32_mult s s in
-  let s := f32_mult s s in
-  let s := f32_mult s s in
-  let s := f32_mult s s in
-  let s := f32_mult s s in
-  s.
+                      (f32_plus (f32_div r6 f32_seven_twenty)
+                                (f32_div r7 f32_five_thousand_forty))))))) in
+  f32_mult s (f32_pow2 k).
 
 (** Float sigmoid: σ(x) = 1 / (1 + exp(-x)) *)
 Definition f32_sigmoid (x : binary32) : binary32 :=
@@ -674,24 +700,31 @@ Proof.
   intros m. unfold f32_softmax_2d. apply List.length_map.
 Qed.
 
-(** ** Float GELU *)
+(** ** Float tanh and GELU *)
 
-(** Float GELU approximation: GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x³)))
-    We use the simpler approximation: GELU(x) ≈ x * σ(1.702 * x)
-    which is commonly used and avoids tanh entirely. *)
+(** Float tanh via sigmoid: tanh(x) = 2σ(2x) - 1. *)
+Definition f32_tanh (x : binary32) : binary32 :=
+  let two_x := f32_mult f32_two x in
+  let sig := f32_sigmoid two_x in
+  f32_minus (f32_mult f32_two sig) f32_one.
 
-Definition f32_gelu_coeff : binary32 := f32_of_Z 1702.
-Definition f32_gelu_scale : binary32 := f32_of_Z 1000.
 Definition f32_half_num : binary32 := f32_of_Z 1.
 Definition f32_half_den : binary32 := f32_of_Z 2.
 Definition f32_half : binary32 := f32_div f32_half_num f32_half_den.
 
-(** GELU via sigmoid approximation: GELU(x) ≈ x * σ(1.702x).
-    The coefficient 1.702 is stored as 1702/1000. *)
+(** The two GELU constants, [sqrt (2/pi)] and [0.044715], as quotients of
+    integers. *)
+Definition f32_gelu_c1 : binary32 :=
+  f32_div (f32_of_Z 7978845608) (f32_of_Z 10000000000).
+Definition f32_gelu_c2 : binary32 :=
+  f32_div (f32_of_Z 44715) (f32_of_Z 1000000).
+
+(** GELU in the form GPT-2 is trained with:
+    [0.5 * x * (1 + tanh (sqrt (2/pi) * (x + 0.044715 * x^3)))]. *)
 Definition f32_gelu (x : binary32) : binary32 :=
-  let coeff_x := f32_mult (f32_div f32_gelu_coeff f32_gelu_scale) x in
-  let sig := f32_sigmoid coeff_x in
-  f32_mult x sig.
+  let x3 := f32_mult x (f32_mult x x) in
+  let inner := f32_mult f32_gelu_c1 (f32_plus x (f32_mult f32_gelu_c2 x3)) in
+  f32_mult (f32_mult f32_half x) (f32_plus f32_one (f32_tanh inner)).
 
 (** GELU applied to a vector. *)
 Definition f32_gelu_vec (v : list binary32) : list binary32 :=
@@ -703,12 +736,6 @@ Lemma f32_gelu_vec_length : forall v,
 Proof.
   intros v. unfold f32_gelu_vec. apply List.length_map.
 Qed.
-
-(** Float tanh via sigmoid: tanh(x) = 2σ(2x) - 1. *)
-Definition f32_tanh (x : binary32) : binary32 :=
-  let two_x := f32_mult f32_two x in
-  let sig := f32_sigmoid two_x in
-  f32_minus (f32_mult f32_two sig) f32_one.
 
 (** Tanh applied to a vector. *)
 Definition f32_tanh_vec (v : list binary32) : list binary32 :=
@@ -882,10 +909,8 @@ Qed.
 
 (** ** Softmax output range
 
-    The integer softmax normalizes with truncating division, so its entries do
-    not sum to exactly [scale_factor]; that stronger reading is false. What
-    holds, and is what treating the output as a distribution actually needs, is
-    that every entry lies in [0, scale_factor]. *)
+    The integer softmax normalizes with truncating division. Every entry lies
+    in [0, scale_factor]. *)
 
 Lemma quadratic_bound : forall x, x * x + 2000 * x + 1998000 >= 0.
 Proof.
@@ -3761,9 +3786,6 @@ Proof.
   reflexivity.
 Qed.
 
-(** Token selection is a total function of the logits and the method, so it is
-    deterministic by construction; there is no content to state as a lemma. *)
-
 Lemma gpt2_firstn_app_exact : forall {A : Type} (l1 l2 : list A),
   List.firstn (List.length l1) (l1 ++ l2) = l1.
 Proof.
@@ -3820,11 +3842,9 @@ Qed.
 
 (** * Float GPT-2: Linear Algebra and LayerNorm
 
-    The Flocq f32 activations exist but are not assembled into a forward
-    pass. This section builds the float linear-algebra layer
-    and an IEEE-754 layer normalization on top of f32_dot / f32_sqrt, so the
-    GPT-2 block can be rebuilt in true float semantics rather than the
-    integer fixed-point approximation. *)
+    The float linear-algebra layer and an IEEE-754 layer normalization on top
+    of f32_dot and f32_sqrt, from which the GPT-2 block is assembled in
+    binary32. *)
 
 (** Float square root via Flocq, round-to-nearest-even. *)
 Definition f32_sqrt (x : binary32) : binary32 :=
@@ -3962,38 +3982,29 @@ Definition f32_concat_heads (heads : list (list (list binary32))) : list (list b
       ) (List.seq 0 (List.length first_head))
   end.
 
-(** Causal mask in float: 0 on/below the diagonal, large negative above. *)
+(** The value [f32_argmax] starts its search from. *)
 Definition f32_mask_neg : binary32 := f32_of_Z (-1000000000).
 
-Definition f32_causal_mask_entry (row col : nat) : binary32 :=
-  if Nat.leb col row then f32_zero else f32_mask_neg.
+(** The factor [1 / sqrt d_k] attention scores are scaled by. *)
+Definition f32_attn_scale (d_k : nat) : binary32 :=
+  f32_div f32_one (f32_sqrt (f32_of_Z (Z.of_nat d_k))).
 
-Definition f32_causal_mask (seq_len : nat) : list (list binary32) :=
-  List.map (fun row => List.map (fun col => f32_causal_mask_entry row col) (List.seq 0 seq_len))
-           (List.seq 0 seq_len).
+(** One query attending over key and value rows: scaled dot-product scores, a
+    softmax over them, and the weighted sum of the value rows, taken column by
+    column. *)
+Definition f32_attend (qrow : list binary32) (ks vs : list (list binary32))
+                      (d_k : nat) : list binary32 :=
+  let scores := List.map (fun kj => f32_mult (f32_dot qrow kj) (f32_attn_scale d_k)) ks in
+  let w := f32_softmax scores in
+  List.map (fun vcol => f32_dot w vcol) (f32_mat_transpose vs).
 
-Lemma f32_causal_mask_length : forall seq_len,
-  List.length (f32_causal_mask seq_len) = seq_len.
-Proof.
-  intros seq_len. unfold f32_causal_mask.
-  rewrite List.length_map, List.length_seq. reflexivity.
-Qed.
-
-(** Scale scores by 1/sqrt(d_k). *)
-Definition f32_scale_scores (scores : list (list binary32)) (d_k : nat) : list (list binary32) :=
-  let s := f32_div f32_one (f32_sqrt (f32_of_Z (Z.of_nat d_k))) in
-  List.map (fun row => List.map (fun x => f32_mult x s) row) scores.
-
-Definition f32_apply_mask (scores mask : list (list binary32)) : list (list binary32) :=
-  List.map (fun '(s_row, m_row) =>
-    List.map (fun '(s, m) => f32_plus s m) (List.combine s_row m_row)
-  ) (List.combine scores mask).
-
-(** Float causal scaled-dot-product attention. *)
+(** Float causal scaled-dot-product attention. Row [i] attends its query over
+    the first [i + 1] key and value rows, so a later position carries no weight
+    in an earlier row. *)
 Definition f32_causal_attention (q k v : list (list binary32)) (d_k : nat) : list (list binary32) :=
-  let scores := f32_scale_scores (f32_mat_mul q (f32_mat_transpose k)) d_k in
-  let masked := f32_apply_mask scores (f32_causal_mask (f32_mat_rows q)) in
-  f32_mat_mul (f32_softmax_2d masked) v.
+  List.map (fun p => let '(i, qrow) := p in
+              f32_attend qrow (List.firstn (S i) k) (List.firstn (S i) v) d_k)
+           (List.combine (List.seq 0 (List.length q)) q).
 
 (** Multi-head causal self-attention forward (GPT-2 c_attn / c_proj). *)
 Definition f32_attention_forward (n_embd n_head : nat)
@@ -4159,27 +4170,12 @@ Lemma f32_softmax_2d_rows : forall m,
   f32_mat_rows (f32_softmax_2d m) = f32_mat_rows m.
 Proof. intros m. unfold f32_softmax_2d, f32_mat_rows. apply List.length_map. Qed.
 
-Lemma f32_scale_scores_rows : forall s d,
-  f32_mat_rows (f32_scale_scores s d) = f32_mat_rows s.
-Proof. intros s d. unfold f32_scale_scores, f32_mat_rows. apply List.length_map. Qed.
-
-Lemma f32_apply_mask_rows : forall scores mask,
-  f32_mat_rows scores = f32_mat_rows mask ->
-  f32_mat_rows (f32_apply_mask scores mask) = f32_mat_rows scores.
-Proof.
-  intros scores mask H. unfold f32_apply_mask, f32_mat_rows in *.
-  rewrite List.length_map, List.length_combine, H. apply Nat.min_id.
-Qed.
-
 Lemma f32_causal_attention_rows : forall q k v d,
   f32_mat_rows (f32_causal_attention q k v d) = f32_mat_rows q.
 Proof.
-  intros q k v d. unfold f32_causal_attention.
-  rewrite f32_mat_mul_rows, f32_softmax_2d_rows.
-  rewrite f32_apply_mask_rows.
-  - rewrite f32_scale_scores_rows, f32_mat_mul_rows. reflexivity.
-  - rewrite f32_scale_scores_rows, f32_mat_mul_rows.
-    unfold f32_mat_rows. rewrite f32_causal_mask_length. reflexivity.
+  intros q k v d. unfold f32_causal_attention, f32_mat_rows.
+  rewrite List.length_map, List.length_combine, List.length_seq, Nat.min_id.
+  reflexivity.
 Qed.
 
 (** Head split/concat row lemmas, for the full attention shape proof. *)
@@ -4739,10 +4735,6 @@ Proof.
   specialize (H x Hx). unfold f32_finite in H. exact H.
 Qed.
 
-(** The forward pass is a pure function of its arguments, so determinism is
-    definitional rather than a theorem. The substantive guarantees about it are
-    [f32_gpt2_forward_rows] above and [f32_output_clean_sound] here. *)
-
 (** Certified-clean forward output: the boolean check over the forward pass. *)
 Definition f32_gpt2_certified_forward (cfg : gpt2_inference_config) (eps : binary32)
                                       (model : f32_model_weights) (toks : list nat) : bool :=
@@ -4839,12 +4831,12 @@ Extraction "phases1_15_complete.ml"
   f32_vec_add f32_vec_mult f32_vec_scale f32_dot f32_mat_vec_mul
   (* Float sigmoid *)
   f32_one f32_of_Z f32_two f32_six f32_twenty_four f32_one_twenty f32_seven_twenty
-  f32_exp_taylor f32_ten f32_neg_ten f32_exp_large f32_exp_small f32_exp_approx
+  f32_five_thousand_forty f32_magic f32_round_int f32_pow2 f32_exp_k f32_exp_approx
   f32_sigmoid f32_sigmoid_vec f32_sigmoid_in_unit_interval
   (* Float softmax *)
   f32_exp_vec f32_sum f32_max_vec f32_softmax f32_softmax_2d
   (* Float GELU *)
-  f32_gelu_coeff f32_gelu_scale f32_half f32_gelu f32_gelu_vec
+  f32_half f32_gelu_c1 f32_gelu_c2 f32_gelu f32_gelu_vec
   f32_tanh f32_tanh_vec f32_relu f32_relu_vec
   dtype DT_I32 DT_I8 DT_F32 DT_F16 DT_BF16 dtype_size
   tensor_data TD_Int TD_Float32 TD_Float16 TD_BFloat16
@@ -5051,7 +5043,7 @@ Extraction "phases1_15_complete.ml"
   f32_mean f32_variance f32_layer_norm_vec f32_layer_norm_2d
   f32_linear_forward f32_linear_forward_2d f32_add_matrices
   f32_split_row_into_heads f32_split_into_heads f32_concat_heads
-  f32_mask_neg f32_causal_mask_entry f32_causal_mask f32_scale_scores f32_apply_mask
+  f32_mask_neg f32_attn_scale f32_attend
   f32_causal_attention f32_attention_forward f32_mlp_forward
   f32_attention_weights mk_f32_attention_weights
   f32_attn_c_attn_weight f32_attn_c_attn_bias f32_attn_c_proj_weight f32_attn_c_proj_bias

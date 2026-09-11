@@ -1,7 +1,7 @@
 """Fetch real GPT-2 (124M), re-save its base weights as an f32 safetensors with
-the exact tensor names the Coq loader builds, and confirm with the torch
-reference that greedy decoding reproduces the brown-fox pangram. The torch
-continuation is the oracle the verified extracted forward must match."""
+the exact tensor names the Coq loader builds, and print the torch reference's
+greedy continuation of two prompts. The torch prediction is the oracle the
+verified extracted forward is compared with."""
 import os, json
 import torch
 from transformers import GPT2LMHeadModel, GPT2TokenizerFast
@@ -46,8 +46,8 @@ for prompt in ["The quick brown", "The quick brown fox jumps over the lazy"]:
     print(f"  greedy next 5: {steps}")
     print(f"  -> {full!r}")
 
-# Pin the single-step target for the verified runner: prompt "The quick brown",
-# expected next token " fox".
+# Pin the single-step prompt for the verified runner, "The quick brown", whose
+# highest-scoring next token in the reference is "ie".
 ids = tok.encode("The quick brown")
 with open(IDS, "w") as f:
     json.dump({"prompt": "The quick brown", "ids": ids,
