@@ -637,6 +637,17 @@ Proof.
     + unfold LNF, f32_layer_norm_2d. apply causal_map.
 Qed.
 
+Lemma causal_gpt2_logits : forall cfg eps model,
+  (0 < gpt2_inf_n_head cfg)%nat -> causal (f32_gpt2_logits cfg eps model).
+Proof.
+  intros cfg eps model Hnh.
+  apply (causal_ext (fun toks => List.map (fun h_row =>
+                       List.map (fun w_row => f32_dot h_row w_row) (f32_wte model))
+                       (f32_gpt2_forward cfg eps model toks))); [reflexivity|].
+  apply (causal_comp (f32_gpt2_forward cfg eps model));
+    [apply causal_gpt2_forward; exact Hnh | apply causal_map].
+Qed.
+
 (** Running GPT-2 on an extended token sequence reproduces every logit row it
     computes for the original sequence. *)
 Corollary gpt2_logits_prefix : forall cfg eps model toks1 toks2,
@@ -645,11 +656,75 @@ Corollary gpt2_logits_prefix : forall cfg eps model toks1 toks2,
   = f32_gpt2_logits cfg eps model toks1.
 Proof.
   intros cfg eps model toks1 toks2 Hnh.
-  assert (H : causal (f32_gpt2_logits cfg eps model)).
-  { apply (causal_ext (fun toks => List.map (fun h_row =>
-                         List.map (fun w_row => f32_dot h_row w_row) (f32_wte model))
-                         (f32_gpt2_forward cfg eps model toks))); [reflexivity|].
-    apply (causal_comp (f32_gpt2_forward cfg eps model));
-      [apply causal_gpt2_forward; exact Hnh | apply causal_map]. }
-  apply (proj2 H).
+  apply (proj2 (causal_gpt2_logits cfg eps model Hnh)).
+Qed.
+
+(** * Decoding one token at a time
+
+    A decoder does not evaluate the sequence function on the whole sequence. It
+    takes one step per token and keeps the last row of each, which is the row it
+    emits. [decode_stream] is that decoder written over any sequence function,
+    and the theorem below is that its output is the one the whole-sequence
+    evaluation produces, row for row. Causality is what the proof runs on. *)
+
+Definition decode_stream {A B : Type} (F : list A -> list B) (d : B)
+                         (xs : list A) : list B :=
+  List.map (fun i => List.last (F (List.firstn (S i) xs)) d)
+           (List.seq 0 (List.length xs)).
+
+Lemma last_nth : forall {A : Type} (l : list A) (d : A),
+  List.last l d = List.nth (List.length l - 1) l d.
+Proof.
+  intros A l d. induction l as [|x l IH]; [reflexivity|].
+  destruct l as [|y l']; [reflexivity|].
+  change (List.last (x :: y :: l') d) with (List.last (y :: l') d).
+  rewrite IH. cbn [List.length]. rewrite !Nat.sub_succ, !Nat.sub_0_r.
+  reflexivity.
+Qed.
+
+Theorem decode_stream_correct : forall {A B : Type} (F : list A -> list B) d xs,
+  causal F -> decode_stream F d xs = F xs.
+Proof.
+  intros A B F d xs HF. unfold decode_stream.
+  rewrite <- (map_nth_seq d (F xs)), (proj1 HF).
+  apply List.map_ext_in. intros i Hi.
+  apply List.in_seq in Hi. destruct Hi as [_ Hi]. cbn in Hi.
+  assert (Hlen : List.length (List.firstn (S i) xs) = S i)
+    by (rewrite List.length_firstn; lia).
+  rewrite last_nth, (proj1 HF), Hlen.
+  replace (S i - 1)%nat with i by lia.
+  rewrite <- (List.firstn_skipn (S i) xs) at 2.
+  rewrite (causal_nth F (List.firstn (S i) xs) (List.skipn (S i) xs) i d HF)
+    by (rewrite Hlen; lia).
+  reflexivity.
+Qed.
+
+(** One decode step per token, on each of the three models, produces the rows
+    a single evaluation of the whole sequence produces. *)
+
+Corollary gpt2_decode_step : forall cfg eps model toks d,
+  (0 < gpt2_inf_n_head cfg)%nat ->
+  decode_stream (f32_gpt2_logits cfg eps model) d toks
+  = f32_gpt2_logits cfg eps model toks.
+Proof.
+  intros cfg eps model toks d Hnh.
+  apply decode_stream_correct, causal_gpt2_logits, Hnh.
+Qed.
+
+Corollary llama_decode_step : forall eps normw fs emb ids d,
+  List.Forall causal fs ->
+  decode_stream (f32_llama_forward eps normw fs emb) d ids
+  = f32_llama_forward eps normw fs emb ids.
+Proof.
+  intros eps normw fs emb ids d Hfs.
+  apply decode_stream_correct, causal_llama_forward, Hfs.
+Qed.
+
+Corollary qwen_decode_step : forall eps normw fs emb ids d,
+  List.Forall causal fs ->
+  decode_stream (f32_qwen_forward eps normw fs emb) d ids
+  = f32_qwen_forward eps normw fs emb ids.
+Proof.
+  intros eps normw fs emb ids d Hfs.
+  apply decode_stream_correct, causal_qwen_forward, Hfs.
 Qed.

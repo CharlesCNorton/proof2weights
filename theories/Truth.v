@@ -800,55 +800,117 @@ Proof.
   eapply Rle_trans; [apply (abs_split _ (ln (1 + a))) | lra].
 Qed.
 
-(** An exponential near zero, from [1 + w <= exp w] alone. *)
-Lemma exp_sub_one_le : forall w : R,
-  Rabs w <= / 4 -> Rabs (exp w - 1) <= 2 * Rabs w.
+(** ** Lipschitz constants for the sigmoid and the hyperbolic tangent
+
+    The constants below are [1/4] and [1], which the derivatives give, and they
+    hold on the whole line. The route is the comparison function
+    [logit_gap t = ln t - ln (1 - t) - 4 t], whose derivative
+    [1/(t (1 - t)) - 4] is nonnegative because [t (1 - t) <= 1/4]; the mean
+    value theorem makes it monotone, and [logit (sigmoid u) = u] turns
+    monotonicity into the bound. *)
+
+Definition logit_gap (t : R) : R := ln t - ln (1 - t) - 4 * t.
+
+Lemma logit_gap_deriv : forall c : R, 0 < c -> c < 1 ->
+  derivable_pt_lim logit_gap c (/ c + / (1 - c) - 4).
 Proof.
-  intros w Hw.
-  pose proof (exp_ineq1_le w) as H1.
-  pose proof (exp_ineq1_le (- w)) as H2.
-  pose proof (exp_pos w) as Hp.
-  rewrite exp_Ropp in H2.
-  assert (H3 : exp w * (1 + - w) <= 1).
-  { apply (Rmult_le_compat_l (exp w)) in H2; [|lra].
-    rewrite Rinv_r in H2 by (apply Rgt_not_eq; exact Hp). exact H2. }
-  apply Rabs_le_inv in Hw.
-  destruct (Rle_or_lt 0 w) as [Hw0|Hw0].
-  - rewrite (Rabs_pos_eq w) by exact Hw0.
-    assert (He : exp w <= 2) by nra.
-    apply Rabs_le. split; nra.
-  - rewrite (Rabs_left w) by exact Hw0.
-    assert (He : exp w <= 1) by nra.
-    apply Rabs_le. split; nra.
+  intros c H0 H1.
+  assert (Hsub : derivable_pt_lim (fun t : R => 1 - t) c (0 - 1)).
+  { apply (derivable_pt_lim_minus (fct_cte 1) id c 0 1).
+    - apply derivable_pt_lim_const.
+    - apply derivable_pt_lim_id. }
+  assert (Hlnc : derivable_pt_lim (fun t : R => ln (1 - t)) c (/ (1 - c) * (0 - 1))).
+  { apply (derivable_pt_lim_comp (fun t : R => 1 - t) ln c (0 - 1) (/ (1 - c))).
+    - exact Hsub.
+    - apply derivable_pt_lim_ln. lra. }
+  assert (Hlin : derivable_pt_lim (fun t : R => 4 * t) c (4 * 1)).
+  { apply (derivable_pt_lim_scal id 4 c 1). apply derivable_pt_lim_id. }
+  assert (Hdiff : derivable_pt_lim (fun t : R => ln t - ln (1 - t)) c
+                    (/ c - / (1 - c) * (0 - 1))).
+  { apply (derivable_pt_lim_minus ln (fun t : R => ln (1 - t)) c
+             (/ c) (/ (1 - c) * (0 - 1))).
+    - apply derivable_pt_lim_ln; exact H0.
+    - exact Hlnc. }
+  unfold logit_gap.
+  replace (/ c + / (1 - c) - 4)
+    with (/ c - / (1 - c) * (0 - 1) - 4 * 1) by ring.
+  apply (derivable_pt_lim_minus (fun t : R => ln t - ln (1 - t))
+           (fun t : R => 4 * t) c (/ c - / (1 - c) * (0 - 1)) (4 * 1)).
+  - exact Hdiff.
+  - exact Hlin.
+Qed.
+
+Lemma logit_gap_mono : forall y x : R,
+  0 < y -> y <= x -> x < 1 -> logit_gap y <= logit_gap x.
+Proof.
+  intros y x Hy Hyx Hx.
+  destruct (Rtotal_order y x) as [Hlt | [Heq | Hgt]];
+    [| rewrite Heq; apply Rle_refl | lra].
+  assert (Hder : forall c : R, y <= c <= x ->
+                 derivable_pt_lim logit_gap c ((fun t : R => / t + / (1 - t) - 4) c)).
+  { intros c Hc. simpl. apply logit_gap_deriv; lra. }
+  destruct (MVT_cor2 logit_gap (fun t : R => / t + / (1 - t) - 4) y x Hlt Hder)
+    as [c [Hc [Hc1 Hc2]]].
+  assert (Hcc : 0 < c * (1 - c)) by nra.
+  assert (Hq : c * (1 - c) <= / 4).
+  { assert (Hsq : 0 <= (1 - 2 * c) * (1 - 2 * c))
+      by (pose proof (Rle_0_sqr (1 - 2 * c)) as Hs; unfold Rsqr in Hs; exact Hs).
+    nra. }
+  assert (Hinv : 4 <= / (c * (1 - c))).
+  { replace 4 with (/ / 4) by (rewrite Rinv_inv; reflexivity).
+    apply Rinv_le_contravar; assumption. }
+  assert (Hsum : / c + / (1 - c) = / (c * (1 - c))) by (field; lra).
+  assert (Hpos : 0 <= / c + / (1 - c) - 4) by (rewrite Hsum; lra).
+  assert (Hstep : 0 <= (/ c + / (1 - c) - 4) * (x - y))
+    by (apply Rmult_le_pos; lra).
+  lra.
+Qed.
+
+Lemma sigmoid_pos : forall u : R, 0 < sigmoid u < 1.
+Proof.
+  intros u. pose proof (exp_pos (- u)) as Ha. unfold sigmoid.
+  split.
+  - apply Rdiv_lt_0_compat; lra.
+  - apply (Rmult_lt_reg_r (1 + exp (- u))); [lra|].
+    unfold Rdiv. rewrite Rmult_assoc, Rinv_l, Rmult_1_r by lra. lra.
+Qed.
+
+Lemma sigmoid_logit : forall u : R, ln (sigmoid u) - ln (1 - sigmoid u) = u.
+Proof.
+  intros u. pose proof (exp_pos (- u)) as Ha.
+  destruct (sigmoid_pos u) as [Hp _].
+  assert (Hne : 1 + exp (- u) <> 0) by (apply Rgt_not_eq; lra).
+  assert (H1 : 1 - sigmoid u = sigmoid u * exp (- u))
+    by (unfold sigmoid; field; exact Hne).
+  rewrite H1, ln_mult by (assumption || apply exp_pos).
+  rewrite ln_exp. ring.
 Qed.
 
 Lemma sigmoid_close : forall u v : R,
-  Rabs (u - v) <= / 8 -> Rabs (sigmoid u - sigmoid v) <= 2 * Rabs (u - v).
+  Rabs (sigmoid u - sigmoid v) <= / 4 * Rabs (u - v).
 Proof.
-  intros u v Huv. unfold sigmoid.
-  pose proof (Rabs_pos (u - v)) as H0.
-  apply recip_one_plus; [apply exp_pos | lra |].
-  assert (He : exp (- u) = exp (- v) * exp (v - u))
-    by (rewrite <- exp_plus; f_equal; ring).
-  rewrite He.
-  replace (exp (- v) * exp (v - u) - exp (- v)) with (exp (- v) * (exp (v - u) - 1))
-    by ring.
-  rewrite Rabs_mult, (Rabs_pos_eq (exp (- v))) by (left; apply exp_pos).
-  apply Rmult_le_compat_l; [left; apply exp_pos|].
-  rewrite (Rabs_minus_sym u v). apply exp_sub_one_le.
-  rewrite <- (Rabs_minus_sym u v). lra.
+  intros u v.
+  destruct (sigmoid_pos u) as [Hu0 Hu1]. destruct (sigmoid_pos v) as [Hv0 Hv1].
+  destruct (Rle_or_lt (sigmoid v) (sigmoid u)) as [Hle | Hlt].
+  - pose proof (logit_gap_mono (sigmoid v) (sigmoid u) Hv0 Hle Hu1) as Hm.
+    unfold logit_gap in Hm. rewrite (sigmoid_logit u), (sigmoid_logit v) in Hm.
+    rewrite (Rabs_pos_eq (sigmoid u - sigmoid v)) by lra.
+    rewrite (Rabs_pos_eq (u - v)) by lra. lra.
+  - pose proof (logit_gap_mono (sigmoid u) (sigmoid v) Hu0 (Rlt_le _ _ Hlt) Hv1) as Hm.
+    unfold logit_gap in Hm. rewrite (sigmoid_logit u), (sigmoid_logit v) in Hm.
+    rewrite (Rabs_left (sigmoid u - sigmoid v)) by lra.
+    rewrite (Rabs_left (u - v)) by lra. lra.
 Qed.
 
-Lemma tanh_close : forall s t : R,
-  Rabs (s - t) <= / 16 -> Rabs (tanh s - tanh t) <= 8 * Rabs (s - t).
+Lemma tanh_close : forall s t : R, Rabs (tanh s - tanh t) <= Rabs (s - t).
 Proof.
-  intros s t H. rewrite !tanh_as_sigmoid.
+  intros s t. rewrite !tanh_as_sigmoid.
   replace (2 * sigmoid (2 * s) - 1 - (2 * sigmoid (2 * t) - 1))
     with (2 * (sigmoid (2 * s) - sigmoid (2 * t))) by ring.
   assert (H2 : Rabs (2 * s - 2 * t) = 2 * Rabs (s - t)).
   { replace (2 * s - 2 * t) with (2 * (s - t)) by ring.
     rewrite Rabs_mult, (Rabs_pos_eq 2) by lra. reflexivity. }
-  pose proof (sigmoid_close (2 * s) (2 * t) ltac:(rewrite H2; lra)) as Hs.
+  pose proof (sigmoid_close (2 * s) (2 * t)) as Hs.
   rewrite H2 in Hs. rewrite Rabs_mult, (Rabs_pos_eq 2) by lra. lra.
 Qed.
 
@@ -922,7 +984,7 @@ Proof.
 Qed.
 
 Theorem gelu_vs_true : forall rx : R,
-  -8 <= rx <= 8 -> Rabs (Rgelu rx - gelu rx) <= 5 / 100000.
+  -8 <= rx <= 8 -> Rabs (Rgelu rx - gelu rx) <= 6 / 1000000.
 Proof.
   intros rx Hr.
   assert (Hra : Rabs rx <= 8) by (apply Rabs_le; lra).
@@ -933,7 +995,7 @@ Proof.
   { apply Rabs_le_inv. unfold Rgelu_inner. rewrite B2R_gelu_c1, B2R_gelu_c2.
     rewrite Rabs_mult, (Rabs_pos_eq (6693141 / 8388608)) by lra. lra. }
   pose proof (tanh_vs_true (Rgelu_inner rx) Hsr) as Ht.
-  pose proof (tanh_close (Rgelu_inner rx) t ltac:(lra)) as Hc.
+  pose proof (tanh_close (Rgelu_inner rx) t) as Hc.
   unfold Rgelu, gelu. rewrite B2R_half. fold t.
   replace (1 / 2 * rx * (1 + Rtanh (Rgelu_inner rx)) - rx / 2 * (1 + tanh t))
     with (rx / 2 * ((Rtanh (Rgelu_inner rx) - tanh (Rgelu_inner rx))
@@ -943,9 +1005,9 @@ Proof.
   { unfold Rdiv. rewrite Rabs_mult, (Rabs_pos_eq (/ 2)) by lra. lra. }
   assert (Hsum : Rabs ((Rtanh (Rgelu_inner rx) - tanh (Rgelu_inner rx))
                        + (tanh (Rgelu_inner rx) - tanh t))
-                 <= 32 / 1000000000 + 8 * (14 / 10000000)).
+                 <= 32 / 1000000000 + 14 / 10000000).
   { eapply Rle_trans; [apply Rabs_triang | lra]. }
-  apply Rle_trans with (4 * (32 / 1000000000 + 8 * (14 / 10000000))); [|lra].
+  apply Rle_trans with (4 * (32 / 1000000000 + 14 / 10000000)); [|lra].
   apply Rmult_le_compat; try apply Rabs_pos; assumption.
 Qed.
 
@@ -1002,7 +1064,7 @@ Qed.
 Theorem ok_gelu_true : forall M m L k x rx,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) x rx -> gelu_reg M m x rx -> -8 <= rx <= 8 ->
-  Rabs (B2R (f32_gelu x) - gelu rx) <= errN M L (k + 33) + 5 / 100000.
+  Rabs (B2R (f32_gelu x) - gelu rx) <= errN M L (k + 33) + 6 / 1000000.
 Proof.
   intros M m L k x rx HM Hamp Hx Hreg Hr.
   destruct (ok_gelu M m L k x rx HM Hamp Hx Hreg) as [_ Hd].

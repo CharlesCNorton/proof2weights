@@ -11,7 +11,8 @@ logits within 7.3e-5 absolute. On SmolLM2 and Qwen3.5, greedy generation
 reproduces PyTorch's continuation token for token. Over 300 windows of held-out
 text per model, 4,800 next-token distributions each, PyTorch in float32 returns
 the extracted pass's top-1 token at every position, with every logit within
-1.6e-3.
+1.6e-3. That holds at longer windows too: at whole blocks of 64 tokens on all
+three models, at GPT-2's full 1024 positions, and at 2048 tokens on SmolLM2.
 
 The arithmetic executed at inference time is the arithmetic the proofs concern.
 The development proves that cached autoregressive decoding computes exactly the
@@ -140,13 +141,16 @@ composition is not; it is the one that decodes autoregressively, and the cache
 equalities of `Cache.v` are what cover it.
 
 The other (`gpt2_verified`, `llama_verified`, `qwen_verified`) does not write
-the loop. It reads the file, decodes each value with `f32_bytes_to_binary32`,
-builds the layer maps and calls `f32_gpt2_logits_pre`, `f32_llama_forward` or
-`f32_qwen_forward`, which are the definitions the proofs are about, extracted.
-What it still does natively is the file read, the offset lookup through the
-verified `json_tensor_offsets`, and the assembly of the weight records. It does
-not cache, so it recomputes the sequence at every step and is not the runner to
-generate with.
+the loop. It hands the extracted loader a fetch of one byte of the data section,
+and `f32_load_model_pre`, `f32_load_llama` or `f32_load_qwen` looks up each
+tensor's offset through `json_tensor_offsets`, decodes it and assembles the
+weight record; `f32_gpt2_logits_pre`, `f32_llama_logits_of` or
+`f32_qwen_logits_of` then runs the pass. `f32_load_model_pre_correct` proves the
+assembled record is the one `f32_load_model` defines, transposed, and
+`f32_load_llama_correct` and `f32_load_qwen_correct` say the same of the other two,
+field by field. What remains native is reading the file and answering the fetch.
+It does not cache, so it recomputes the sequence at every step and is not the
+runner to generate with.
 
 The two agree: on GPT-2 and SmolLM2 the ten highest logits of the stored prompt
 agree to every digit printed, and each verified runner reproduces its model's
@@ -269,7 +273,7 @@ is why `Series.v` states its truncation bounds on [-3.17, 3.17].
 The logarithm is within `2e-8` of `ln` on (1, 2] (`ok_log_true`), sigmoid
 within `1.6e-8` (`ok_sigmoid_true`), tanh within `3.2e-8` (`ok_tanh_true`),
 softplus within `4e-8` of `ln (1 + exp x)` (`ok_softplus_true`), GELU within
-`5e-5` of the tanh form on [-8, 8] (`ok_gelu_true`), and square root within
+`6e-6` of the tanh form on [-8, 8] (`ok_gelu_true`), and square root within
 half a ULP (`ok_sqrt_true`).
 
 Cached decoding. The gated delta scan decomposes at any split point into a
@@ -289,7 +293,11 @@ causality is closed under composition, zipping and stacking, so the three
 forward passes are causal (`causal_gpt2_forward`, `causal_llama_forward`,
 `causal_qwen_forward`): running a model on a longer sequence reproduces bit for
 bit every row it produced for the shorter one (`gpt2_logits_prefix`,
-`llama_forward_prefix`, `qwen_forward_prefix`).
+`llama_forward_prefix`, `qwen_forward_prefix`). Emitting the last row of each
+prefix, which is what a decoder does, therefore produces the rows one
+evaluation of the whole sequence produces (`decode_stream_correct`, and
+`gpt2_decode_step`, `llama_decode_step`, `qwen_decode_step` at the three
+models).
 
 Runners, generation and receipts. The GPT-2 runners decode each weight matrix
 directly in transposed order, and that decode equals `f32_mat_transpose` of the
@@ -427,11 +435,13 @@ difference, on SmolLM2 on the GPU, where the two highest extracted logits are
 
 ## Scope
 
-The agreement with PyTorch is measured, not proved; the development is itself
-the specification of what these models compute in binary32. The checkpoint
-runners compose the verified primitives in OCaml, reading bytes natively and
-streaming weights layer by layer. The transposed decode and the caches, which
-regroup the arithmetic, are proved to compute the values the definitions
+The development is the specification of what these models compute in binary32,
+and its agreement with PyTorch is a measurement. The cached checkpoint runners
+compose the verified primitives in OCaml, reading bytes natively and streaming
+weights layer by layer; the verified runners read the file and answer a byte
+fetch, and everything after that is extracted. The
+transposed decode and the caches, which regroup the arithmetic, are proved to
+compute the values the definitions
 compute; the rest of the composition is ordinary OCaml, checked by the fixture
 comparison above and by the inductive references, which call
 `f32_llama_forward` and `f32_qwen_forward` directly. The composed error bound
@@ -594,6 +604,16 @@ whose `ggml/src/ggml-cpu/vec.h` has no `#define GGML_GELU_FP16`, and on the GPU,
 `ggml_cuda_mul_mat` in `ggml/src/ggml-cuda/ggml-cuda.cu` has no
 `ggml_cuda_should_use_mmf` branch, all at llama.cpp commit 8172e65.
 
+The longer evaluations take the same commands with different window files.
+`agree_setup.py <model> <out> <T> <N> <P>` with `T` equal to `P` cuts whole
+blocks: `64 60 64` gives the sixty blocks of 64 tokens, `1024 3 1024` GPT-2's
+full position table and `2048 3 2048` SmolLM2's long windows. The bfloat16 rows
+read a GGUF converted with `--outtype bf16`, which llama.cpp computes from in
+float32, while `agree_torch.py` takes `bf16` as its last argument and computes
+in bfloat16 as well. Qwen3.5's fused row runs `agree_torch.py` from an
+environment with `flash-linear-attention` installed, which routes the gated
+delta rule through its Triton kernels.
+
 `scripts/run_float_demo.sh` builds the small float drivers and runs the fixture
 comparison against `scripts/tiny_gpt2_ref.py`. The integer export path has its
 own build: `make -C tools` writes the two example integer networks to
@@ -614,6 +634,7 @@ library.
 | `runners/*_verified.ml` | Each checkpoint through the extracted forward pass itself rather than a loop rebuilt around it. |
 | `scripts/verified_check.py` | Those runners against the stored PyTorch oracles. |
 | `scripts/exhaustive.c` | Every elementary function at every one of the 2^32 binary32 inputs. |
+| `scripts/settle_undecided.py` | The inputs the binary64 reference cannot decide, settled against a reference at 120 decimal digits. |
 | `theories/Narrow.v` | The widening and narrowing the native build performs, and the proof that narrowing the binary64 result of an operation on widened binary32 operands is the binary32 result, for every input, overflow and infinities and NaNs and signed zeros included. |
 | `runners/fp_selftest.ml` | The assumptions the native build makes about its host, decided on that host in thirty-three checks. |
 | `scripts/check.sh` | Runs the checks and prints the time each takes. |
@@ -628,9 +649,10 @@ library.
 | `theories/Annot.v`, `theories/AnnExp.v` | Annotated binary32 operations carrying a binary64 bound against real arithmetic, the exponential included. |
 | `theories/RunErr.v` | The GPT-2 forward pass over an abstract arithmetic, its binary32, real and annotated instances, and `gpt2_logits_bounded`. |
 | `theories/Cache.v`, `theories/Cache_attn.v` | Prefill and decode for the delta scan, the convolution window, and causal attention; transposition. |
-| `theories/Causal.v` | Causality of the three forward passes. |
+| `theories/Causal.v` | Causality of the three forward passes, and that one decode step per token produces the rows one evaluation of the whole sequence produces. |
 | `theories/Runner.v` | The transposed decode the checkpoint runners perform. |
 | `theories/Loader.v` | What a named load returns, the dtype check, and validation connected to the shape theorems. |
+| `theories/Loadpre.v` | The same load through a byte fetch rather than a list of bytes, and the proof that the record it assembles is the one `f32_load_model` defines. |
 | `theories/RoundChk.v` | Rounding to the nearest integer, checked by computation. |
 | `theories/Receipt.v` | Inference receipts, their checker, and what the checksum detects. |
 | `theories/Extract.v` | The native extraction of the GPT-2, Llama and Qwen3.5 targets and of the annotated GPT-2 forward pass. |
@@ -650,6 +672,7 @@ library.
 | `scripts/arch_ref.py`, `scripts/experiment_arch.py` | numpy mirrors of the Llama and Qwen3.5 forwards, and their sweep. |
 | `scripts/prim_check.py` | The elementary-function sweep. |
 | `scripts/run_bound_batch.sh`, `scripts/bound_cmp.py` | The annotated forward pass over the GPT-2 sweep, and its bounds against the actual error. |
+| `scripts/layer_gain.py` | The gain each linear layer applies to an absolute error on its input. |
 | `scripts/agree_setup.py`, `scripts/agree_torch.py`, `scripts/llamacpp_logits/`, `scripts/agree_cmp.py` | Held-out windows, PyTorch and llama.cpp logit dumps, and the agreement report. |
 | `scripts/run_float_demo.sh` | The fixture demonstration. |
 | `tools/` | Export of the integer example networks. |

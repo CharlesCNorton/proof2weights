@@ -12,10 +12,12 @@
  * the correctly rounded one. Because the reference is a binary64 libm value
  * rather than an infinitely precise one, an input whose true value lies within
  * a guard band of a binary32 midpoint cannot be decided from it; those are
- * counted separately and are the only inputs the sweep leaves open.
+ * counted separately, and scripts/settle_undecided.py decides them against a
+ * reference at 120 decimal digits.
  *
  *   gcc -O2 -fopenmp -o exhaustive exhaustive.c -lm
  *   ./exhaustive [function ...]
+ *   P2W_UNDECIDED=<dir> ./exhaustive        # also record the undecided inputs
  *
  * With no function named, every function is swept.
  */
@@ -28,6 +30,12 @@
 #ifdef _OPENMP
 #include <omp.h>
 #endif
+
+/* When P2W_UNDECIDED names a directory, each function's undecided inputs are
+   written there as <name>.u32, two little-endian words each, the input and the
+   result this file computed, so a higher precision reference can settle them
+   without repeating the composition. */
+static const char *undec_dir = NULL;
 
 static inline float fb(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
 static inline uint32_t bf(float f) { uint32_t u; memcpy(&u, &f, 4); return u; }
@@ -205,6 +213,7 @@ static double ulp32(double v) {
 
 int main(int argc, char **argv) {
   init_consts();
+  undec_dir = getenv("P2W_UNDECIDED");
   printf("%-9s %13s %12s %11s %11s %12s %10s\n",
          "function", "inputs", "max ulp", "max abs", "max rel",
          "not c.r.", "undecided");
@@ -221,6 +230,8 @@ int main(int argc, char **argv) {
 #pragma omp parallel reduction(+:n,bad,undec) reduction(max:wabs,wrel)
     {
       double tworst = 0.0; uint32_t tworst_in = 0;
+      uint32_t *ulist = NULL; long un = 0, ucap = 0;
+      if (undec_dir) { ucap = 1 << 21; ulist = malloc(ucap * sizeof(uint32_t)); }
 #pragma omp for schedule(static)
       for (long long i = 0; i <= 0xFFFFFFFFLL; i++) {
         uint32_t u = (uint32_t)i;
@@ -242,12 +253,27 @@ int main(int argc, char **argv) {
              decide the binary32 rounding */
           double frac = fabs(ref) / uu;
           double d = fabs(frac - floor(frac) - 0.5);
-          if (d < 1e-6) undec++; else bad++;
+          if (d < 1e-6) {
+            undec++;
+            if (ulist && un + 1 < ucap) {
+              ulist[un++] = u;
+              ulist[un++] = bf(got);
+            }
+          } else bad++;
         }
         if (err > tworst) { tworst = err; tworst_in = u; }
       }
 #pragma omp critical
-      { if (tworst > worst) { worst = tworst; worst_in = tworst_in; } }
+      {
+        if (tworst > worst) { worst = tworst; worst_in = tworst_in; }
+        if (ulist && un) {
+          char path[512];
+          snprintf(path, sizeof path, "%s/%s.u32", undec_dir, c->name);
+          FILE *fh = fopen(path, "ab");
+          if (fh) { fwrite(ulist, sizeof(uint32_t), (size_t)un, fh); fclose(fh); }
+        }
+      }
+      free(ulist);
     }
     printf("%-9s %13lld %12.4f %11.3e %11.3e %12lld %10lld  ulp worst 0x%08x = %.9g\n",
            c->name, n, worst, wabs, wrel, bad, undec, worst_in,

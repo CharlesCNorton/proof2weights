@@ -1,14 +1,14 @@
 (* gpt2_verified.ml - GPT-2 through the extracted forward pass itself.
 
    gpt2_talk_native.ml writes the layer loop by hand in OCaml. This runner does
-   not. It decodes each weight in transposed order, which is the order
-   Pretransposed.v's forward pass expects and the order Runner.v proves equal to
-   the transpose of the reshape, assembles the model record, and calls
-   f32_gpt2_logits_pre. That function is proved to return, on a model whose
-   matrices are stored transposed, exactly what f32_gpt2_logits returns on the
-   model (f32_gpt2_logits_pre_correct). The composition that runs is therefore
-   extracted code; what remains native is the file read, the offset lookup and
-   the assembly of the record.
+   not. It calls f32_load_model_pre, which looks up each tensor's offset in the
+   header, decodes each weight matrix in transposed order and assembles the
+   weight record, and then f32_gpt2_logits_pre. The first is proved to return
+   the model f32_load_model defines, transposed (f32_load_model_pre_correct);
+   the second is proved to return, on a model whose matrices are stored
+   transposed, exactly what f32_gpt2_logits returns on the model
+   (f32_gpt2_logits_pre_correct). What remains native is reading the file and
+   answering the byte fetch the loader reads it through.
 
    usage:
      gpt2_verified <path> d n_head n_layer ff vocab n_positions <tok,...>
@@ -24,21 +24,6 @@ let read_file path =
 let u64_le b off =
   let r = ref 0 in
   for i = 7 downto 0 do r := (!r * 256) + Char.code (Bytes.get b (off + i)) done; !r
-
-let dec1 b o =
-  f32_bytes_to_binary32
-    [ Char.code (Bytes.get b o); Char.code (Bytes.get b (o + 1));
-      Char.code (Bytes.get b (o + 2)); Char.code (Bytes.get b (o + 3)) ]
-
-let dec_vec b start count = List.init count (fun i -> dec1 b (start + 4 * i))
-
-(* the stored layout is [in, out] row-major, so this is its transpose *)
-let dec_wt b start in_dim out_dim =
-  List.init out_dim (fun o ->
-    List.init in_dim (fun i -> dec1 b (start + 4 * (i * out_dim + o))))
-
-let dec_rows b start rows cols =
-  List.init rows (fun r -> dec_vec b (start + 4 * r * cols) cols)
 
 let coqstr s = List.init (String.length s) (fun i -> s.[i])
 
@@ -71,36 +56,14 @@ let () =
   let hlen = u64_le b 0 in
   let base = 8 + hlen in
   let header = coqstr (Bytes.sub_string b 8 hlen) in
-  let off name =
-    match json_tensor_offsets header (coqstr name) with
-    | s :: _ :: _ -> base + s
-    | _ -> failwith ("offsets not found for " ^ name) in
-
-  Printf.eprintf "decoding weights...\n%!";
-  let ln nm = { f32_ln_weight = dec_vec b (off (nm ^ ".weight")) d;
-                f32_ln_bias   = dec_vec b (off (nm ^ ".bias")) d } in
-  let blocks = List.init nl (fun i ->
-    let p = Printf.sprintf "h.%d." i in
-    { f32_block_ln_1 = ln (p ^ "ln_1");
-      f32_block_attn =
-        { f32_attn_c_attn_weight = dec_wt b (off (p ^ "attn.c_attn.weight")) d (3 * d);
-          f32_attn_c_attn_bias   = dec_vec b (off (p ^ "attn.c_attn.bias")) (3 * d);
-          f32_attn_c_proj_weight = dec_wt b (off (p ^ "attn.c_proj.weight")) d d;
-          f32_attn_c_proj_bias   = dec_vec b (off (p ^ "attn.c_proj.bias")) d };
-      f32_block_ln_2 = ln (p ^ "ln_2");
-      f32_block_mlp =
-        { f32_mlp_c_fc_weight   = dec_wt b (off (p ^ "mlp.c_fc.weight")) d ff;
-          f32_mlp_c_fc_bias     = dec_vec b (off (p ^ "mlp.c_fc.bias")) ff;
-          f32_mlp_c_proj_weight = dec_wt b (off (p ^ "mlp.c_proj.weight")) ff d;
-          f32_mlp_c_proj_bias   = dec_vec b (off (p ^ "mlp.c_proj.bias")) d } }) in
-  let model =
-    { f32_wte = dec_rows b (off "wte.weight") vocab d;
-      f32_wpe = dec_rows b (off "wpe.weight") npos d;
-      f32_blocks = blocks;
-      f32_ln_f = ln "ln_f" } in
+  (* the data section, read one byte at a time, which is all the loader wants *)
+  let rd o = Char.code (Bytes.get b (base + o)) in
   let cfg = { gpt2_inf_n_embd = d; gpt2_inf_n_head = nh; gpt2_inf_n_layer = nl;
               gpt2_inf_n_inner = ff; gpt2_inf_vocab_size = vocab;
               gpt2_inf_n_positions = npos } in
+
+  Printf.eprintf "decoding weights...\n%!";
+  let model = f32_load_model_pre header rd cfg in
   Printf.eprintf "weights ready.\n%!";
 
   let logits_of ids = f32_gpt2_logits_pre cfg f32_ln_eps model ids in

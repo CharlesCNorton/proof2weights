@@ -3,16 +3,14 @@
 
    llama_talk_native.ml writes the layer loop by hand in OCaml and calls the
    extracted operators from it, so the arithmetic is verified but the
-   composition around it is not. This runner does not write the loop. It reads
-   the file, decodes each value with the verified f32_bytes_to_binary32, builds
-   the layer maps with f32_llama_layer and hands them to f32_llama_forward and
-   f32_llama_logits, which are the definitions the proofs are about, extracted.
-   What remains unverified here is the file read, the offset lookup and the
-   assembly of the weight records; the forward pass is extracted code.
-
-   The rotary tables are built with the extracted f32_sin and f32_cos on the
-   angles the checkpoint's stored inverse frequencies give, so no trigonometry
-   is performed outside the development either.
+   composition around it is not. This runner does not write the loop. It calls
+   f32_load_llama, which looks up each tensor's offset in the header, decodes
+   it and assembles the weight record, and then f32_llama_logits_of, which
+   builds the rotary tables and the layer maps and hands them to
+   f32_llama_forward and f32_llama_logits. Both are extracted from the
+   definitions the proofs are about, and f32_load_llama_correct says the record
+   holds the tensors the header names. What remains native is reading the file
+   and answering the byte fetch the loader reads it through.
 
    usage:
      llama_verified <path> d n_layer n_head n_kv ff vocab <tok,...>
@@ -32,15 +30,6 @@ let read_file path =
 let u64_le b off =
   let r = ref 0 in
   for i = 7 downto 0 do r := (!r * 256) + Char.code (Bytes.get b (off + i)) done; !r
-
-let dec1 b o =
-  f32_bytes_to_binary32
-    [ Char.code (Bytes.get b o); Char.code (Bytes.get b (o + 1));
-      Char.code (Bytes.get b (o + 2)); Char.code (Bytes.get b (o + 3)) ]
-
-let dec_vec b start count = List.init count (fun i -> dec1 b (start + 4 * i))
-let dec_mat b start rows cols =
-  List.init rows (fun r -> dec_vec b (start + 4 * r * cols) cols)
 
 let coqstr s = List.init (String.length s) (fun i -> s.[i])
 
@@ -69,52 +58,20 @@ let () =
   let mode  = Sys.argv.(8) in
   let dump  = (mode = "dump") in
   let hd = d / nh in
-  ignore ff;
 
   let b = read_file path in
   let hlen = u64_le b 0 in
   let base = 8 + hlen in
   let header = coqstr (Bytes.sub_string b 8 hlen) in
-  let off name =
-    match json_tensor_offsets header (coqstr name) with
-    | s :: _ :: _ -> base + s
-    | _ -> failwith ("offsets not found for " ^ name) in
+  (* the data section, read one byte at a time, which is all the loader wants *)
+  let rdb o = Char.code (Bytes.get b (base + o)) in
 
   let eps = f32_div (f32_of_Z 1) (f32_of_Z 100000) in
   Printf.eprintf "decoding weights...\n%!";
-  let emb = dec_mat b (off "embed_tokens.weight") vocab d in
-  let invf = dec_vec b (off "rope.inv_freq") (hd / 2) in
-  let normw = dec_vec b (off "norm.weight") d in
-  let layers = Array.init nl (fun i ->
-    let p = Printf.sprintf "layers.%d." i in
-    (dec_vec b (off (p ^ "input_layernorm.weight")) d,
-     dec_vec b (off (p ^ "post_attention_layernorm.weight")) d,
-     { la_q = dec_mat b (off (p ^ "self_attn.q_proj.weight")) d d;
-       la_k = dec_mat b (off (p ^ "self_attn.k_proj.weight")) (nkv * hd) d;
-       la_v = dec_mat b (off (p ^ "self_attn.v_proj.weight")) (nkv * hd) d;
-       la_o = dec_mat b (off (p ^ "self_attn.o_proj.weight")) d d },
-     { lm_gate = dec_mat b (off (p ^ "mlp.gate_proj.weight")) ff d;
-       lm_up   = dec_mat b (off (p ^ "mlp.up_proj.weight")) ff d;
-       lm_down = dec_mat b (off (p ^ "mlp.down_proj.weight")) d ff })) in
+  let model = f32_load_llama header rdb d nl nkv hd ff vocab in
   Printf.eprintf "weights ready.\n%!";
 
-  (* cos and sin of position * inverse frequency, in the half-split convention
-     f32_partial_rope reads: a table of length hd per position, the first half
-     repeated. Both are computed by the extracted f32_cos and f32_sin. *)
-  let rope_tables npos =
-    let rows = List.init npos (fun pos ->
-      let pf = f32_of_Z pos in
-      let ang = List.map (fun fj -> f32_mult pf fj) invf in
-      (List.map f32_cos ang, List.map f32_sin ang)) in
-    (List.map (fun (c, _) -> c @ c) rows, List.map (fun (_, s) -> s @ s) rows) in
-
-  let logits_of ids =
-    let npos = List.length ids in
-    let (cosv, sinv) = rope_tables npos in
-    let fs = Array.to_list (Array.map (fun (ln1, ln2, aw, mw) ->
-        f32_llama_layer nh nkv hd eps ln1 ln2 aw mw cosv sinv) layers) in
-    let h = f32_llama_forward eps normw fs emb ids in
-    f32_llama_logits emb h in
+  let logits_of ids = f32_llama_logits_of nh nkv hd eps model ids in
 
   if dump then begin
     let windows = Sys.argv.(9) and outdir = Sys.argv.(10) in

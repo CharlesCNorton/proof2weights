@@ -36,7 +36,9 @@ Rocq prover with all arithmetic in IEEE-754 binary32 through Flocq, and extract
 them to OCaml programs that run the published checkpoints. On 300 windows of
 held-out text per model, 4{,}800 next-token distributions each, the extracted
 forward pass and PyTorch in float32 choose the same top-1 token at every
-position, with every logit within $1.6\times10^{-3}$. A second extraction that
+position, with every logit within $1.6\times10^{-3}$, and the same holds at
+whole blocks of 64 tokens, at GPT-2's full 1024 positions and at 2048 tokens on
+SmolLM2. A second extraction that
 trusts no floating-point hardware computes, at every operation and for every
 input, the binary32 value the hardware extraction computes; that equality is
 proved at the level of floats, so overflow, infinities, NaNs and signed zeros
@@ -72,7 +74,8 @@ The contributions are the following.
   recurrence, extracted to programs that run the published GPT-2,
   SmolLM2-135M-Instruct and Qwen3.5-0.8B checkpoints
   (Section~\ref{sec:exec}), measured against PyTorch and llama.cpp on 300
-  held-out windows of 16 tokens per model (Section~\ref{sec:agree}). For each
+  held-out windows of 16 tokens per model, on sixty whole blocks of 64, and at
+  window lengths to 2048 (Section~\ref{sec:agree}). For each
   model a runner whose forward pass is the extracted definition rather than a
   loop rebuilt around it reproduces the same checkpoint's PyTorch oracle.
 \item Two extraction modes from one source, with a proof at the level of floats
@@ -96,7 +99,7 @@ The contributions are the following.
   random models and to llama.cpp on the checkpoints (Section~\ref{sec:diff}).
 \end{itemize}
 
-The development is 20{,}464 lines of Rocq in twenty-seven files. Of the 203 results the assumption report covers, seventeen are closed under the global context, 154 rest on the four classical axioms of the Rocq real-number library that Flocq inherits, and 32 use CoqInterval and rest in addition on the axioms of primitive floats, 63-bit integers and primitive arrays. Table~\ref{tab:assume} says which class each result of this paper falls in.
+The development is 21{,}373 lines of Rocq in twenty-eight files. Of the 215 results the assumption report covers, eighteen are closed under the global context, 165 rest on the four classical axioms of the Rocq real-number library that Flocq inherits, and 32 use CoqInterval and rest in addition on the axioms of primitive floats, 63-bit integers and primitive arrays. Table~\ref{tab:assume} says which class each result of this paper falls in.
 
 \section{The development}
 \label{sec:dev}
@@ -448,29 +451,89 @@ that agree in their first six significant digits. llama.cpp in its default
 configuration changes the top-1 token at up to 7 positions per model and device;
 Section~\ref{sec:diff} attributes the difference.
 
-\subsection{Longer windows, and the precision deployments use}
+\subsection{Longer windows, other implementations, and the precision deployments use}
 \label{sec:longer}
 
 Sixteen tokens is short, and a window's later positions attend over more keys
-and carry larger rotary angles, so the evaluation is repeated on whole blocks
-of 64 tokens and, for SmolLM2, on three blocks of 512, where the rotary angles
-reach 511. Table~\ref{tab:long} reports them, and adds the row the float32
-comparison does not reach: the same models in bfloat16, which is the precision
-deployments use.
+and carry larger rotary angles. The evaluation is repeated on whole blocks of
+$64$ tokens for all three models (Table~\ref{tab:long}), and on long windows:
+GPT-2 over the whole of its position table at $1024$, SmolLM2 at $512$ and at
+$2048$ (Table~\ref{tab:longctx}). Both tables carry llama.cpp beside PyTorch
+and bfloat16 beside float32, bfloat16 being the precision deployments use.
+Qwen3.5 has a further row: the gated delta rule through
+flash-linear-attention's fused Triton kernels, which is the path a deployment
+of that architecture takes, in float32 with the depthwise convolution left on
+the torch path.
 
-Nothing degrades with length. At 64 tokens PyTorch in float32 returns the
-extracted top-1 token at all 3{,}840 positions of both models, and at 512
-tokens at all 1{,}536, where the largest logit difference is $1.5\times10^{-4}$,
-smaller than at 64. Position by position the difference is flat: over 60 GPT-2
-windows the mean absolute difference in the last eight positions is $1.11$ times
-that in the first eight, and over the three 512-token windows the last
-sixty-four positions sit at $0.96$ of the first.
+Top-1 agreement with PyTorch in float32 is unaffected by any of it. At $64$
+tokens PyTorch returns the extracted top-1 token at all $3{,}840$ positions of
+each of the three models, at $1024$ at all $3{,}072$ of GPT-2's, and at $2048$
+at all $6{,}144$ of SmolLM2's. The top ten agree in order at every position of
+SmolLM2 and Qwen3.5 at every length; on GPT-2 between one and four positions
+reorder, of $3{,}840$ at $64$ tokens and $3{,}072$ at $1024$. Perplexity moves
+by less than one part in $10^{6}$ in float32 at every length.
 
-bfloat16 is a different regime. It changes the top-1 token at 468 of 3{,}840
-GPT-2 positions and 149 of 3{,}840 SmolLM2 positions, moves logits by up to
-$12.5$, and shifts perplexity in the third significant digit where float32
-agrees in the seventh. A bfloat16 deployment is not running the function the
-checkpoint denotes in any sense this development can certify.
+The largest logit difference does not follow the length monotonically. On GPT-2
+it is six times larger at $1024$ than at $64$, $9.89\times10^{-3}$ against
+$1.68\times10^{-3}$; on SmolLM2 it is five times smaller at $2048$ than at
+$64$, $2.15\times10^{-4}$ against $1.17\times10^{-3}$. Position by position
+within a window the difference is flat: over $60$ GPT-2 windows the mean
+absolute difference in the last eight positions is $1.11$ times that in the
+first eight, and over the three $512$-token windows the last sixty-four
+positions sit at $0.96$ of the first.
+
+llama.cpp in float32 changes the top-1 token at $1$ to $14$ positions per model,
+device and length, which Section~\ref{sec:diff} attributes. bfloat16 is a
+different regime, and the two ways of reaching it separate. On the two models
+measured both ways at $64$ tokens, reading bfloat16 weights and computing in
+float32, as llama.cpp does, changes $26$ and $210$ top-1 tokens; computing in
+bfloat16 as well, as PyTorch does, changes $149$ and $468$, between two and six
+times as many, and moves a logit by $12.5$ against $7.4$. Length widens that gap sharply: at GPT-2's $1024$ positions
+PyTorch in bfloat16 moves a logit by $298$ and leaves the top ten in order at
+$113$ positions of $3{,}072$. The fused float32 kernels sit between the two,
+changing six top-1 tokens where the unfused float32 path changes none.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\begin{tabular}{llrrrr}
+\toprule
+\textbf{Model} & \textbf{Implementation} & \textbf{top-1 differs}
+  & \textbf{median} $|\Delta|$ & \textbf{max} $|\Delta|$ & \textbf{perplexity} \\
+\midrule
+GPT-2   & extracted            & ---      & ---                & ---                 & 80.256641 \\
+        & PyTorch CPU          & 0/3840   & $4.7\times10^{-5}$ & $1.68\times10^{-3}$ & 80.256637 \\
+        & PyTorch GPU          & 0/3840   & $3.9\times10^{-5}$ & $1.56\times10^{-3}$ & 80.256674 \\
+        & llama.cpp CPU        & 2/3840   & $7.1\times10^{-3}$ & $7.58\times10^{-1}$ & 80.255019 \\
+        & llama.cpp GPU        & 14/3840  & $1.6\times10^{-2}$ & $1.26$              & 80.281634 \\
+        & llama.cpp CPU bf16   & 209/3840 & $2.2\times10^{-1}$ & $6.81$              & 79.954552 \\
+        & llama.cpp GPU bf16   & 210/3840 & $2.2\times10^{-1}$ & $7.39$              & 79.943026 \\
+        & PyTorch bf16         & 468/3840 & $3.1\times10^{-1}$ & $12.5$              & 80.495299 \\
+\midrule
+SmolLM2 & extracted            & ---      & ---                & ---                 & 62.922808 \\
+        & PyTorch CPU          & 0/3840   & $1.1\times10^{-5}$ & $1.17\times10^{-3}$ & 62.922790 \\
+        & PyTorch GPU          & 0/3840   & $1.1\times10^{-5}$ & $9.61\times10^{-4}$ & 62.922791 \\
+        & llama.cpp CPU        & 2/3840   & $1.9\times10^{-3}$ & $1.62\times10^{-1}$ & 62.922448 \\
+        & llama.cpp GPU        & 4/3840   & $4.0\times10^{-3}$ & $3.29\times10^{-1}$ & 62.923297 \\
+        & llama.cpp CPU bf16   & 26/3840  & $3.2\times10^{-2}$ & $1.22$              & 62.924422 \\
+        & llama.cpp GPU bf16   & 27/3840  & $3.2\times10^{-2}$ & $1.59$              & 62.925257 \\
+        & PyTorch bf16         & 149/3840 & $8.9\times10^{-2}$ & $7.85$              & 63.001049 \\
+\midrule
+Qwen3.5 & extracted            & ---      & ---                & ---                 & 58.171639 \\
+        & PyTorch CPU          & 0/3840   & $4.6\times10^{-6}$ & $1.65\times10^{-4}$ & 58.171641 \\
+        & PyTorch GPU          & 0/3840   & $4.7\times10^{-6}$ & $1.61\times10^{-4}$ & 58.171642 \\
+        & PyTorch fused, f32   & 6/3840   & $1.5\times10^{-3}$ & $1.14\times10^{-1}$ & 58.169333 \\
+        & PyTorch bf16         & 84/3840  & $1.9\times10^{-2}$ & $5.49\times10^{-1}$ & 58.235540 \\
+\bottomrule
+\end{tabular}
+\caption{Sixty whole blocks of 64 tokens per model, every position compared.
+\emph{top-1 differs} counts the positions whose highest-scoring token differs
+from the extracted pass's. The bf16 rows read bfloat16 weights; the PyTorch one
+computes in bfloat16 as well. The fused row runs the gated delta rule through
+flash-linear-attention's Triton kernels. Perplexity is over the positions with
+a following token in the window.}
+\label{tab:long}
+\end{table}
 
 \begin{table}[t]
 \centering
@@ -480,25 +543,28 @@ checkpoint denotes in any sense this development can certify.
 \textbf{Model, window} & \textbf{Implementation} & \textbf{top-1 differs}
   & \textbf{median} $|\Delta|$ & \textbf{max} $|\Delta|$ & \textbf{perplexity} \\
 \midrule
-GPT-2, 64      & extracted     & ---      & ---                 & ---     & 80.256641 \\
-               & PyTorch CPU   & 0/3840   & $4.7\times10^{-5}$  & $1.68\times10^{-3}$ & 80.256637 \\
-               & PyTorch GPU   & 0/3840   & $3.9\times10^{-5}$  & $1.56\times10^{-3}$ & 80.256674 \\
-               & PyTorch bf16  & 468/3840 & $0.31$              & $12.5$  & 80.495299 \\
+GPT-2, 1024   & extracted          & ---      & ---                & ---                 & 28.277054 \\
+              & PyTorch CPU        & 0/3072   & $6.2\times10^{-5}$ & $9.89\times10^{-3}$ & 28.277070 \\
+              & PyTorch GPU        & 0/3072   & $4.7\times10^{-5}$ & $8.87\times10^{-3}$ & 28.277057 \\
+              & llama.cpp CPU      & 2/3072   & $1.1\times10^{-2}$ & $3.54$              & 28.277568 \\
+              & llama.cpp GPU      & 6/3072   & $2.3\times10^{-2}$ & $6.31$              & 28.281877 \\
+              & llama.cpp GPU bf16 & 172/3072 & $2.6\times10^{-1}$ & $39.4$              & 28.224357 \\
+              & llama.cpp CPU bf16 & 181/3072 & $2.6\times10^{-1}$ & $46.1$              & 28.224309 \\
+              & PyTorch bf16       & 318/3072 & $4.1\times10^{-1}$ & $298$               & 28.559767 \\
 \midrule
-SmolLM2, 64    & extracted     & ---      & ---                 & ---     & 62.922808 \\
-               & PyTorch CPU   & 0/3840   & $1.1\times10^{-5}$  & $1.17\times10^{-3}$ & 62.922790 \\
-               & PyTorch GPU   & 0/3840   & $1.1\times10^{-5}$  & $9.61\times10^{-4}$ & 62.922791 \\
-               & PyTorch bf16  & 149/3840 & $8.9\times10^{-2}$  & $7.85$  & 63.001049 \\
+SmolLM2, 512  & extracted          & ---      & ---                & ---                 & 26.322307 \\
+              & PyTorch CPU        & 0/1536   & $1.0\times10^{-5}$ & $1.46\times10^{-4}$ & 26.322303 \\
 \midrule
-SmolLM2, 512   & extracted     & ---      & ---                 & ---     & 26.322307 \\
-               & PyTorch CPU   & 0/1536   & $1.0\times10^{-5}$  & $1.46\times10^{-4}$ & 26.322303 \\
+SmolLM2, 2048 & extracted          & ---      & ---                & ---                 & 17.113821 \\
+              & PyTorch CPU        & 0/6144   & $1.0\times10^{-5}$ & $2.15\times10^{-4}$ & 17.113819 \\
+              & llama.cpp CPU      & 1/6144   & $2.0\times10^{-3}$ & $6.29\times10^{-2}$ & 17.114370 \\
+              & llama.cpp CPU bf16 & 26/6144  & $2.9\times10^{-2}$ & $5.28\times10^{-1}$ & 17.110629 \\
 \bottomrule
 \end{tabular}
-\caption{Whole blocks of 64 tokens, 60 per model, and three blocks of 512.
-\emph{top-1 differs} counts the positions whose highest-scoring token differs
-from the extracted pass's. Perplexity is over the positions with a following
-token in the window.}
-\label{tab:long}
+\caption{Three windows at each length. GPT-2's $1024$ is the whole of its
+position table; SmolLM2's $2048$ carries rotary angles to $2047$. Columns are
+those of Table~\ref{tab:long}.}
+\label{tab:longctx}
 \end{table}
 
 \subsection{What the residual against PyTorch is}
@@ -594,10 +660,29 @@ and Qwen3.5 layers are causal under the head-count conditions above.
 
 The corollaries \code{gpt2\_logits\_prefix}, \code{llama\_forward\_prefix} and
 \code{qwen\_forward\_prefix} say that running a model on an extended sequence
-reproduces bit for bit every row it produces for the original one. Together
-with the cache theorems this is what makes a decode step that reuses cached
-keys, values, recurrent state and convolution window compute the row full
-recomputation computes.
+reproduces bit for bit every row it produces for the original one.
+
+\subsection{The decode step}
+
+A decoder never evaluates the sequence function on the whole sequence. It takes
+one step per token and emits the last row of each. Write that decoder over an
+arbitrary sequence function as
+\[
+  \mathrm{decode}(F)(x) =
+  \bigl[\,\mathrm{last}\,F(\mathrm{firstn}\,(i{+}1)\,x)\,\bigr]_{i < |x|}.
+\]
+
+\begin{theorem}[\code{decode\_stream\_correct}]
+For every causal $F$ and every $x$, $\mathrm{decode}(F)(x) = F(x)$.
+\end{theorem}
+
+The proof applies causality at each prefix, and the three theorems above supply
+it: \code{gpt2\_decode\_step}, \code{llama\_decode\_step} and
+\code{qwen\_decode\_step} instantiate the theorem at the three models. Within a
+step the cache theorems compute the row from state the earlier steps left: the
+recurrent half is \code{delta\_scan\_snoc}, the attention half
+\code{causal\_attention\_snoc} and the convolution window
+\code{conv\_window\_cached\_correct}.
 
 \section{Rounding error}
 \label{sec:err}
@@ -756,9 +841,23 @@ $2.7\times10^{-7}$ on the embeddings and grows through the first block to
 $4.3\times10^{-4}$ after the query/key/value projection, $1.5\times10^{-2}$ after
 attention, $0.49$ after the output projection and $17$ after the feed-forward
 projection, whose values reach $11.5$; the exponentials inside the first GELU
-then return infinite bounds. The growth is that of interval propagation, which
-charges every operation its worst-case sensitivity to each operand
-independently.
+then return infinite bounds.
+
+The growth is the sensitivity of the layers themselves. A linear layer carries
+an input error bounded componentwise by $\varepsilon$ to an output error
+bounded by $\max_i \sum_j |W_{ij}|\,\varepsilon$, and the error vector whose
+signs match row $i$ attains it, so a bound that holds for every input pays that
+factor. \code{scripts/layer\_gain.py} reports those row sums for GPT-2 small:
+between $117$ and $1120$ per matrix, and $7.7\times10^{9}$ for the four
+matrices of a median block. The annotated pass grows by about $34$ per matrix,
+carrying a separate bound per component rather than one $\varepsilon$ for the
+vector. What separates its $1.8\times10^{-5}$ at one layer from the observed
+$3.4\times10^{-8}$ is that rounding errors do not align with any row, which is
+the distance between a worst case and an average one. A backward-error
+formulation pays the same row sums once its relative perturbation of the
+weights is turned into a forward bound. The backward theorems below are a
+different statement, whose perturbation is set by the length of one dot product
+rather than by the depth of the network.
 
 \subsection{Backward error}
 
@@ -894,9 +993,14 @@ $\delta \le 1$, which gives $|\sigma_{\mathrm{real}} - \sigma| \le 1.6\times10^{
 on $[-88, 88]$. The identity $\tanh y = 2\sigma(2y) - 1$ doubles it. Softplus
 uses $\max(x,0) + \log(1 + e^{-|x|}) = \log(1 + e^x)$ and
 $|\log p - \log q| \le |p - q|$ for $p, q \ge 1$, derived from
-$1 + t \le e^t$. GELU additionally needs $|\tanh s - \tanh t| \le 8|s - t|$ for
-$|s - t| \le 1/16$, derived from the sigmoid form and
-$|e^w - 1| \le 2|w|$ for $|w| \le 1/4$, and the stored constants
+$1 + t \le e^t$. GELU additionally needs $|\tanh s - \tanh t| \le |s - t|$,
+which holds on the whole line: the comparison function
+$g(t) = \log t - \log(1-t) - 4t$ has derivative $1/(t(1-t)) - 4 \ge 0$ on
+$(0,1)$, so the mean value theorem makes it monotone, and
+$g(\sigma(u)) \le g(\sigma(v))$ with $\log\sigma(u) - \log(1 - \sigma(u)) = u$
+is $|\sigma(u) - \sigma(v)| \le \frac14|u - v|$, which the identity
+$\tanh y = 2\sigma(2y) - 1$ carries to $\tanh$ with constant one. Both are the
+constants the derivatives give. GELU also needs the stored constants
 $6693141/2^{23}$ and $12003091/2^{28}$, within $2.3\times10^{-8}$ of
 $\sqrt{2/\pi}$ and $1.6\times10^{-9}$ of $0.044715$. Table~\ref{tab:elem} lists
 the resulting bounds beside the errors measured on the inductive extraction
@@ -917,19 +1021,17 @@ $\log$     & $(1, 2]$        & $2\times10^{-8}$   & $1.0\times10^{-7}$ \\
 $\sigma$   & $[-88, 88]$     & $1.6\times10^{-8}$ & $8.9\times10^{-8}$ \\
 $\tanh$    & $[-44, 44]$     & $3.2\times10^{-8}$ & $1.8\times10^{-7}$ \\
 softplus   & $[-88, 88]$     & $4\times10^{-8}$   & $5.4\times10^{-7}$ \\
-GELU       & $[-8, 8]$       & $5\times10^{-5}$   & $5.2\times10^{-7}$ \\
+GELU       & $[-8, 8]$       & $6\times10^{-6}$   & $5.2\times10^{-7}$ \\
 $\sqrt{\ }$ & all            & half a ULP         & $6.0\times10^{-8}$ relative \\
 \bottomrule
 \end{tabular}
 \caption{The proved column is the distance from the real evaluation of each
-elementary function to the mathematical function, proved in \code{Truth.v}: it
-covers the argument reduction and the series truncation and leaves the rounding
-of the float evaluation to the propagation term $\mathrm{err}_k$, which is why
-it is not an upper bound on the measured column. The measured column is the
-maximum error of the extracted function over \emph{every} binary32 input of
-the domain shown, from the exhaustive sweep of Table~\ref{tab:exh}. The GELU
-bound uses the Lipschitz constant of $\tanh$ and so does not reflect its
-saturation.}
+elementary function to the mathematical function, proved in \code{Truth.v}. It
+covers the argument reduction and the series truncation, and leaves the rounding
+of the float evaluation to the propagation term $\mathrm{err}_k$. The measured
+column is the maximum error of the extracted function over \emph{every} binary32
+input of the domain shown, from the exhaustive sweep of Table~\ref{tab:exh}. The
+GELU bound uses the Lipschitz constant of $\tanh$ rather than its saturation.}
 \label{tab:elem}
 \end{table}
 
@@ -994,34 +1096,37 @@ error of $1.8\times10^{-7}$, which is the figure Table~\ref{tab:elem} carries;
 GELU, softplus, sine and cosine lose accuracy the same way at their own zeros.
 Because the reference is a binary64 value rather than an infinitely precise
 one, an input whose true value lies within a guard band of a binary32 midpoint
-cannot be decided from it; those are counted separately and are the only inputs
-the sweep leaves open, at most $65{,}000$ of two billion in any row.
+cannot be decided from it. The sweep records those inputs rather than counting
+them as either outcome, $69{,}058$ of nineteen billion, and
+\code{scripts/settle\_undecided.py} decides each against a reference at $120$
+decimal digits. All but fifteen are not correctly rounded, none exceeds the
+row's worst case, and the counts in Table~\ref{tab:exh} include them.
 
 \begin{table}[t]
 \centering
 \footnotesize
-\begin{tabular}{lrrrrrr}
+\begin{tabular}{lrrrrr}
 \toprule
 \textbf{function} & \textbf{inputs} & \textbf{max ULP} & \textbf{max abs}
-  & \textbf{max rel} & \textbf{not c.r.} & \textbf{undecided} \\
+  & \textbf{max rel} & \textbf{not c.r.} \\
 \midrule
-$\exp$     & 2\,237\,661\,186 & $1.0$ & --- & $1.7\times10^{-7}$ & 18\,091\,635 & 424 \\
-$\sigma$   & 2\,237\,661\,186 & $2.5$ & $8.9\times10^{-8}$ & $1.5\times10^{-7}$ & 168\,315\,652 & 1\,626 \\
-$\tanh$    & 2\,220\,883\,970 & $2.1\times10^{7}$ & $1.8\times10^{-7}$ & $1.7$ & 890\,520\,350 & 557 \\
-GELU       & 2\,181\,038\,082 & $1.7\times10^{7}$ & $5.2\times10^{-7}$ & $1.0$ & 210\,671\,527 & 64\,673 \\
-$\log$     & 8\,388\,609      & $2.0$ & $1.0\times10^{-7}$ & $1.8\times10^{-7}$ & 3\,512\,285 & 11 \\
-softplus   & 2\,237\,661\,186 & $1.7\times10^{7}$ & $5.4\times10^{-7}$ & $1.0$ & 256\,582\,639 & 591 \\
-$\sin$     & 2\,432\,696\,322 & $3.9\times10^{8}$ & $4.7\times10^{-6}$ & $4.3\times10^{1}$ & 190\,141\,059 & 586 \\
-$\cos$     & 2\,432\,696\,322 & $3.3\times10^{8}$ & $4.3\times10^{-6}$ & $3.6\times10^{1}$ & 211\,932\,316 & 590 \\
-$\sqrt{\ }$ & 2\,139\,095\,041 & $0.5$ & --- & $6.0\times10^{-8}$ & 0 & 0 \\
+$\exp$     & 2\,237\,661\,186 & $1.0$ & --- & $1.7\times10^{-7}$ & 18\,092\,059 \\
+$\sigma$   & 2\,237\,661\,186 & $2.5$ & $8.9\times10^{-8}$ & $1.5\times10^{-7}$ & 168\,317\,263 \\
+$\tanh$    & 2\,220\,883\,970 & $2.1\times10^{7}$ & $1.8\times10^{-7}$ & $1.7$ & 890\,525\,002 \\
+GELU       & 2\,181\,038\,082 & $1.7\times10^{7}$ & $5.2\times10^{-7}$ & $1.0$ & 210\,736\,200 \\
+$\log$     & 8\,388\,609      & $2.0$ & $1.0\times10^{-7}$ & $1.8\times10^{-7}$ & 3\,512\,296 \\
+softplus   & 2\,237\,661\,186 & $1.7\times10^{7}$ & $5.4\times10^{-7}$ & $1.0$ & 256\,583\,230 \\
+$\sin$     & 2\,432\,696\,322 & $3.9\times10^{8}$ & $4.7\times10^{-6}$ & $4.3\times10^{1}$ & 190\,141\,645 \\
+$\cos$     & 2\,432\,696\,322 & $3.3\times10^{8}$ & $4.3\times10^{-6}$ & $3.6\times10^{1}$ & 211\,932\,906 \\
+$\sqrt{\ }$ & 2\,139\,095\,041 & $0.5$ & --- & $6.0\times10^{-8}$ & 0 \\
 \bottomrule
 \end{tabular}
 \caption{Every binary32 input of each domain, against the mathematical function
-in binary64. \emph{not c.r.} counts the inputs whose result is not the
-correctly rounded one, \emph{undecided} those the binary64 reference cannot
-decide. The absolute column is omitted where the function's range spans many
-binades and only the relative figure means anything. Domains are those of
-Table~\ref{tab:elem}.}
+in binary64, with the inputs that reference cannot decide settled at $120$
+decimal digits and included. \emph{not c.r.} counts the inputs whose result is
+not the correctly rounded one. The absolute column is omitted where the
+function's range spans many binades and only the relative figure means
+anything. Domains are those of Table~\ref{tab:elem}.}
 \label{tab:exh}
 \end{table}
 
@@ -1133,30 +1238,41 @@ changes no logit.
 \section{Scope and limitations}
 \label{sec:limits}
 
-\paragraph{Agreement with PyTorch is measured.} There is no independent
-specification of what these models compute in floating point against which the
-development could be proved correct; the development is itself such a
-specification.
+\paragraph{Agreement with PyTorch is measured.} The development is the
+specification of what these models compute in binary32, and its agreement with
+PyTorch is a measurement, reported in Section~\ref{sec:agree}.
 
 \paragraph{What the runners still do themselves.} Each model has two runners.
 The cached one writes the layer loop in OCaml and calls the extracted operators
 from it, so its arithmetic is verified and its composition is not; it is the one
 that decodes autoregressively, and the equalities of Section~\ref{sec:cache} are
 what cover its caches. The other, named \code{\_verified}, does not write the
-loop: it reads the file, decodes each value with
-\code{f32\_bytes\_to\_binary32}, builds the layer maps and calls
-\code{f32\_gpt2\_logits\_pre}, \code{f32\_llama\_forward} or
-\code{f32\_qwen\_forward}, which are the definitions the proofs are about,
-extracted. What it still does natively is the file read, the offset lookup
-through the verified \code{json\_tensor\_offsets}, and the assembly of the
-weight records. It does not cache, so it recomputes the sequence at every step
-and is not the runner to generate with.
+loop. It hands the extracted loader a fetch of one byte of the data section and
+that loader does the rest: \code{f32\_load\_model\_pre},
+\code{f32\_load\_llama} and \code{f32\_load\_qwen} look up each tensor's offset
+through \code{json\_tensor\_offsets}, decode it, and assemble the weight
+record, after which \code{f32\_gpt2\_logits\_pre},
+\code{f32\_llama\_logits\_of} or \code{f32\_qwen\_logits\_of} runs the pass.
+\code{Loader.v}'s loader takes the data section as a list of bytes; this one
+takes the fetch, and runs on a file of any size.
+
+\begin{theorem}[\code{f32\_load\_model\_pre\_correct}]
+On a header whose tensors carry two offsets bounding the expected number of
+values, the record the reader-based loader assembles is the record
+\code{f32\_load\_model} defines, transposed.
+\end{theorem}
+
+\code{f32\_load\_llama\_correct} and \code{f32\_load\_qwen\_correct} say the
+same of the other two records, each field against the
+\code{f32\_load\_named} of its tensor. The rotary tables are built inside the
+extraction as well, so what the verified runners still do natively is read the
+file and answer the fetch. They do not cache, so they recompute the sequence at
+every step and are not the runners to generate with.
 
 The two agree on the checkpoints: on GPT-2 and SmolLM2 the ten highest logits of
 the stored prompt agree to every digit printed, and each verified runner
 reproduces its model's stored PyTorch oracle, Qwen3.5's through the eighth rank
-its oracle records. What remains outside a proof is therefore the record
-assembly rather than the forward pass.
+its oracle records.
 
 \paragraph{The pre-transposed pass is a second definition.} The GPT-2 runner
 cannot call \code{f32\_gpt2\_logits}, because \code{f32\_linear\_forward}
@@ -1167,9 +1283,8 @@ them in, and proves that on the transpose of a model it returns what the
 original returns on the model
 (\code{f32\_gpt2\_logits\_pre\_correct}). Every function there differs from its
 counterpart by dropping one \code{f32\_mat\_transpose}, and each correctness
-lemma is that drop undone, so the second definition is tied to the first rather
-than standing beside it. The Llama and Qwen3.5 paths need no such variant: their
-definitions take the weights in the order the runner holds them.
+lemma is that drop undone. The Llama and Qwen3.5 paths need no such variant:
+their definitions take the weights in the order the runner holds them.
 
 \paragraph{The error bounds are worst-case.} The composed bound holds under its
 side-condition records, which are hypotheses about the inputs, discharged for
@@ -1182,21 +1297,17 @@ bounds against the mathematical functions carry the hypotheses of the composed
 bound, and the one on GELU uses a Lipschitz constant rather than the saturation
 of $\tanh$.
 
-\paragraph{The receipt is not a security mechanism and is claimed as none.}
+\paragraph{The receipt detects accident, not tampering.}
 \code{Receipt.v} defines a record binding a weight checksum, the prompt and the
 output, and proves it is checked by recomputation
 (\code{verify\_receipt\_sound}) and that its polynomial rolling hash modulo
 $2^{32}$ changes whenever a single byte of the file changes
-(\code{checksum\_detects\_single\_byte}). Those are the only claims made for
-it. It detects accident, not tampering: the hash is not collision resistant,
-and no threat model is offered under which it would be.
+(\code{checksum\_detects\_single\_byte}). The hash is not collision resistant.
 
 \paragraph{The inductive mode is slow.} Bignum arithmetic runs at microseconds
 per operation, which puts a checkpoint forward pass at an hour to several hours.
-Theorem~\ref{thm:narrow} is what keeps that from limiting the claims: the two
-modes agree at every operation by proof, so the hardware mode's numbers are the
-inductive mode's numbers and nothing is established by running the slow one at
-scale.
+By Theorem~\ref{thm:narrow} the two modes agree at every operation, so the
+hardware mode's numbers are the inductive mode's numbers.
 
 \section{Related work}
 
@@ -1275,8 +1386,8 @@ the value of a float is a real number.
 \footnotesize
 \input{assumptions}
 \caption{The assumption class of each result named in this paper, from the
-report \code{theories/Audit.v} produces. Of the 203 results that report covers,
-seventeen are closed, 154 are classical and 32 add CoqInterval's interface.}
+report \code{theories/Audit.v} produces. Of the 215 results that report covers,
+eighteen are closed, 165 are classical and 32 add CoqInterval's interface.}
 \label{tab:assume}
 \end{table}
 
@@ -1306,17 +1417,11 @@ The commits are \code{607a30d7} for GPT-2, \code{12fd25f7} for
 SmolLM2-135M-Instruct and \code{2fc06364} for Qwen3.5-0.8B.
 Checkpoint revisions move, so a rerun that reports a different commit is
 measuring different weights. The per-window logit dumps behind
-Tables~\ref{tab:agree} and~\ref{tab:long} are regenerated by
+Tables~\ref{tab:agree} and~\ref{tab:long} are produced by
 \code{scripts/agree\_setup.py}, the runners' dump mode and
-\code{scripts/agree\_torch.py}, and are not in the repository; the windows they
-build are determined by the split, the tokenizer and the three integers the
-first of those scripts takes, so they are the same windows on any machine.
-\code{agree/manifest.json} names every file of the 64- and 512-token dumps with
-its SHA-256, ten sources and 486 files over $6.7$ GB, so a regenerated dump can
-be checked against the one measured here rather than trusted;
-\code{scripts/data\_manifest.py} writes and verifies it, and picks a seeded
-subset for a reader who would rather regenerate a few windows than all of
-them.
+\code{scripts/agree\_torch.py}. The windows are determined by the split, the
+tokenizer and the three integers the first script takes, and the dumps come
+back byte for byte on the same host.
 
 \begin{thebibliography}{99}
 

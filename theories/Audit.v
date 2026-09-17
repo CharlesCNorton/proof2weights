@@ -28,6 +28,7 @@ Require Import Cache_attn.
 Require Import Causal.
 Require Import Runner.
 Require Import Loader.
+Require Import Loadpre.
 Require Import Series.
 Require Import Truth.
 Require Import Witness.
@@ -233,6 +234,13 @@ Print Assumptions llama_forward_prefix.
 Print Assumptions qwen_forward_prefix.
 Print Assumptions gpt2_logits_prefix.
 
+(** * One decode step per token equals evaluating the whole sequence *)
+
+Print Assumptions decode_stream_correct.
+Print Assumptions gpt2_decode_step.
+Print Assumptions llama_decode_step.
+Print Assumptions qwen_decode_step.
+
 (** * The transposed decode the checkpoint runners perform *)
 
 Print Assumptions decode_transposed_correct.
@@ -248,6 +256,17 @@ Print Assumptions f32_load_named_checked_sound.
 Print Assumptions f32_load_named_checked_rejects.
 Print Assumptions validated_logits_shape.
 Print Assumptions loaded_model_blocks.
+
+(** * Loading a checkpoint through a byte reader *)
+
+Print Assumptions f32_read_vec_load_named.
+Print Assumptions read_rows_ok.
+Print Assumptions read_transposed_ok.
+Print Assumptions f32_load_model_pre_correct.
+Print Assumptions read_llama_layer_ok.
+Print Assumptions f32_load_llama_correct.
+Print Assumptions read_qwen_layer_ok.
+Print Assumptions f32_load_qwen_correct.
 
 (** * The elementary functions against the mathematical functions *)
 
