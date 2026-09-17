@@ -5,6 +5,8 @@ Llama.v
 Qwen.v
 Float_error.v
 Narrow.v
+Backward.v
+Pretransposed.v
 Dot.v
 Cache.v
 Cache_attn.v

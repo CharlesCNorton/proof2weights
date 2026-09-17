@@ -20,6 +20,8 @@ Require Import Llama.
 Require Import Qwen.
 Require Import Float_error.
 Require Import Narrow.
+Require Import Backward.
+Require Import Pretransposed.
 Require Import Dot.
 Require Import Cache.
 Require Import Cache_attn.
@@ -69,6 +71,22 @@ Print Assumptions narrow_widen_minus.
 Print Assumptions narrow_widen_mult.
 Print Assumptions narrow_widen_div.
 Print Assumptions narrow_widen_sqrt.
+
+(** * Backward error with underflow *)
+
+Print Assumptions f32_dot_backward_mixed.
+Print Assumptions f32_mat_vec_mul_backward_mixed.
+Print Assumptions logits_backward_mixed.
+
+(** * The forward pass over pre-transposed weights *)
+
+Print Assumptions f32_linear_pre_correct.
+Print Assumptions f32_attention_pre_correct.
+Print Assumptions f32_mlp_pre_correct.
+Print Assumptions f32_block_pre_correct.
+Print Assumptions f32_blocks_pre_correct.
+Print Assumptions f32_gpt2_forward_pre_correct.
+Print Assumptions f32_gpt2_logits_pre_correct.
 
 (** * The rounding model *)
 

@@ -28,6 +28,7 @@
 Require Import Phases1_15_complete.
 Require Import Llama.
 Require Import Qwen.
+Require Import Pretransposed.
 From Flocq Require Import IEEE754.BinarySingleNaN.
 From Stdlib Require Import ExtrOcamlBasic.
 From Stdlib Require Import ExtrOcamlNatInt.
@@ -67,6 +68,8 @@ Extraction "phases1_15_native.ml"
   f32_dot f32_vec_add f32_mat_vec_mul f32_add_matrices
   f32_layer_norm_2d f32_ln_eps
   f32_split_into_heads f32_causal_attention f32_concat_heads f32_gelu_vec
+  f32_gpt2_forward f32_gpt2_logits
+  f32_gpt2_forward_pre f32_gpt2_logits_pre
   json_tensor_offsets.
 
 Extraction "llama_native.ml"
@@ -76,6 +79,9 @@ Extraction "llama_native.ml"
   f32_of_Z f32_sin f32_cos
   f32_rmsnorm f32_silu_vec
   f32_attend f32_causal_attention f32_concat_heads
+  f32_slice f32_partial_rope f32_swiglu
+  f32_llama_layer f32_llama_stack f32_llama_forward f32_llama_logits
+  f32_embed_tokens
   json_tensor_offsets.
 
 (* The annotated forward pass of RunErr.v. Its bounds are binary64 values, which
@@ -115,4 +121,6 @@ Extraction "qwen_native.ml"
   f32_delta_step f32_delta_scan f32_delta_state0 f32_delta_decay f32_delta_prep_q
   f32_partial_rope f32_swiglu f32_gate_sigmoid
   f32_attend f32_causal_attention f32_concat_heads f32_split_into_heads
+  f32_qwen_delta_mix f32_qwen_attn_mix f32_qwen_wrap
+  f32_qwen_stack f32_qwen_forward f32_qwen_logits f32_embed_tokens
   json_tensor_offsets.
