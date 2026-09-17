@@ -36,10 +36,13 @@ Rocq prover with all arithmetic in IEEE-754 binary32 through Flocq, and extract
 them to OCaml programs that run the published checkpoints. On 300 windows of
 held-out text per model, 4{,}800 next-token distributions each, the extracted
 forward pass and PyTorch in float32 choose the same top-1 token at every
-position, with every logit within $1.6\times10^{-3}$. An inductive extraction
-that trusts no floating-point hardware reproduces the native build's top-ten
-logits bit for bit, and we prove that the native build's rounding through binary64 changes no
-result, that cached autoregressive decoding computes exactly the binary32 values
+position, with every logit within $1.6\times10^{-3}$. A second extraction that
+trusts no floating-point hardware computes, at every operation and for every
+input, the binary32 value the hardware extraction computes; that equality is
+proved at the level of floats, so overflow, infinities, NaNs and signed zeros
+are inside it, and the two assumptions the hardware extraction makes about its
+host are decided on that host by a self-test. We further prove that cached
+autoregressive decoding computes exactly the binary32 values
 full recomputation computes, and that the three forward passes are causal. Used
 as a fixed reference, the extracted pass attributes llama.cpp's divergence, top-1
 changes at up to 7 of 4{,}800 positions and logit shifts up to $1.7$, to four
@@ -70,8 +73,10 @@ The contributions are the following.
   SmolLM2-135M-Instruct and Qwen3.5-0.8B checkpoints
   (Section~\ref{sec:exec}), measured against PyTorch and llama.cpp on 300
   held-out windows of 16 tokens per model (Section~\ref{sec:agree}).
-\item Two extraction modes from one source, with a proof that the native
-  mode's intermediate binary64 rounding does not change any result
+\item Two extraction modes from one source, with a proof at the level of floats
+  that they compute the same binary32 value at every operation for every input,
+  overflow, infinities, NaNs and signed zeros included, and a self-test that
+  decides on the host the two assumptions the hardware mode makes about it
   (Section~\ref{sec:tcb}).
 \item Proofs that cached decoding equals full recomputation, as equalities of
   binary32 values, and that the three forward passes are causal
@@ -86,13 +91,14 @@ The contributions are the following.
   random models and to llama.cpp on the checkpoints (Section~\ref{sec:diff}).
 \end{itemize}
 
-The development is 19{,}171 lines of Rocq in twenty-four files and compiles in
-thirty seconds on one core, with a further three minutes for the report of
-assumptions. Of the 187 results that report covers, seventeen are closed under
-the global context, 138 rest on the four classical axioms of the Rocq
-real-number library that Flocq inherits, and 32 use CoqInterval and rest in
-addition on the axioms of primitive floats, 63-bit integers and primitive
-arrays.
+The development is 19{,}919 lines of Rocq in twenty-five files and compiles
+from clean in twenty-six seconds on one core, with a further one hundred and
+sixty-seven seconds for the report of assumptions. Of the 193 results that
+report covers, seventeen are closed under the global context, 144 rest on the
+four classical axioms of the Rocq real-number library that Flocq inherits, and
+32 use CoqInterval and rest in addition on the axioms of primitive floats,
+63-bit integers and primitive arrays. Table~\ref{tab:assume} says which class
+each result of this paper falls in.
 
 \section{The development}
 \label{sec:dev}
@@ -233,7 +239,57 @@ The proofs instantiate Flocq's double-rounding development \cite{roux2014} at
 the two formats. The width conditions hold because binary64's $53$ significand
 bits exceed binary32's $24$ by the margin each operation requires, and the
 exponent conditions because $e_{\min}^{64} = -1074$ lies below
-$e_{\min}^{32} = -149$. The elementary functions extract structurally in both
+$e_{\min}^{32} = -149$.
+
+That statement is about real numbers, so it settles the two modes' agreement
+only where both results are finite and it says nothing about the value either
+mode returns when a result overflows, when an operand is an infinity or a NaN,
+or when the result is a zero whose sign has to be chosen. \code{Narrow.v}
+closes the remaining cases by moving the statement to the floats themselves. It
+defines $\mathrm{widen}$, the exact embedding of a binary32 into binary64 that
+occurs when an OCaml \code{float} holding a binary32 value enters an
+arithmetic operation, and $\mathrm{narrow}$, the round-to-nearest-even
+conversion back that the \code{Int32} bit round-trip performs, with overflow to
+an infinity of the operand's sign.
+
+\begin{theorem}[\code{narrow\_widen\_plus}, \code{\_minus}, \code{\_mult}, \code{\_div}, \code{\_sqrt}]
+\label{thm:narrow}
+For all binary32 values $x$ and $y$,
+\[
+  \mathrm{narrow}\bigl(\mathrm{widen}(x) \mathbin{\circ_{64}} \mathrm{widen}(y)\bigr)
+  = x \mathbin{\circ_{32}} y
+\]
+for $\circ \in \{+, \times, \div\}$, with subtraction the case
+$\mathrm{narrow}(\mathrm{widen}(x) +_{64} -\mathrm{widen}(y))$ because
+\code{f32\_minus} is addition after negation and the native build extracts it
+that way, and likewise
+$\mathrm{narrow}(\sqrt{\vphantom{x}}_{64}\,\mathrm{widen}(x)) = \sqrt{\vphantom{x}}_{32}\,x$.
+There is no side condition: the statement quantifies over the constructors of
+\code{binary\_float}, so infinities, NaNs, signed zeros, underflow and overflow
+are all inside it.
+\end{theorem}
+
+The proof is one bridge lemma applied five times. For operands on which the
+operation's Flocq correctness theorem applies, the binary64 result is the
+correct rounding of the same exact real value the binary32 result rounds; the
+binary64 rounding never overflows, because a binary32 pair produces a quotient
+of magnitude at most $2^{277}$; narrowing that result is correct rounding
+again, and double rounding is harmless by the theorem above, so the two sides
+have the same value, the same finiteness and the same sign, which determines a
+float. The remaining operand shapes are decided by computation on the
+constructors. \code{narrow\_widen} states the special case that narrowing a
+widened binary32 returns it.
+
+The consequence is that the two extraction modes compute the same binary32
+value at every operation for every input, so a number measured on the native
+build is a number of the inductive build. What the native build still assumes
+is that the host's binary64 arithmetic is IEEE-754 round-to-nearest-even with
+no excess precision and no contraction of a multiply and an add, and that
+\code{Int32.bits\_of\_float} rounds to nearest. \code{runners/fp\_selftest.ml}
+decides both on the host that runs it, in thirty-three checks covering excess
+precision, contraction, ties to even at both widths, subnormals, overflow to an
+infinity, NaN propagation and the two signed zeros; it is the first thing
+\code{scripts/check.sh} runs. The elementary functions extract structurally in both
 modes as the same compositions of the primitives. Table~\ref{tab:tcb} states
 the two trusted bases.
 
@@ -248,7 +304,10 @@ binary32 values      & Flocq \code{binary\_float}        & OCaml \code{float} \\
 $\mathbb{Z}$, \code{positive} & inductive datatypes      & machine integers \\
 Arithmetic           & Flocq \code{B}-operations         & binary64, rounded to binary32 \\
 Floating-point hardware & not used for arithmetic        & trusted: binary64, nearest-even \\
-Further assumption   & none                              & \code{Int32.bits\_of\_float} rounds to nearest \\
+                     &                                   & no excess precision, no contraction \\
+Further assumption   & none                              & \code{bits\_of\_float} rounds to nearest \\
+Host assumptions decided by & ---                        & \code{fp\_selftest}, 33 checks \\
+Value at each operation & \multicolumn{2}{c}{equal on every input (Thm.~\ref{thm:narrow})} \\
 Byte addressing      & native, values via verified decode & native, values via verified decode \\
 GPT-2 forward pass   & 58.8 min                          & 10.3 s \\
 \bottomrule
@@ -276,7 +335,11 @@ Llama and Qwen3.5 references call \code{f32\_llama\_forward} and
 \code{f32\_qwen\_forward} directly.
 
 Table~\ref{tab:models} reports the three checkpoints against PyTorch in
-float32. Every ranking agrees, the largest logit difference among the top
+float32. Each ranking agrees as deeply as the stored oracle records it, which
+is through rank ten for GPT-2 and SmolLM2 and through rank eight for Qwen3.5,
+whose oracle holds eight; the eighth and seventh Qwen3.5 logits are $0.021$
+apart, so the depth is a property of the oracle and not of the agreement. The
+largest logit difference among the top
 candidates is $7.3\times10^{-5}$ absolute and $1.5\times10^{-6}$ relative, and
 the greedy continuations of SmolLM2 and Qwen3.5 are token-identical over twelve
 tokens. The inductive forward passes of all three models return top-ten logits
@@ -331,7 +394,14 @@ own tokenizer, was cut into consecutive blocks of 64 tokens, and the first 16
 tokens of 300 blocks spread evenly over the split form the windows. Each window
 was run through the native extraction, through PyTorch in float32 on an Intel
 i9-13900KF and on an RTX 6000 Ada GPU, and through llama.cpp \cite{llamacpp} on
-the same CPU and GPU from a float32 GGUF conversion. Each implementation returns
+the same CPU and GPU from a float32 GGUF conversion. That conversion is
+compared against the \code{safetensors} the extracted pass loads, tensor by
+tensor, by \code{scripts/provenance.py}: on SmolLM2 all $272$ tensors hold the
+same values, $212$ of them bit for bit and the remaining $60$, the query and
+key projections of the thirty layers, after undoing the row permutation the
+converter applies so that llama.cpp's rotary convention matches the
+checkpoint's. The deviations reported below are therefore differences in
+arithmetic and not in the weights. Each implementation returns
 the logits of all 16 positions, 4{,}800 next-token distributions per model.
 PyTorch runs with eager attention and with TF32 disabled, and Qwen3.5's gated
 DeltaNet runs its PyTorch fallback, a chunked form of the delta rule. llama.cpp
@@ -650,7 +720,7 @@ one.
 \code{Series.v} states, and CoqInterval \cite{coqinterval} proves, the
 truncation error of each polynomial with the divisors the code holds: the sine
 polynomial within $2\times10^{-9}$ of $\sin$ and the cosine polynomial within
-$2\times10^{-8}$ of $\cos$ on $[-3.15, 3.15]$, the exponential polynomial within
+$2\times10^{-8}$ of $\cos$ on $[-3.17, 3.17]$, the exponential polynomial within
 $10^{-8}$ of $\exp$ for $|r| \le 0.35$, and the arctanh series within
 $2\times10^{-8}$ of $\log$ on $[1, 2.0001]$, together with bounds on the stored
 constants. The file imports only the reals and the interval tactic, which keeps
@@ -674,25 +744,54 @@ an incoming relative error.
 \subsection{Sine and cosine}
 
 \begin{theorem}[\code{reduce\_vs\_true}]
-For $|x| \le 4000$ the real reduction $\rho(x) = x - k\,(201/32) - k\,(8312081/2^{32})$
-satisfies $|\rho(x)| \le 3.15$, $|\sin\rho(x) - \sin x| \le 1.3\times10^{-8}$ and
-$|\cos\rho(x) - \cos x| \le 1.3\times10^{-8}$.
+For $|x| \le 262144$ the real reduction $\rho(x) = x - k\,(201/32) - k\,(8312081/2^{32})$
+satisfies $|\rho(x)| \le 3.16$, $|\sin\rho(x) - \sin x| \le 8.4\times10^{-7}$ and
+$|\cos\rho(x) - \cos x| \le 8.4\times10^{-7}$.
 \end{theorem}
 
-The integer $k$ is at most $637$ in magnitude, the stored split differs from
-$2\pi$ by at most $2\times10^{-11}$, and the stored $1/2\pi$ differs from
-$1/2\pi$ by at most $10^{-8}$, which keeps $x - 2\pi k$ within $3.1419$ of zero.
+The range is the largest rotary angle any of the three checkpoints forms. An
+angle is a position times an inverse frequency, the largest inverse frequency
+is one, so the largest angle is the context length, and Qwen3.5's $262144$ is
+the longest. The integer $k$ is at most $41722$ in magnitude, the stored split
+differs from $2\pi$ by at most $2\times10^{-11}$, and the stored $1/2\pi$
+differs from $1/2\pi$ by at most $10^{-8}$, which keeps $x - 2\pi k$ within
+$3.159$ of zero. Both quantities grow with the range: the reduction is charged
+the split's error once per multiple of $2\pi$ removed, which is what takes the
+bound from $1.3\times10^{-8}$ at $|x| \le 4000$ to $8.4\times10^{-7}$ here, and
+the interval the reduced argument occupies widens with the error in the stored
+$1/2\pi$, which is why \code{Series.v} states its truncation bounds on
+$[-3.17, 3.17]$ rather than on $[-\pi, \pi]$. The integer the reduction selects
+converts to binary32 exactly for every $|k| < 2^{24}$
+(\code{f32\_of\_Z\_exact}), so it is the series interval and not the conversion
+that fixes the range.
 Periodicity over the integers and the Lipschitz bounds
 $|\sin p - \sin q| \le |p - q|$ and $|\cos p - \cos q| \le |p - q|$, both derived
 from the product formulas, finish the proof. \code{ok\_reduce\_2pi} carries the
 propagation relation through the reduction under the same kind of hypothesis
 as the exponential's, that the float and real evaluations select the same $k$.
 
+The side conditions of a stage are collected in a record, and the reduction's
+is the smallest one worth displaying in full. Writing $k$ for the integer the
+real evaluation selects and $\hat k$ for \code{f32\_of\_Z} of it,
+$\mathrm{red\_reg}\;M\;m\;x\;r$ is the conjunction of eight clauses: that the
+float reduction's rounded product agrees with $\hat k$ bit for bit; that
+$|\hat k|$, $|{\cdot}\,\mathrm{hi}|$ and $|{\cdot}\,\mathrm{lo}|$ are each at
+most $M$; that the two products $\hat k \cdot \mathrm{hi}$ and
+$\hat k \cdot \mathrm{lo}$ satisfy $\mathrm{regz}\;M$; and that the two
+subtractions do as well. The first clause is the one that is a genuine
+hypothesis rather than a magnitude bound, and it is the assumption the
+measurement of Section~\ref{sec:diff} exercises without discharging: it says
+that the float reduction lands on the integer the real reduction lands on. The
+records for the other stages have the same shape, one overflow clause per
+operation and one magnitude bound per factor, and are discharged pointwise in
+\code{Witness.v}.
+
 \begin{corollary}[\code{ok\_sin\_true\_full}, \code{ok\_cos\_true\_full}]
-Under the reduction's and the polynomial's side conditions, for $|x| \le 4000$
-the extracted \code{f32\_sin} is within $\mathrm{err}_{n+23} + 1.5\times10^{-8}$
-of $\sin x$ and \code{f32\_cos} within $\mathrm{err}_{n+22} + 3.3\times10^{-8}$ of
-$\cos x$, where the input is $\mathrm{ok}\;\mathrm{err}_n$.
+Under the reduction's and the polynomial's side conditions, for
+$|x| \le 262144$ the extracted \code{f32\_sin} is within
+$\mathrm{err}_{n+23} + 8.5\times10^{-7}$ of $\sin x$ and \code{f32\_cos} within
+$\mathrm{err}_{n+22} + 8.7\times10^{-7}$ of $\cos x$, where the input is
+$\mathrm{ok}\;\mathrm{err}_n$.
 \end{corollary}
 
 \subsection{The compositions}
@@ -717,11 +816,11 @@ bounds leave to the propagation term.
 \small
 \begin{tabular}{llll}
 \toprule
-\textbf{function} & \textbf{domain} & \textbf{proved, beyond rounding} & \textbf{measured} \\
+\textbf{function} & \textbf{domain} & \textbf{proved, reduction and series} & \textbf{measured, total} \\
 \midrule
 $\exp$     & $[-88, 88]$     & $1.6\times10^{-8}$ relative & $7.8\times10^{-8}$ relative \\
-$\sin$     & $[-4000, 4000]$ & $1.5\times10^{-8}$ & $5.6\times10^{-7}$ \\
-$\cos$     & $[-4000, 4000]$ & $3.3\times10^{-8}$ & $3.7\times10^{-7}$ \\
+$\sin$     & $[-262144, 262144]$ & $8.5\times10^{-7}$ & $4.4\times10^{-6}$ \\
+$\cos$     & $[-262144, 262144]$ & $8.7\times10^{-7}$ & $4.2\times10^{-6}$ \\
 $\log$     & $(1, 2]$        & $2\times10^{-8}$   & $9.4\times10^{-8}$ \\
 $\sigma$   & $[-88, 88]$     & $1.6\times10^{-8}$ & $8.4\times10^{-8}$ \\
 $\tanh$    & $[-44, 44]$     & $3.2\times10^{-8}$ & $1.7\times10^{-7}$ \\
@@ -730,13 +829,18 @@ GELU       & $[-8, 8]$       & $5\times10^{-5}$   & $5.1\times10^{-7}$ \\
 $\sqrt{\ }$ & all            & half a ULP         & $5.9\times10^{-8}$ relative \\
 \bottomrule
 \end{tabular}
-\caption{Distance from the real evaluation of each elementary function to the
-mathematical function, proved in \code{Truth.v}, and the maximum error of the
-extracted function measured on the inductive extraction at 20{,}001 points per
-row (sampled over $[-80,80]$ for $\exp$, $[-40,40]$ for $\sigma$, $[-20,20]$ for
-$\tanh$ and GELU, $[-30,30]$ for softplus and $[0,10^6]$ for $\sqrt{\ }$). The
-GELU bound uses the Lipschitz constant of $\tanh$ and so does not reflect its
-saturation.}
+\caption{The proved column is the distance from the real evaluation of each
+elementary function to the mathematical function, proved in \code{Truth.v}: it
+covers the argument reduction and the series truncation and leaves the rounding
+of the float evaluation to the propagation term $\mathrm{err}_k$, which is why
+it is not an upper bound on the measured column. The measured column is the
+maximum error of the extracted function, on the inductive extraction, at
+40{,}001 points per row sampled over the domain shown, except $[-80,80]$ for
+$\exp$, $[-40,40]$ for $\sigma$, $[-20,20]$ for $\tanh$ and GELU, $[-30,30]$
+for softplus and $[0,10^6]$ for $\sqrt{\ }$. The number of inputs whose sign
+disagrees with the mathematical function is zero in every row, at the widened
+trigonometric range included. The GELU bound uses the Lipschitz constant of
+$\tanh$ and so does not reflect its saturation.}
 \label{tab:elem}
 \end{table}
 
@@ -770,12 +874,14 @@ sequence, on top of a logarithm and a convolution, predicts.
 
 The architecture sweep supplies the rotary tables as data, so it does not
 evaluate \code{f32\_sin} or \code{f32\_cos}. A separate driver evaluates every
-elementary function on the inductive extraction at $20{,}001$ inputs, passed
+elementary function on the inductive extraction at $40{,}001$ inputs, passed
 and returned as binary32 bit patterns, and compares the results with the
 mathematical function in double precision. It reports the maximum error, in
 Table~\ref{tab:elem}, and the number of inputs whose sign disagrees with the
 mathematical function, which exposes a reduction landing on the wrong multiple
-of the period; that number is zero for every function.
+of the period; that number is zero for every function, and stays zero over the
+whole rotary range, where the reduction removes up to $41{,}722$ multiples of
+$2\pi$.
 
 \begin{table}[t]
 \centering
@@ -865,7 +971,17 @@ Qwen3.5 have no GELU.}
 
 Each choice alone, with the other three removed, changes top-1 tokens on at
 least one model and multiplies the largest logit deviation by about 90 to
-1{,}000 on every model it applies to, the kernel and TF32 by the most. With all
+1{,}000 on every model it applies to, the kernel and TF32 by the most.
+
+The counts are not monotone in the number of choices removed, because the
+kernel and the math mode govern the same matrix products. On GPT-2 on the GPU,
+removing \code{mul\_mat\_f} while TF32 remains enabled raises the top-1
+differences from 7 to 11: the products the kernel handled fall to cuBLAS, which
+in TF32 math mode carries a ten-bit significand. The three paths order by
+accuracy as cuBLAS in float32, then the kernel, then cuBLAS in TF32, so
+removing the kernel is an improvement only once TF32 is off. The two choices
+have to be read as a pair, and the row with both removed is the float32 path.
+With all
 four removed, llama.cpp agrees with the extracted forward pass as closely as
 PyTorch does on both backends, with every logit within $1.79\times10^{-3}$; its
 one top-1 difference, on SmolLM2 on the GPU, falls where the two highest
@@ -884,7 +1000,15 @@ specification.
 decode and the caches, which regroup the arithmetic, are proved to compute the
 values the definitions compute. The rest of the runners' composition, file
 input and the order of layers, is checked by the fixture comparison and by the
-inductive references rather than proved.
+inductive references rather than proved. This is the widest gap between what is
+proved and what is measured, and it is the reason the agreement of
+Section~\ref{sec:agree} is evidence and not a theorem. Closing it means defining
+the streaming, layer-by-layer pass in Rocq over an abstract weight source,
+proving it equal to \code{f32\_gpt2\_logits}, \code{f32\_llama\_forward} and
+\code{f32\_qwen\_forward}, and reducing the runners to byte input and output;
+the equalities of Section~\ref{sec:cache} are the fragments of that proof that
+exist. Theorem~\ref{thm:narrow} does not reach it: that theorem is about the
+arithmetic, and this is about the composition around it.
 
 \paragraph{The error bounds are worst-case.} The composed bound holds under its
 side-condition records, which are hypotheses about the inputs, discharged for
@@ -897,15 +1021,21 @@ bounds against the mathematical functions carry the hypotheses of the composed
 bound, and the one on GELU uses a Lipschitz constant rather than the saturation
 of $\tanh$.
 
-\paragraph{The receipt checksum is not cryptographic.} A generation can emit a
-receipt binding the weight checksum, the prompt and the output, checked by
-recomputation (\code{verify\_receipt\_sound}). The checksum is a polynomial
-rolling hash modulo $2^{32}$; it changes whenever a single byte of the file
-changes (\code{checksum\_detects\_single\_byte}), and it is not collision
-resistant.
+\paragraph{The receipt is not a security mechanism and is claimed as none.}
+\code{Receipt.v} defines a record binding a weight checksum, the prompt and the
+output, and proves it is checked by recomputation
+(\code{verify\_receipt\_sound}) and that its polynomial rolling hash modulo
+$2^{32}$ changes whenever a single byte of the file changes
+(\code{checksum\_detects\_single\_byte}). Those are the only claims made for
+it. It detects accident, not tampering: the hash is not collision resistant,
+and no threat model is offered under which it would be.
 
 \paragraph{The inductive mode is slow.} Bignum arithmetic runs at microseconds
 per operation, which puts a checkpoint forward pass at an hour to several hours.
+Theorem~\ref{thm:narrow} is what keeps that from limiting the claims: the two
+modes agree at every operation by proof, so the hardware mode's numbers are the
+inductive mode's numbers and nothing is established by running the slow one at
+scale.
 
 \section{Related work}
 
@@ -942,20 +1072,83 @@ self-attention.
 
 Batch-invariant kernels \cite{tinker2025} and RepOps \cite{gensyn2025} address
 nondeterminism by fixing the reduction order in the implementation rather than
-specifying it in a proof assistant. Correctly rounded binary32 elementary
+specifying it in a proof assistant. Three further lines take a reference
+without building one in a prover. Cankaya \cite{bitexact} shows that vLLM and
+Hugging Face transformers produce deterministic but non-invariant outputs and
+that bit-exact recomputation is possible across NVIDIA GPU variants by software
+emulation, so accumulated rounding becomes a signature of the setup that
+produced an output; the reference there is a rerun of the same software, where
+the reference here is a definition. Srivastava, Arora and Boneh \cite{optver}
+control hardware nondeterminism to make a training run auditable by a verifier
+who reruns it. Somani \cite{somani} compiles circuit explanations into bounded
+propositions an SMT solver decides over finite symbolic domains, which needs an
+operator stack that is piecewise linear and therefore replaces softmax; the
+development here keeps the operators the checkpoints were trained with and
+gives up decidability for them. George \cite{torchleancheck} reports a Lean
+layer over TorchLean that checks exported checkpoint files, traces and
+summaries against the claim they support, which is the same concern as
+Section~\ref{sec:exec} at the level of files rather than of arithmetic. Correctly rounded binary32 elementary
 functions \cite{rlibm32,coremath} are an alternative to the series used here,
 which would make the reference canonical against mathematics at the cost of
 moving it away from PyTorch, whose backends are not correctly rounded. Gated
 DeltaNet is due to Yang, Kautz and Hatamizadeh \cite{gateddeltanet}.
 
+\section{What each result rests on}
+\label{sec:assume}
+
+\code{theories/Audit.v} reports the assumptions behind every result named in
+this paper. Table~\ref{tab:assume} gives the class of each, generated from that
+report by \code{scripts/assumption\_table.py} rather than transcribed. Three
+classes occur. A result closed under the global context uses no axiom at all. A
+classical result rests on the four axioms of the Rocq real-number library that
+Flocq inherits, which is where every statement about real numbers necessarily
+lands. The results that call CoqInterval rest in addition on its
+primitive-float, 63-bit-integer and primitive-array interface, and those are
+the bounds against the mathematical functions: the series truncations of
+\code{Series.v} and everything composed from them. No result of this paper is
+closed under the global context and also about floating-point values, because
+the value of a float is a real number.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\input{assumptions}
+\caption{The assumption class of each result named in this paper, from the
+report \code{theories/Audit.v} produces. Of the 193 results that report covers,
+seventeen are closed, 144 are classical and 32 add CoqInterval's interface.}
+\label{tab:assume}
+\end{table}
+
 \section*{Availability}
 
-The development, the runners, the setup and harness scripts, and the data behind
-Tables~\ref{tab:bound}, \ref{tab:agree}, \ref{tab:elem}, \ref{tab:sweep}
-and~\ref{tab:llamacpp} are at
+The development, the runners, the setup and harness scripts, and the aggregate
+results behind Tables~\ref{tab:bound}, \ref{tab:agree}, \ref{tab:elem},
+\ref{tab:sweep} and~\ref{tab:llamacpp} are at
 \url{https://github.com/CharlesCNorton/proof2weights}. The theories compile
 under Rocq~9.0 with \code{coq-flocq} and \code{coq-interval}, and
 \code{theories/Audit.v} reports the assumptions behind the results.
+
+\code{scripts/check.sh} runs the checks and prints the time each takes: the
+theories, the assumption report, the self-test of the host the native build
+runs on, the provenance record, the elementary functions against the
+mathematical ones, the three checkpoints against their PyTorch oracles, and the
+bound the annotated pass carries. A step whose input is absent is reported as
+skipped and named, so the output says what was decided and what was not. On a
+machine with the runners and checkpoints present it takes nine minutes, and a
+further three to compile the theories and the assumption report.
+
+\code{scripts/provenance.py} writes the record that says which bytes every
+number here was produced from: the Hugging Face commit each checkpoint was read
+at, the digest of the converted \code{safetensors} the runners load, and the
+version of Rocq, Flocq, CoqInterval, PyTorch, CUDA, transformers and llama.cpp.
+The commits are \code{607a30d7} for GPT-2, \code{12fd25f7} for
+SmolLM2-135M-Instruct and \code{2fc06364} for Qwen3.5-0.8B.
+Checkpoint revisions move, so a rerun that reports a different commit is
+measuring different weights. The per-window logit dumps behind
+Table~\ref{tab:agree} are regenerated by \code{scripts/agree\_setup.py} and
+\code{scripts/agree\_torch.py} and are not in the repository; the windows they
+build are determined by the split, the tokenizer and the three integers the
+first of those scripts takes, so they are the same windows on any machine.
 
 \begin{thebibliography}{99}
 
@@ -1077,6 +1270,29 @@ S.~Merity, C.~Xiong, J.~Bradbury, and R.~Socher.
 G.~Gerganov and contributors.
 \newblock llama.cpp.
 \newblock \url{https://github.com/ggml-org/llama.cpp}, commit 8172e65.
+
+\bibitem{bitexact}
+N.~Cankaya.
+\newblock Bit-exact AI inference verification without performance tradeoffs.
+\newblock arXiv:2606.00279, 2026.
+
+\bibitem{optver}
+M.~Srivastava, S.~Arora, and D.~Boneh.
+\newblock Optimistic verifiable training by controlling hardware
+  nondeterminism.
+\newblock arXiv:2403.09603, 2024.
+
+\bibitem{somani}
+N.~Somani.
+\newblock Towards verifiable transformers: Solver-checkable circuit
+  explanations.
+\newblock arXiv:2605.24033, 2026.
+
+\bibitem{torchleancheck}
+R.~J.~George.
+\newblock Verifiable transformers in Lean.
+\newblock TorchLean research note, June 2026.
+\newblock \url{https://www.robertj1.com/ai4science/verifiable-transformer-checkpoint/}.
 
 \bibitem{residualstream}
 K.~U.~Qasim, J.~Zhang, M.~K.~Shaheen, R.~Alharith, and H.~Zhang.

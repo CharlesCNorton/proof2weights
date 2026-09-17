@@ -16,10 +16,11 @@ the extracted pass's top-1 token at every position, with every logit within
 The arithmetic executed at inference time is the arithmetic the proofs concern.
 The development proves that cached autoregressive decoding computes exactly the
 values full recomputation computes, that each of the three forward passes is
-causal, that the native build's double rounding through binary64 is harmless,
-a composed rounding-error bound from the arithmetic primitives to the logits of
-all three architectures, and a bound from each elementary function the models
-use to the corresponding mathematical function.
+causal, that the two extraction modes compute the same binary32 value at every
+operation for every input, with overflow, infinities, NaNs and signed zeros
+inside the statement, a composed rounding-error bound from the arithmetic
+primitives to the logits of all three architectures, and a bound from each
+elementary function the models use to the corresponding mathematical function.
 
 A paper describing the development is in `paper/paper.tex`.
 
@@ -96,9 +97,38 @@ operation is the binary64 result rounded to binary32 through an `Int32` bit
 round-trip. `Float_error.v` proves, by instantiating Flocq's double-rounding
 theorems at the two formats, that for binary32 operands rounding the exact
 result of `+`, `-`, `*`, `/` or `sqrt` to binary64 and then to binary32 equals
-rounding it directly to binary32. The trusted boundary of this mode is that the
-host float is binary64 with round-to-nearest-even and that
-`Int32.bits_of_float` rounds to nearest. The elementary functions extract
+rounding it directly to binary32.
+
+That statement is about real numbers, so it settles the two modes' agreement
+only where both results are finite. `Narrow.v` moves it to the floats
+themselves. It defines `widen`, the exact embedding of a binary32 into
+binary64 that happens when an OCaml `float` holding a binary32 value enters an
+operation, and `narrow`, the round-to-nearest-even conversion back that the
+`Int32` round-trip performs, and proves
+
+```
+narrow (b64_plus (widen x) (widen y))          = f32_plus x y
+narrow (b64_plus (widen x) (Bopp (widen y)))   = f32_minus x y
+narrow (b64_mult (widen x) (widen y))          = f32_mult x y
+narrow (b64_div  (widen x) (widen y))          = f32_div  x y
+narrow (b64_sqrt (widen x))                    = f32_sqrt x
+narrow (widen x)                               = x
+```
+
+for every binary32 `x` and `y`, with no side condition. The statements quantify
+over the constructors of `binary_float`, so overflow, infinities, NaNs, signed
+zeros and underflow are inside them. The two modes therefore compute the same
+binary32 value at every operation for every input, and a number measured on the
+native build is a number of the inductive build.
+
+The trusted boundary of the native mode is that the host float is binary64 with
+round-to-nearest-even, with no excess precision and no contraction of a
+multiply and an add, and that `Int32.bits_of_float` rounds to nearest.
+`runners/fp_selftest.ml` decides both on the host that runs it, in thirty-three
+checks covering excess precision, contraction, ties to even at both widths,
+subnormals, overflow to an infinity, NaN propagation and the two signed zeros.
+It exits non-zero on the first failure and is the first thing
+`scripts/check.sh` runs. The elementary functions extract
 structurally in both modes, as the same compositions of the primitives.
 
 ## Results on published checkpoints
@@ -195,10 +225,17 @@ Elementary functions against mathematics. `Series.v` bounds each series the
 code evaluates, with its stored divisors, against the function it approximates,
 using CoqInterval, and `Truth.v` composes those bounds with the propagation
 relation. The real evaluation of the exponential is within a relative `1.6e-8`
-of `exp` on [-88, 88] (`exp_core_vs_true`). For `|x| <= 4000` the reduction
-lands within 3.15 of zero, the stored split of `2 pi` costs at most `1.3e-8`,
-and the extracted sine and cosine are within `1.5e-8` and `3.3e-8` of `sin x`
+of `exp` on [-88, 88] (`exp_core_vs_true`). For `|x| <= 262144` the reduction
+lands within 3.16 of zero, the stored split of `2 pi` costs at most `8.4e-7`,
+and the extracted sine and cosine are within `8.5e-7` and `8.7e-7` of `sin x`
 and `cos x` beyond the rounding term (`ok_sin_true_full`, `ok_cos_true_full`).
+That range is the largest rotary angle any of the three checkpoints forms: an
+angle is a position times an inverse frequency, the largest inverse frequency
+is one, so the range is the longest context, and Qwen3.5's is 262144. Both
+constants grow with the range, the first because the split's error is charged
+once per multiple of `2 pi` removed and the second because the interval the
+reduced argument occupies widens with the error in the stored `1/(2 pi)`, which
+is why `Series.v` states its truncation bounds on [-3.17, 3.17].
 The logarithm is within `2e-8` of `ln` on (1, 2] (`ok_log_true`), sigmoid
 within `1.6e-8` (`ok_sigmoid_true`), tanh within `3.2e-8` (`ok_tanh_true`),
 softplus within `4e-8` of `ln (1 + exp x)` (`ok_softplus_true`), GELU within
@@ -278,7 +315,13 @@ blocks spread evenly over the split form the windows. Each window runs through
 the native extraction, through PyTorch in float32 on an i9-13900KF and an RTX
 6000 Ada with eager attention and TF32 off, and through llama.cpp from a float32
 GGUF on the same CPU and GPU with flash attention off and otherwise its
-defaults. Every implementation returns the logits of all 16 positions, 4,800
+defaults. `scripts/provenance.py --gguf smollm=<file>` compares that conversion
+against the `safetensors` the extracted pass loads, tensor by tensor: on
+SmolLM2 all 272 tensors hold the same values, 212 bit for bit and the other 60,
+the query and key projections of the thirty layers, after undoing the row
+permutation the converter applies so that llama.cpp's rotary convention matches
+the checkpoint's. The deviations below are differences in arithmetic, not in
+the weights. Every implementation returns the logits of all 16 positions, 4,800
 next-token distributions per model. Against the extracted pass, where top-1
 differs counts positions of 4,800, KL is D(p_extracted || p) averaged over
 positions, and perplexity covers the 4,500 positions with a following token:
@@ -322,21 +365,22 @@ moving from one layer to eight at width 8 raises it by 1.4.
 The architecture sweep supplies the rotary tables as data, so it does not
 evaluate `f32_sin` or `f32_cos`. `runners/prim_sweep.ml` and
 `scripts/prim_check.py` evaluate the elementary functions themselves on the
-inductive extraction at 20,001 points each and compare them with the
+inductive extraction at 40,001 points each and compare them with the
 mathematical functions in double precision, reporting the maximum error and
-the number of sign disagreements:
+the number of sign disagreements. Sine and cosine are swept over the whole
+rotary range, which is the longest context of the three checkpoints:
 
 | primitive | range | max error | sign disagreements |
 |---|---|---|---|
-| sin | [-4000, 4000] | 5.6e-7 abs | 0 |
-| cos | [-4000, 4000] | 3.7e-7 abs | 0 |
+| sin | [-262144, 262144] | 4.4e-6 abs | 0 |
+| cos | [-262144, 262144] | 4.2e-6 abs | 0 |
 | exp | [-80, 80] | 7.8e-8 rel | 0 |
-| sigmoid | [-40, 40] | 8.4e-8 abs | 0 |
-| tanh | [-20, 20] | 1.7e-7 abs | 0 |
+| sigmoid | [-40, 40] | 8.8e-8 abs | 0 |
+| tanh | [-20, 20] | 1.8e-7 abs | 0 |
 | GELU | [-20, 20] | 5.1e-7 abs | 0 |
-| log | [1, 2] | 9.4e-8 abs | 0 |
+| log | [1, 2] | 1.0e-7 abs | 0 |
 | softplus | [-30, 30] | 5.4e-7 abs | 0 |
-| sqrt | [0, 1e6] | 5.9e-8 rel | 0 |
+| sqrt | [0, 1e6] | 6.0e-8 rel | 0 |
 
 On the checkpoints the same reference attributes llama.cpp's divergence to four
 choices: the float16 key/value cache it uses by default, ggml-cpu's float16 GELU
@@ -373,6 +417,27 @@ receipt checksum detects any single-byte change but is not collision resistant.
 The theories need Rocq 9.0 with `coq-flocq` and `coq-interval`; the runners need
 OCaml 4.14 or later; the setup scripts and the harness need Python with `torch`,
 `transformers`, `numpy` and `safetensors`.
+
+`scripts/check.sh` runs the checks and prints the time each takes:
+the theories, the assumption report, the host self-test, the provenance record,
+the elementary functions against the mathematical ones, each checkpoint against
+its stored PyTorch oracle, and the bound the annotated pass carries. A step
+whose input is absent is reported as skipped and named, so the output says what
+was decided and what was not. On a machine with the theories built and the
+runners and checkpoints present it takes about fifteen minutes, of which the
+checkpoint oracles are nine and the assumption report is three.
+
+```bash
+scripts/check.sh            # everything
+scripts/check.sh --quick    # everything but the assumption report
+```
+
+Compiling the theories rewrites the extraction output in `theories/`, which the
+runners link against, so build the runners after the theories and not before.
+
+
+
+The individual steps:
 
 ```bash
 # Compile every theory in dependency order. Extraction output
@@ -514,6 +579,12 @@ library.
 | `theories/Llama.v` | RMSNorm, SiLU, sine and cosine, slicing, partial rotary embedding, SwiGLU, and the Llama layer, stack and forward pass. |
 | `theories/Qwen.v` | The logarithm and softplus, Euclidean normalization, the two extra RMSNorm variants, the depthwise causal convolution, the gated delta rule, and the Qwen3.5 mixers, layer wrapper, stack and forward pass. |
 | `theories/Float_error.v` | Correct rounding per operation, double rounding through binary64, the rounding model, and the composed error bounds up to the logits of all three architectures, with the backward-error statements. |
+| `theories/Narrow.v` | The widening and narrowing the native build performs, and the proof that narrowing the binary64 result of an operation on widened binary32 operands is the binary32 result, for every input, overflow and infinities and NaNs and signed zeros included. |
+| `runners/fp_selftest.ml` | The assumptions the native build makes about its host, decided on that host in thirty-three checks. |
+| `scripts/check.sh` | Runs the checks and prints the time each takes. |
+| `scripts/provenance.py` | The checkpoint revisions, file digests and tool versions every reported number was produced from. |
+| `scripts/oracle_check.py` | Each checkpoint's extracted forward pass against its stored PyTorch oracle. |
+| `scripts/assumption_table.py` | The assumption class of each result, from the report `Audit.v` produces. |
 | `theories/Dot.v` | The running bound for the dot product and its witnesses at an exact zero. |
 | `theories/Series.v` | CoqInterval bounds on each series and constant the code evaluates. |
 | `theories/Truth.v` | The elementary functions against the mathematical functions. |
