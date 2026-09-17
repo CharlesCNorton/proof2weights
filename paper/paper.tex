@@ -72,7 +72,9 @@ The contributions are the following.
   recurrence, extracted to programs that run the published GPT-2,
   SmolLM2-135M-Instruct and Qwen3.5-0.8B checkpoints
   (Section~\ref{sec:exec}), measured against PyTorch and llama.cpp on 300
-  held-out windows of 16 tokens per model (Section~\ref{sec:agree}).
+  held-out windows of 16 tokens per model (Section~\ref{sec:agree}). For each
+  model a runner whose forward pass is the extracted definition rather than a
+  loop rebuilt around it reproduces the same checkpoint's PyTorch oracle.
 \item Two extraction modes from one source, with a proof at the level of floats
   that they compute the same binary32 value at every operation for every input,
   overflow, infinities, NaNs and signed zeros included, and a self-test that
@@ -84,21 +86,17 @@ The contributions are the following.
 \item A composed rounding-error bound from the primitives to the logits of all
   three architectures, a GPT-2 forward pass that computes a bound on each
   logit's distance from exact real arithmetic while it runs, and a
-  backward-error statement for the linear layers (Section~\ref{sec:err}).
+  backward-error statement for the linear layers whose only hypothesis is that
+  nothing overflows (Section~\ref{sec:err}).
 \item Bounds from every elementary function the models evaluate to the
-  mathematical function (Section~\ref{sec:elem}).
+  mathematical function (Section~\ref{sec:elem}), and the error of each
+  measured at every one of the $2^{32}$ binary32 inputs
+  (Section~\ref{sec:exh}).
 \item A differential oracle for float32 implementations, applied to numpy on
   random models and to llama.cpp on the checkpoints (Section~\ref{sec:diff}).
 \end{itemize}
 
-The development is 19{,}919 lines of Rocq in twenty-five files and compiles
-from clean in twenty-six seconds on one core, with a further one hundred and
-sixty-seven seconds for the report of assumptions. Of the 193 results that
-report covers, seventeen are closed under the global context, 144 rest on the
-four classical axioms of the Rocq real-number library that Flocq inherits, and
-32 use CoqInterval and rest in addition on the axioms of primitive floats,
-63-bit integers and primitive arrays. Table~\ref{tab:assume} says which class
-each result of this paper falls in.
+The development is 20{,}464 lines of Rocq in twenty-seven files. Of the 203 results the assumption report covers, seventeen are closed under the global context, 154 rest on the four classical axioms of the Rocq real-number library that Flocq inherits, and 32 use CoqInterval and rest in addition on the axioms of primitive floats, 63-bit integers and primitive arrays. Table~\ref{tab:assume} says which class each result of this paper falls in.
 
 \section{The development}
 \label{sec:dev}
@@ -706,6 +704,30 @@ and to the tied-embedding projection of all three models
 (\code{f32\_mat\_vec\_mul\_backward}, \code{logits\_backward}), where the longest
 dot products are \cite{higham2002}.
 
+Its hypothesis is that every product and every partial sum is zero or at least
+$2^{-126}$ in magnitude, which is where rounding is relative. That is false
+where the networks compute: a masked attention score is the exponential of a
+saturated argument and is subnormal, and the products a dot product then
+accumulates are subnormal too. \code{Backward.v} drops it. The mixed rounding
+model holds for every real with no hypothesis, so the same induction carries an
+absolute term beside the relative one.
+
+\begin{theorem}[\code{f32\_dot\_backward\_mixed}]
+If no rounding in $\mathrm{dot}(x, y)$ of length $n$ overflows, the computed
+value equals $\sum_i x_i y_i t_i + \delta$ with
+$|t_i - 1| \le (1+u)^{n+1} - 1$ and
+$|\delta| \le 2 n \eta (1+u)^{n}$.
+\end{theorem}
+
+The relative factor is the one above, so the classical statement is the case
+where the displacement is known to vanish. The displacement is a multiple of
+half the smallest positive binary32, so it matters only where the exact inner
+product is itself of that size, which is exactly the masked rows. Overflow is
+the only hypothesis left, and it lifts to the matrix-vector product and the
+logit projection unchanged
+(\code{f32\_mat\_vec\_mul\_backward\_mixed}, \code{logits\_backward\_mixed}),
+where a row of length at most $k$ carries at most $2 k \eta (1+u)^{k}$.
+
 \section{The elementary functions against mathematics}
 \label{sec:elem}
 
@@ -818,15 +840,15 @@ bounds leave to the propagation term.
 \toprule
 \textbf{function} & \textbf{domain} & \textbf{proved, reduction and series} & \textbf{measured, total} \\
 \midrule
-$\exp$     & $[-88, 88]$     & $1.6\times10^{-8}$ relative & $7.8\times10^{-8}$ relative \\
-$\sin$     & $[-262144, 262144]$ & $8.5\times10^{-7}$ & $4.4\times10^{-6}$ \\
-$\cos$     & $[-262144, 262144]$ & $8.7\times10^{-7}$ & $4.2\times10^{-6}$ \\
-$\log$     & $(1, 2]$        & $2\times10^{-8}$   & $9.4\times10^{-8}$ \\
-$\sigma$   & $[-88, 88]$     & $1.6\times10^{-8}$ & $8.4\times10^{-8}$ \\
-$\tanh$    & $[-44, 44]$     & $3.2\times10^{-8}$ & $1.7\times10^{-7}$ \\
+$\exp$     & $[-88, 88]$     & $1.6\times10^{-8}$ relative & $1.7\times10^{-7}$ relative \\
+$\sin$     & $[-262144, 262144]$ & $8.5\times10^{-7}$ & $4.7\times10^{-6}$ \\
+$\cos$     & $[-262144, 262144]$ & $8.7\times10^{-7}$ & $4.3\times10^{-6}$ \\
+$\log$     & $(1, 2]$        & $2\times10^{-8}$   & $1.0\times10^{-7}$ \\
+$\sigma$   & $[-88, 88]$     & $1.6\times10^{-8}$ & $8.9\times10^{-8}$ \\
+$\tanh$    & $[-44, 44]$     & $3.2\times10^{-8}$ & $1.8\times10^{-7}$ \\
 softplus   & $[-88, 88]$     & $4\times10^{-8}$   & $5.4\times10^{-7}$ \\
-GELU       & $[-8, 8]$       & $5\times10^{-5}$   & $5.1\times10^{-7}$ \\
-$\sqrt{\ }$ & all            & half a ULP         & $5.9\times10^{-8}$ relative \\
+GELU       & $[-8, 8]$       & $5\times10^{-5}$   & $5.2\times10^{-7}$ \\
+$\sqrt{\ }$ & all            & half a ULP         & $6.0\times10^{-8}$ relative \\
 \bottomrule
 \end{tabular}
 \caption{The proved column is the distance from the real evaluation of each
@@ -834,13 +856,10 @@ elementary function to the mathematical function, proved in \code{Truth.v}: it
 covers the argument reduction and the series truncation and leaves the rounding
 of the float evaluation to the propagation term $\mathrm{err}_k$, which is why
 it is not an upper bound on the measured column. The measured column is the
-maximum error of the extracted function, on the inductive extraction, at
-40{,}001 points per row sampled over the domain shown, except $[-80,80]$ for
-$\exp$, $[-40,40]$ for $\sigma$, $[-20,20]$ for $\tanh$ and GELU, $[-30,30]$
-for softplus and $[0,10^6]$ for $\sqrt{\ }$. The number of inputs whose sign
-disagrees with the mathematical function is zero in every row, at the widened
-trigonometric range included. The GELU bound uses the Lipschitz constant of
-$\tanh$ and so does not reflect its saturation.}
+maximum error of the extracted function over \emph{every} binary32 input of
+the domain shown, from the exhaustive sweep of Table~\ref{tab:exh}. The GELU
+bound uses the Lipschitz constant of $\tanh$ and so does not reflect its
+saturation.}
 \label{tab:elem}
 \end{table}
 
@@ -876,12 +895,65 @@ The architecture sweep supplies the rotary tables as data, so it does not
 evaluate \code{f32\_sin} or \code{f32\_cos}. A separate driver evaluates every
 elementary function on the inductive extraction at $40{,}001$ inputs, passed
 and returned as binary32 bit patterns, and compares the results with the
-mathematical function in double precision. It reports the maximum error, in
-Table~\ref{tab:elem}, and the number of inputs whose sign disagrees with the
-mathematical function, which exposes a reduction landing on the wrong multiple
-of the period; that number is zero for every function, and stays zero over the
-whole rotary range, where the reduction removes up to $41{,}722$ multiples of
-$2\pi$.
+mathematical function in double precision. The number of inputs whose sign
+disagrees with the mathematical function, which exposes a reduction landing on
+the wrong multiple of the period, is zero for every function, and stays zero
+over the whole rotary range, where the reduction removes up to $41{,}722$
+multiples of $2\pi$.
+
+\subsection{Every binary32 input}
+\label{sec:exh}
+
+Sampling leaves the worst case to chance. \code{scripts/exhaustive.c} performs
+the same compositions, in the same order, with each primitive written as the
+binary64 operation narrowed to binary32, which Theorem~\ref{thm:narrow} makes
+the same function, and evaluates \emph{every} binary32 input of each domain
+against the mathematical function in binary64. Nineteen billion evaluations in
+all; Table~\ref{tab:exh} reports them.
+
+Three things follow. Square root is correctly rounded at all $2{,}139{,}095{,}041$
+non-negative binary32 inputs, with no exception and nothing left undecided,
+which is the only function here of which that is true. The exponential is
+within one unit in the last place everywhere, and the logarithm within two.
+And the functions built on a difference of nearly equal quantities lose all
+relative accuracy near their zeros: $\tanh$ is $2\sigma(2x) - 1$, so for
+$|x|$ below about $10^{-7}$ the sum inside $\sigma$ rounds to exactly two and
+the result is zero rather than $x$. That is visible as a relative error of one
+and an error of twenty million units in the last place, and as an absolute
+error of $1.8\times10^{-7}$, which is the figure Table~\ref{tab:elem} carries;
+GELU, softplus, sine and cosine lose accuracy the same way at their own zeros.
+Because the reference is a binary64 value rather than an infinitely precise
+one, an input whose true value lies within a guard band of a binary32 midpoint
+cannot be decided from it; those are counted separately and are the only inputs
+the sweep leaves open, at most $65{,}000$ of two billion in any row.
+
+\begin{table}[t]
+\centering
+\footnotesize
+\begin{tabular}{lrrrrrr}
+\toprule
+\textbf{function} & \textbf{inputs} & \textbf{max ULP} & \textbf{max abs}
+  & \textbf{max rel} & \textbf{not c.r.} & \textbf{undecided} \\
+\midrule
+$\exp$     & 2\,237\,661\,186 & $1.0$ & --- & $1.7\times10^{-7}$ & 18\,091\,635 & 424 \\
+$\sigma$   & 2\,237\,661\,186 & $2.5$ & $8.9\times10^{-8}$ & $1.5\times10^{-7}$ & 168\,315\,652 & 1\,626 \\
+$\tanh$    & 2\,220\,883\,970 & $2.1\times10^{7}$ & $1.8\times10^{-7}$ & $1.7$ & 890\,520\,350 & 557 \\
+GELU       & 2\,181\,038\,082 & $1.7\times10^{7}$ & $5.2\times10^{-7}$ & $1.0$ & 210\,671\,527 & 64\,673 \\
+$\log$     & 8\,388\,609      & $2.0$ & $1.0\times10^{-7}$ & $1.8\times10^{-7}$ & 3\,512\,285 & 11 \\
+softplus   & 2\,237\,661\,186 & $1.7\times10^{7}$ & $5.4\times10^{-7}$ & $1.0$ & 256\,582\,639 & 591 \\
+$\sin$     & 2\,432\,696\,322 & $3.9\times10^{8}$ & $4.7\times10^{-6}$ & $4.3\times10^{1}$ & 190\,141\,059 & 586 \\
+$\cos$     & 2\,432\,696\,322 & $3.3\times10^{8}$ & $4.3\times10^{-6}$ & $3.6\times10^{1}$ & 211\,932\,316 & 590 \\
+$\sqrt{\ }$ & 2\,139\,095\,041 & $0.5$ & --- & $6.0\times10^{-8}$ & 0 & 0 \\
+\bottomrule
+\end{tabular}
+\caption{Every binary32 input of each domain, against the mathematical function
+in binary64. \emph{not c.r.} counts the inputs whose result is not the
+correctly rounded one, \emph{undecided} those the binary64 reference cannot
+decide. The absolute column is omitted where the function's range spans many
+binades and only the relative figure means anything. Domains are those of
+Table~\ref{tab:elem}.}
+\label{tab:exh}
+\end{table}
 
 \begin{table}[t]
 \centering
@@ -996,19 +1068,38 @@ specification of what these models compute in floating point against which the
 development could be proved correct; the development is itself such a
 specification.
 
-\paragraph{The checkpoint runners are partly ordinary OCaml.} The transposed
-decode and the caches, which regroup the arithmetic, are proved to compute the
-values the definitions compute. The rest of the runners' composition, file
-input and the order of layers, is checked by the fixture comparison and by the
-inductive references rather than proved. This is the widest gap between what is
-proved and what is measured, and it is the reason the agreement of
-Section~\ref{sec:agree} is evidence and not a theorem. Closing it means defining
-the streaming, layer-by-layer pass in Rocq over an abstract weight source,
-proving it equal to \code{f32\_gpt2\_logits}, \code{f32\_llama\_forward} and
-\code{f32\_qwen\_forward}, and reducing the runners to byte input and output;
-the equalities of Section~\ref{sec:cache} are the fragments of that proof that
-exist. Theorem~\ref{thm:narrow} does not reach it: that theorem is about the
-arithmetic, and this is about the composition around it.
+\paragraph{What the runners still do themselves.} Each model has two runners.
+The cached one writes the layer loop in OCaml and calls the extracted operators
+from it, so its arithmetic is verified and its composition is not; it is the one
+that decodes autoregressively, and the equalities of Section~\ref{sec:cache} are
+what cover its caches. The other, named \code{\_verified}, does not write the
+loop: it reads the file, decodes each value with
+\code{f32\_bytes\_to\_binary32}, builds the layer maps and calls
+\code{f32\_gpt2\_logits\_pre}, \code{f32\_llama\_forward} or
+\code{f32\_qwen\_forward}, which are the definitions the proofs are about,
+extracted. What it still does natively is the file read, the offset lookup
+through the verified \code{json\_tensor\_offsets}, and the assembly of the
+weight records. It does not cache, so it recomputes the sequence at every step
+and is not the runner to generate with.
+
+The two agree on the checkpoints: on GPT-2 and SmolLM2 the ten highest logits of
+the stored prompt agree to every digit printed, and each verified runner
+reproduces its model's stored PyTorch oracle, Qwen3.5's through the eighth rank
+its oracle records. What remains outside a proof is therefore the record
+assembly rather than the forward pass.
+
+\paragraph{The pre-transposed pass is a second definition.} The GPT-2 runner
+cannot call \code{f32\_gpt2\_logits}, because \code{f32\_linear\_forward}
+transposes its weight and the extracted transpose indexes a list of lists, which
+is quadratic in the output dimension. \code{Pretransposed.v} gives the same pass
+over weights already stored transposed, which is the order the runner decodes
+them in, and proves that on the transpose of a model it returns what the
+original returns on the model
+(\code{f32\_gpt2\_logits\_pre\_correct}). Every function there differs from its
+counterpart by dropping one \code{f32\_mat\_transpose}, and each correctness
+lemma is that drop undone, so the second definition is tied to the first rather
+than standing beside it. The Llama and Qwen3.5 paths need no such variant: their
+definitions take the weights in the order the runner holds them.
 
 \paragraph{The error bounds are worst-case.} The composed bound holds under its
 side-condition records, which are hypotheses about the inputs, discharged for
@@ -1114,8 +1205,8 @@ the value of a float is a real number.
 \footnotesize
 \input{assumptions}
 \caption{The assumption class of each result named in this paper, from the
-report \code{theories/Audit.v} produces. Of the 193 results that report covers,
-seventeen are closed, 144 are classical and 32 add CoqInterval's interface.}
+report \code{theories/Audit.v} produces. Of the 203 results that report covers,
+seventeen are closed, 154 are classical and 32 add CoqInterval's interface.}
 \label{tab:assume}
 \end{table}
 

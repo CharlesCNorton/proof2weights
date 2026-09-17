@@ -131,6 +131,36 @@ It exits non-zero on the first failure and is the first thing
 `scripts/check.sh` runs. The elementary functions extract
 structurally in both modes, as the same compositions of the primitives.
 
+## Two runners per model
+
+Each model has two runners. The cached one (`gpt2_talk_native`,
+`llama_talk_native`, `qwen_talk_native`) writes the layer loop in OCaml and
+calls the extracted operators from it, so its arithmetic is verified and its
+composition is not; it is the one that decodes autoregressively, and the cache
+equalities of `Cache.v` are what cover it.
+
+The other (`gpt2_verified`, `llama_verified`, `qwen_verified`) does not write
+the loop. It reads the file, decodes each value with `f32_bytes_to_binary32`,
+builds the layer maps and calls `f32_gpt2_logits_pre`, `f32_llama_forward` or
+`f32_qwen_forward`, which are the definitions the proofs are about, extracted.
+What it still does natively is the file read, the offset lookup through the
+verified `json_tensor_offsets`, and the assembly of the weight records. It does
+not cache, so it recomputes the sequence at every step and is not the runner to
+generate with.
+
+The two agree: on GPT-2 and SmolLM2 the ten highest logits of the stored prompt
+agree to every digit printed, and each verified runner reproduces its model's
+stored PyTorch oracle, Qwen3.5's through the eighth rank its oracle records.
+`scripts/verified_check.py` is that comparison.
+
+`f32_linear_forward` transposes its weight, and the extracted transpose indexes
+a list of lists, so it is quadratic in the output dimension; that is why the
+GPT-2 runner cannot call `f32_gpt2_logits` directly. `Pretransposed.v` gives the
+same pass over weights already stored transposed, which is the order the runner
+decodes them in, and proves that on the transpose of a model it returns what the
+original returns on the model (`f32_gpt2_logits_pre_correct`). The Llama and
+Qwen3.5 paths need no such variant.
+
 ## Results on published checkpoints
 
 Agreement is against PyTorch in float32 on the same prompt. Timings are wall
@@ -579,6 +609,11 @@ library.
 | `theories/Llama.v` | RMSNorm, SiLU, sine and cosine, slicing, partial rotary embedding, SwiGLU, and the Llama layer, stack and forward pass. |
 | `theories/Qwen.v` | The logarithm and softplus, Euclidean normalization, the two extra RMSNorm variants, the depthwise causal convolution, the gated delta rule, and the Qwen3.5 mixers, layer wrapper, stack and forward pass. |
 | `theories/Float_error.v` | Correct rounding per operation, double rounding through binary64, the rounding model, and the composed error bounds up to the logits of all three architectures, with the backward-error statements. |
+| `theories/Backward.v` | The backward error of the dot product with the underflow term, whose only hypothesis is that nothing overflows, and its lifting to the linear layers and the logit projection. |
+| `theories/Pretransposed.v` | The GPT-2 forward pass over weights already stored transposed, and the proof that it returns what the original returns. |
+| `runners/*_verified.ml` | Each checkpoint through the extracted forward pass itself rather than a loop rebuilt around it. |
+| `scripts/verified_check.py` | Those runners against the stored PyTorch oracles. |
+| `scripts/exhaustive.c` | Every elementary function at every one of the 2^32 binary32 inputs. |
 | `theories/Narrow.v` | The widening and narrowing the native build performs, and the proof that narrowing the binary64 result of an operation on widened binary32 operands is the binary32 result, for every input, overflow and infinities and NaNs and signed zeros included. |
 | `runners/fp_selftest.ml` | The assumptions the native build makes about its host, decided on that host in thirty-three checks. |
 | `scripts/check.sh` | Runs the checks and prints the time each takes. |
