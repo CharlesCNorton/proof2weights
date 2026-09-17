@@ -68,3 +68,6 @@ nul
 /theories/Makefile.coq
 /theories/Makefile.coq.conf
 /theories/.Makefile.coq.d
+
+# The provenance record, written by scripts/provenance.py for the run at hand.
+/provenance.json
