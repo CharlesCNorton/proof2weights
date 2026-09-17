@@ -71,3 +71,8 @@ nul
 
 # The provenance record, written by scripts/provenance.py for the run at hand.
 /provenance.json
+
+# Logit dumps and window files for the agreement evaluation. The manifest that
+# names them is tracked; the dumps themselves are regenerated.
+/agree/*/
+/agree/*.log
