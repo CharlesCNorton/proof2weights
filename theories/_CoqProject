@@ -4,6 +4,7 @@ Phases1_15_complete.v
 Llama.v
 Qwen.v
 Float_error.v
+Narrow.v
 Dot.v
 Cache.v
 Cache_attn.v

@@ -19,6 +19,7 @@ Require Import Phases1_15_complete.
 Require Import Llama.
 Require Import Qwen.
 Require Import Float_error.
+Require Import Narrow.
 Require Import Dot.
 Require Import Cache.
 Require Import Cache_attn.
@@ -59,6 +60,15 @@ Print Assumptions f32_double_round_plus.
 Print Assumptions f32_double_round_mult.
 Print Assumptions f32_double_round_div.
 Print Assumptions f32_double_round_sqrt.
+
+(** * The native build's arithmetic, at the level of floats *)
+
+Print Assumptions narrow_widen.
+Print Assumptions narrow_widen_plus.
+Print Assumptions narrow_widen_minus.
+Print Assumptions narrow_widen_mult.
+Print Assumptions narrow_widen_div.
+Print Assumptions narrow_widen_sqrt.
 
 (** * The rounding model *)
 
