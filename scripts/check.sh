@@ -97,6 +97,14 @@ else
   skipstep "each checkpoint against its PyTorch oracle" "runners not built"
 fi
 
+echo "the extracted forward pass on the checkpoints"
+if [ -x "$RUN_DIR/gpt2_verified" ] || [ -x "$RUN_DIR/llama_verified" ]; then
+  step "the extracted pass against each oracle" \
+    "$PY" scripts/verified_check.py gpt2 smollm --bin "$RUN_DIR"
+else
+  skipstep "the extracted pass against each oracle" "runners not built"
+fi
+
 echo "the bound the annotated pass carries"
 # GPT-2 small, on the prompt "The quick brown"
 if [ -x "$RUN_DIR/gpt2_bound_native" ] && [ -f "$RUN_DIR/gpt2.safetensors" ]; then
