@@ -230,3 +230,95 @@ constants as stored.
 | GPU, f32 cache, TF32, no mul_mat_f | 4500 | 213.213979 | 1.03e-02 |
 | GPU, f16 cache, no TF32, no mul_mat_f | 4500 | 213.221885 | 5.95e-03 |
 | GPU, f32 cache, no TF32, no mul_mat_f | 4500 | 213.216583 | 8.14e-05 |
+
+## Agreement on 64-token windows: gpt2
+
+60 windows of 64 tokens from the WikiText-2 raw test split, every position compared. bf16 is the row the float32 comparison does not reach.
+
+| pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
+|------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
+| extracted / PyTorch CPU | 3840/3840 | 3836/3840 | 5.20% | 4.7e-05 | 1.0e-03 | 1.68e-03 | 7.2e-10 | 7.5e-09 | - |
+| extracted / PyTorch CUDA | 3840/3840 | 3838/3840 | 5.53% | 3.9e-05 | 1.1e-03 | 1.56e-03 | 6.4e-10 | 1.1e-08 | - |
+| extracted / PyTorch CUDA bf16 | 3372/3840 | 92/3840 | 0.00% | 3.1e-01 | 8.7e+00 | 1.25e+01 | 1.6e-02 | 8.6e-02 | 7.89e-01 |
+| PyTorch CPU / PyTorch CUDA | 3840/3840 | 3836/3840 | 8.49% | 3.1e-05 | 5.8e-04 | 1.11e-03 | 4.0e-10 | 3.5e-09 | - |
+
+| source | predicted tokens | perplexity | max per-token NLL difference from extracted |
+|--------|------------------|------------|-----------------------|
+| extracted | 3780 | 80.256641 | - |
+| PyTorch CPU | 3780 | 80.256637 | 2.59e-04 |
+| PyTorch CUDA | 3780 | 80.256674 | 2.90e-04 |
+| PyTorch CUDA bf16 | 3780 | 80.495299 | 1.15e+00 |
+
+## Agreement on 64-token windows: smollm
+
+60 windows of 64 tokens from the WikiText-2 raw test split, every position compared. bf16 is the row the float32 comparison does not reach.
+
+| pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
+|------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
+| extracted / PyTorch CPU | 3840/3840 | 3840/3840 | 1.35% | 1.1e-05 | 1.4e-04 | 1.17e-03 | 4.7e-11 | 4.1e-08 | - |
+| extracted / PyTorch CUDA | 3840/3840 | 3840/3840 | 1.35% | 1.1e-05 | 1.4e-04 | 9.61e-04 | 4.1e-11 | 2.7e-08 | - |
+| extracted / PyTorch CUDA bf16 | 3691/3840 | 961/3840 | 0.00% | 8.9e-02 | 1.5e+00 | 7.85e+00 | 1.6e-03 | 2.7e-01 | 3.16e-01 |
+
+| source | predicted tokens | perplexity | max per-token NLL difference from extracted |
+|--------|------------------|------------|-----------------------|
+| extracted | 3780 | 62.922808 | - |
+| PyTorch CPU | 3780 | 62.922790 | 1.83e-04 |
+| PyTorch CUDA | 3780 | 62.922791 | 1.55e-04 |
+| PyTorch CUDA bf16 | 3780 | 63.001049 | 1.31e+00 |
+
+## Agreement on 512-token windows: smollm
+
+3 windows of 512 tokens from the WikiText-2 raw test split, every position compared. The rotary angles here reach 511.
+
+| pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
+|------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
+| extracted / PyTorch CPU | 1536/1536 | 1536/1536 | 1.37% | 1.0e-05 | 7.1e-05 | 1.46e-04 | 2.9e-11 | 2.7e-10 | - |
+
+| source | predicted tokens | perplexity | max per-token NLL difference from extracted |
+|--------|------------------|------------|-----------------------|
+| extracted | 1533 | 26.322307 | - |
+| PyTorch CPU | 1533 | 26.322303 | 3.59e-05 |
+
+## What the PyTorch residual is made of
+
+The llama.cpp attribution turns one implementation choice off at a time. The
+residual against PyTorch has only two sources: PyTorch evaluates the elementary
+functions with its own implementations rather than the series the development
+composes, and it accumulates its matrix products in a different order.
+`scripts/residual_attr.py` separates them on GPT-2 by running the forward pass
+in numpy float32 twice over the same checkpoint and windows, once with numpy's
+own exp and GELU and once with the extracted ones, against the extracted
+reference. Twenty windows of 64 tokens:
+
+| source | max abs | mean abs | top-1 differs |
+|---|---|---|---|
+| numpy | 1.766e-03 | 6.159e-05 | 0 |
+| numpy, extracted exp and GELU | 1.678e-03 | 6.112e-05 | 0 |
+| PyTorch CPU | 1.678e-03 | 6.199e-05 | 0 |
+
+Substituting the extracted elementary functions moves the maximum by 5 percent
+and the mean by under 1 percent, and PyTorch lands where the substituted numpy
+lands. The residual against PyTorch is therefore reduction order, not the
+elementary functions.
+
+## Whether the difference grows with position
+
+A window's later positions attend over more keys and carry larger rotary
+angles. `scripts/position_growth.py` reports the difference from PyTorch at
+each position. It is flat.
+
+| model | window | first band | last band | last over first |
+|---|---|---|---|---|
+| GPT-2 | 64 tokens, 60 windows | 5.281e-05 | 5.860e-05 | 1.110 |
+| SmolLM2 | 512 tokens, 3 windows | 1.286e-05 | 1.236e-05 | 0.961 |
+
+## The dumps behind these tables
+
+`agree/manifest.json` names every logit dump above with its SHA-256: ten
+sources, 486 files, 6.71 GB. The files themselves are regenerated by
+`scripts/agree_setup.py`, the runners' dump mode and `scripts/agree_torch.py`;
+the windows are determined by the split, the tokenizer and the three integers
+the first of those takes, so they are the same windows on any machine.
+`scripts/data_manifest.py check` verifies a set of files against the manifest,
+and `scripts/data_manifest.py subset` picks a seeded subset for a reader who
+would rather regenerate a few windows than all of them.
