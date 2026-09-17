@@ -22,8 +22,11 @@ f32 = np.float32
 
 # primitive -> (sample range, reference function, kind)
 CASES = {
-    "sin":      ((-4000.0, 4000.0), np.sin,                       "abs"),
-    "cos":      ((-4000.0, 4000.0), np.cos,                       "abs"),
+    # sin and cos are sampled over the whole rotary range: an angle is a
+    # position times an inverse frequency, the largest inverse frequency is
+    # one, so the range is the longest context of the three checkpoints.
+    "sin":      ((-262144.0, 262144.0), np.sin,                   "abs"),
+    "cos":      ((-262144.0, 262144.0), np.cos,                   "abs"),
     "exp":      ((-80.0, 80.0),     np.exp,                       "rel"),
     "sigmoid":  ((-40.0, 40.0),     lambda x: 1.0 / (1.0 + np.exp(-x)), "abs"),
     "tanh":     ((-20.0, 20.0),     np.tanh,                      "abs"),

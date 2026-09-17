@@ -16,11 +16,16 @@ Open Scope R_scope.
 
 (** * Sine and cosine, on the reduced argument
 
-    The reduction lands within [3.15] of zero for every argument of magnitude
-    up to [4000] (Truth.v). *)
+    The reduction lands within [3.17] of zero for every argument of magnitude
+    up to [262144] (Truth.v), which covers the largest rotary angle any of the
+    three checkpoints can form: the angle is the position times the largest
+    inverse frequency, which is one, so the bound is the context length. The
+    interval is wider than [pi] because the stored [1/(2 pi)] and the rounding
+    of the product select an integer that can sit a little off the nearest one;
+    the slack grows with the argument, and at [262144] it is [0.027]. *)
 
 Theorem sin_series_bound : forall r : R,
-  -3.15 <= r <= 3.15 ->
+  -3.17 <= r <= 3.17 ->
   Rabs ((r - r^3/6 + r^5/120 - r^7/5040 + r^9/362880 - r^11/39916800
          + r^13/6227020800 - r^15/1307674411008 + r^17/355687414628352
          - r^19/121645104594157568) - sin r) <= 2/1000000000.
@@ -29,7 +34,7 @@ Proof.
 Qed.
 
 Theorem cos_series_bound : forall r : R,
-  -3.15 <= r <= 3.15 ->
+  -3.17 <= r <= 3.17 ->
   Rabs ((1 - r^2/2 + r^4/24 - r^6/720 + r^8/40320 - r^10/3628800
          + r^12/479001600 - r^14/87178289152 + r^16/20922790576128
          - r^18/6402373530419200) - cos r) <= 2/100000000.

@@ -100,31 +100,8 @@ Proof.
   destruct (Rcompare_spec (B2R x) (B2R y)); try discriminate; lra.
 Qed.
 
-(** An integer below [2^24] in magnitude converts exactly. *)
-Lemma f32_of_Z_exact : forall n : Z,
-  (Z.abs n < 16777216)%Z ->
-  is_finite (f32_of_Z n) = true /\ B2R (f32_of_Z n) = IZR n.
-Proof.
-  intros n Hn.
-  pose proof (binary_normalize_correct prec32 emax32 prec32_gt_0 prec32_lt_emax32
-                mode_NE n 0 false) as H.
-  cbv zeta in H.
-  assert (HF : F2R (Float radix2 n 0) = IZR n) by (unfold F2R; simpl; ring).
-  rewrite HF in H.
-  assert (Hfmt : generic_format radix2 f32_fexp (IZR n)).
-  { rewrite <- HF. apply generic_format_FLT.
-    apply (FLT_spec _ _ _ _ (Float radix2 n 0)); [reflexivity | | ].
-    - cbn [Fnum]. unfold prec32. simpl. lia.
-    - cbn [Fexp]. unfold SpecFloat.emin, prec32, emax32. lia. }
-  unfold f32_fexp in Hfmt.
-  rewrite (round_generic radix2 _ _ _ Hfmt) in H.
-  assert (Hlt : Rabs (IZR n) < bpow radix2 emax32).
-  { rewrite <- abs_IZR. apply Rlt_trans with (IZR 16777216).
-    - apply IZR_lt. exact Hn.
-    - unfold emax32. simpl. apply IZR_lt. reflexivity. }
-  rewrite Rlt_bool_true in H by exact Hlt.
-  destruct H as [H1 [H2 _]]. unfold f32_of_Z. split; assumption.
-Qed.
+(** [f32_of_Z_exact], that an integer below [2^24] in magnitude converts
+    exactly, is Float_error.v's. *)
 
 (** * Rounding to the nearest integer lands on an integer *)
 

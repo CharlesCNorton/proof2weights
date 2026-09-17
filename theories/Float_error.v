@@ -448,6 +448,36 @@ Proof.
   apply FLT_format_generic; solve [ apply generic_format_B2R | dr_side ].
 Qed.
 
+(** An integer below [2^24] in magnitude converts exactly. Truth.v needs this
+    for the integer the trigonometric reduction selects, which reaches 41722 at
+    the largest rotary angle the checkpoints form, and Annot.v for the
+    constants of the annotated arithmetic. *)
+Lemma f32_of_Z_exact : forall n : Z,
+  (Z.abs n < 16777216)%Z ->
+  is_finite (f32_of_Z n) = true /\ B2R (f32_of_Z n) = IZR n.
+Proof.
+  intros n Hn.
+  pose proof (binary_normalize_correct prec32 emax32 prec32_gt_0 prec32_lt_emax32
+                mode_NE n 0 false) as H.
+  cbv zeta in H.
+  assert (HF : F2R (Float radix2 n 0) = IZR n) by (unfold F2R; simpl; ring).
+  rewrite HF in H.
+  assert (Hfmt : generic_format radix2 f32_fexp (IZR n)).
+  { rewrite <- HF. apply generic_format_FLT.
+    apply (FLT_spec _ _ _ _ (Float radix2 n 0)); [reflexivity | | ].
+    - cbn [Fnum]. unfold prec32. simpl. lia.
+    - cbn [Fexp]. unfold SpecFloat.emin, prec32, emax32. lia. }
+  unfold f32_fexp in Hfmt.
+  rewrite (round_generic radix2 _ _ _ Hfmt) in H.
+  assert (Hlt : (Rabs (IZR n) < bpow radix2 emax32)%R).
+  { rewrite <- abs_IZR. apply Rlt_le_trans with (bpow radix2 24).
+    - rewrite <- (IZR_Zpower radix2 24) by lia.
+      apply IZR_lt. change (radix2 ^ 24)%Z with 16777216%Z. exact Hn.
+    - apply bpow_le. unfold emax32. lia. }
+  rewrite Rlt_bool_true in H by exact Hlt.
+  destruct H as [H1 [H2 _]]. unfold f32_of_Z. split; assumption.
+Qed.
+
 (** * Double rounding is harmless at these two formats
 
     binary64 carries 53 bits of significand against binary32's 24, which

@@ -99,13 +99,13 @@ Qed.
 (** * Sine and cosine *)
 
 Theorem sin_poly_actual : forall r : R,
-  -3.15 <= r <= 3.15 -> Rabs (Rs_poly r - sin r) <= 2/1000000000.
+  -3.17 <= r <= 3.17 -> Rabs (Rs_poly r - sin r) <= 2/1000000000.
 Proof.
   intros r Hr. rewrite Rs_poly_expand. apply sin_series_bound, Hr.
 Qed.
 
 Theorem cos_poly_actual : forall r : R,
-  -3.15 <= r <= 3.15 -> Rabs (Rc_poly r - cos r) <= 2/100000000.
+  -3.17 <= r <= 3.17 -> Rabs (Rc_poly r - cos r) <= 2/100000000.
 Proof.
   intros r Hr. rewrite Rc_poly_expand. apply cos_series_bound, Hr.
 Qed.
@@ -127,7 +127,7 @@ Theorem ok_sin_true : forall M m L k x rr,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) (f32_reduce_2pi x) rr ->
   sin_reg M m (f32_reduce_2pi x) rr ->
-  -3.15 <= rr <= 3.15 ->
+  -3.17 <= rr <= 3.17 ->
   Rabs (B2R (f32_sin x) - sin rr) <= errN M L (k + 20) + 2/1000000000.
 Proof.
   intros M m L k x rr HM Hamp Hr Hreg Hint.
@@ -140,7 +140,7 @@ Theorem ok_cos_true : forall M m L k x rr,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L k) (f32_reduce_2pi x) rr ->
   cos_reg M m (f32_reduce_2pi x) rr ->
-  -3.15 <= rr <= 3.15 ->
+  -3.17 <= rr <= 3.17 ->
   Rabs (B2R (f32_cos x) - cos rr) <= errN M L (k + 19) + 2/100000000.
 Proof.
   intros M m L k x rr HM Hamp Hr Hreg Hint.
@@ -156,38 +156,19 @@ Qed.
     rounding the exact product and performs the same two subtractions. The one
     branch that is a hypothesis is [k] itself, as for the exponential: the
     float reduction must land on the integer the real evaluation selects. For
-    [|x| <= 4000] the reduced argument stays within [3.15] of zero and differs
-    from [x - 2 pi k] by at most [1.3e-8], so the series bounds carry over to
-    [sin x] and [cos x]. *)
+    [|x| <= 262144] the reduced argument stays within [3.16] of zero and
+    differs from [x - 2 pi k] by at most [8.4e-7], so the series bounds carry
+    over to [sin x] and [cos x]. That range is the largest rotary angle any of
+    the three checkpoints forms, the context length times the largest inverse
+    frequency, which is one. The error grows with the range because the stored
+    split of [2 pi] is charged once per multiple removed. *)
 
-Definition trig_k_range : list Z :=
-  List.map (fun n => (Z.of_nat n - 1024)%Z) (List.seq 0 2049).
-
-Definition trig_k_ok (z : Z) : bool :=
-  is_finite (f32_of_Z z) && Qeq_bool (Qb (f32_of_Z z)) (inject_Z z).
-
-Lemma trig_k_ok_all : List.forallb trig_k_ok trig_k_range = true.
-Proof. vm_compute. reflexivity. Qed.
-
-Lemma in_trig_k_range : forall z, (-1024 <= z <= 1024)%Z -> List.In z trig_k_range.
-Proof.
-  intros z Hz. unfold trig_k_range. apply List.in_map_iff.
-  exists (Z.to_nat (z + 1024)). split.
-  - rewrite Z2Nat.id by lia. lia.
-  - apply List.in_seq. lia.
-Qed.
-
-Lemma of_Z_exact : forall z, (-1024 <= z <= 1024)%Z ->
+(** The integer the reduction selects converts exactly. This is Float_error.v's
+    [f32_of_Z_exact], which holds for every integer below [2^24] in magnitude
+    and so does not cap the argument range. *)
+Lemma of_Z_exact : forall z, (Z.abs z < 16777216)%Z ->
   is_finite (f32_of_Z z) = true /\ B2R (f32_of_Z z) = IZR z.
-Proof.
-  intros z Hz.
-  pose proof (proj1 (List.forallb_forall trig_k_ok trig_k_range) trig_k_ok_all z
-                (in_trig_k_range z Hz)) as H.
-  unfold trig_k_ok in H. apply andb_prop in H as [H1 H2].
-  apply Qeq_bool_eq in H2.
-  split; [exact H1|].
-  rewrite Qb_correct, (Qeq_eqR _ _ H2). apply Q2R_inject.
-Qed.
+Proof. exact f32_of_Z_exact. Qed.
 
 Lemma B2R_2pi_hi : B2R f32_2pi_hi = 201 / 32.
 Proof.
@@ -231,7 +212,8 @@ Record red_reg (M m : R) (x : binary32) (rx : R) : Prop := {
 
 Lemma ok_reduce_2pi : forall M m L n x rx,
   M < bpow radix2 emax32 -> amp_ok M m L ->
-  ok (errN M L n) x rx -> red_reg M m x rx -> (-1024 <= Rs_k rx <= 1024)%Z ->
+  ok (errN M L n) x rx -> red_reg M m x rx ->
+  (Z.abs (Rs_k rx) < 16777216)%Z ->
   ok (errN M L (n + 3)) (f32_reduce_2pi x) (Rreduce rx).
 Proof.
   intros M m L n x rx HM Hamp Hx Hreg Hk.
@@ -271,18 +253,22 @@ Lemma Rs_k_half : forall rx : R,
   Rabs (rx * (10680707 / 67108864) - IZR (Rs_k rx)) <= / 2.
 Proof. intros rx. unfold Rs_k. rewrite B2R_inv2pi. apply Znearest_half. Qed.
 
-Lemma Rs_k_bounds : forall rx : R, -4000 <= rx <= 4000 ->
-  (-637 <= Rs_k rx <= 637)%Z /\ Rabs (rx - 2 * PI * IZR (Rs_k rx)) <= 31419 / 10000.
+(** [262144] is the largest rotary angle any of the three checkpoints forms:
+    the angle is the position times the largest inverse frequency, which is
+    one, so the bound is the context length, and Qwen3.5's is the longest. *)
+Lemma Rs_k_bounds : forall rx : R, -262144 <= rx <= 262144 ->
+  (-41722 <= Rs_k rx <= 41722)%Z
+  /\ Rabs (rx - 2 * PI * IZR (Rs_k rx)) <= 31590 / 10000.
 Proof.
   intros rx Hr.
   pose proof (Rs_k_half rx) as H. apply Rabs_le_inv in H.
   pose proof pi_bounds as Hpi.
   split; [split|].
-  - destruct (Z_lt_le_dec (Rs_k rx) (-637)) as [Hc|Hc]; [|exact Hc].
-    exfalso. assert (Hc' : (Rs_k rx <= Z.opp 638)%Z) by lia.
+  - destruct (Z_lt_le_dec (Rs_k rx) (-41722)) as [Hc|Hc]; [|exact Hc].
+    exfalso. assert (Hc' : (Rs_k rx <= Z.opp 41723)%Z) by lia.
     apply IZR_le in Hc'. rewrite opp_IZR in Hc'. lra.
-  - destruct (Z_lt_le_dec 637 (Rs_k rx)) as [Hc|Hc]; [|exact Hc].
-    exfalso. assert (Hc' : (638 <= Rs_k rx)%Z) by lia.
+  - destruct (Z_lt_le_dec 41722 (Rs_k rx)) as [Hc|Hc]; [|exact Hc].
+    exfalso. assert (Hc' : (41723 <= Rs_k rx)%Z) by lia.
     apply IZR_le in Hc'. lra.
   - pose proof inv_two_pi_bound as Hi.
     assert (Heq : rx - 2 * PI * IZR (Rs_k rx)
@@ -292,15 +278,15 @@ Proof.
     rewrite Heq, Rabs_mult, (Rabs_pos_eq (2 * PI)) by lra.
     assert (Hq : Rabs ((rx * (10680707 / 67108864) - IZR (Rs_k rx))
                        - rx * (10680707 / 67108864 - / (2 * PI)))
-                 <= / 2 + 4000 * (1 / 100000000)).
+                 <= / 2 + 262144 * (1 / 100000000)).
     { unfold Rminus at 1. eapply Rle_trans; [apply Rabs_triang|].
       rewrite Rabs_Ropp, Rabs_mult.
-      assert (Hxr : Rabs rx <= 4000) by (apply Rabs_le; lra).
+      assert (Hxr : Rabs rx <= 262144) by (apply Rabs_le; lra).
       assert (Hp : Rabs rx * Rabs (10680707 / 67108864 - / (2 * PI))
-                   <= 4000 * (1 / 100000000))
+                   <= 262144 * (1 / 100000000))
         by (apply Rmult_le_compat; try apply Rabs_pos; assumption).
       apply Rabs_le in H. lra. }
-    apply Rle_trans with (2 * PI * (/ 2 + 4000 * (1 / 100000000))).
+    apply Rle_trans with (2 * PI * (/ 2 + 262144 * (1 / 100000000))).
     + apply Rmult_le_compat_l; [lra | exact Hq].
     + lra.
 Qed.
@@ -367,27 +353,27 @@ Proof.
   rewrite Rabs_Ropp. lra.
 Qed.
 
-Theorem reduce_vs_true : forall rx : R, -4000 <= rx <= 4000 ->
-  -3.15 <= Rreduce rx <= 3.15
-  /\ Rabs (sin (Rreduce rx) - sin rx) <= 13 / 1000000000
-  /\ Rabs (cos (Rreduce rx) - cos rx) <= 13 / 1000000000.
+Theorem reduce_vs_true : forall rx : R, -262144 <= rx <= 262144 ->
+  -3.16 <= Rreduce rx <= 3.16
+  /\ Rabs (sin (Rreduce rx) - sin rx) <= 84 / 100000000
+  /\ Rabs (cos (Rreduce rx) - cos rx) <= 84 / 100000000.
 Proof.
   intros rx Hr.
   destruct (Rs_k_bounds rx Hr) as [[Hk1 Hk2] H2pi].
   pose proof two_pi_split_bound as Hs.
   set (k := Rs_k rx) in *.
-  assert (HK : Rabs (IZR k) <= 637).
+  assert (HK : Rabs (IZR k) <= 41722).
   { apply Rabs_le. split.
-    - assert (Hc : (Z.opp 637 <= k)%Z) by lia.
+    - assert (Hc : (Z.opp 41722 <= k)%Z) by lia.
       apply IZR_le in Hc. rewrite opp_IZR in Hc. exact Hc.
     - apply IZR_le in Hk2. exact Hk2. }
   assert (Heq : Rreduce rx = (rx + 2 * IZR (- k) * PI)
                              - IZR k * (201 / 32 + 8312081 / 4294967296 - 2 * PI)).
   { unfold Rreduce. fold k. rewrite B2R_2pi_hi, B2R_2pi_lo, opp_IZR. ring. }
   assert (Hke : Rabs (IZR k * (201 / 32 + 8312081 / 4294967296 - 2 * PI))
-                <= 13 / 1000000000).
+                <= 84 / 100000000).
   { rewrite Rabs_mult.
-    apply Rle_trans with (637 * (2 / 100000000000)); [|lra].
+    apply Rle_trans with (41722 * (2 / 100000000000)); [|lra].
     apply Rmult_le_compat; try apply Rabs_pos; assumption. }
   assert (Hshift : rx + 2 * IZR (- k) * PI = rx - 2 * PI * IZR k)
     by (rewrite opp_IZR; ring).
@@ -414,15 +400,16 @@ Qed.
 Theorem ok_sin_true_full : forall M m L n x rx,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L n) x rx -> red_reg M m x rx ->
-  sin_reg M m (f32_reduce_2pi x) (Rreduce rx) -> -4000 <= rx <= 4000 ->
-  Rabs (B2R (f32_sin x) - sin rx) <= errN M L (n + 23) + 15 / 1000000000.
+  sin_reg M m (f32_reduce_2pi x) (Rreduce rx) -> -262144 <= rx <= 262144 ->
+  Rabs (B2R (f32_sin x) - sin rx) <= errN M L (n + 23) + 85 / 100000000.
 Proof.
   intros M m L n x rx HM Hamp Hx Hred Hsin Hr.
   destruct (Rs_k_bounds rx Hr) as [[Hk1 Hk2] _].
   assert (Hrd : ok (errN M L (n + 3)) (f32_reduce_2pi x) (Rreduce rx))
     by (apply ok_reduce_2pi with (m := m); try assumption; lia).
   destruct (reduce_vs_true rx Hr) as (Hrr & Hs & _).
-  pose proof (ok_sin_true M m L (n + 3) x (Rreduce rx) HM Hamp Hrd Hsin Hrr) as H.
+  assert (Hrr' : -3.17 <= Rreduce rx <= 3.17) by lra.
+  pose proof (ok_sin_true M m L (n + 3) x (Rreduce rx) HM Hamp Hrd Hsin Hrr') as H.
   replace (n + 3 + 20)%nat with (n + 23)%nat in H by lia.
   eapply Rle_trans; [apply (abs_split _ (sin (Rreduce rx))) | lra].
 Qed.
@@ -430,15 +417,16 @@ Qed.
 Theorem ok_cos_true_full : forall M m L n x rx,
   M < bpow radix2 emax32 -> amp_ok M m L ->
   ok (errN M L n) x rx -> red_reg M m x rx ->
-  cos_reg M m (f32_reduce_2pi x) (Rreduce rx) -> -4000 <= rx <= 4000 ->
-  Rabs (B2R (f32_cos x) - cos rx) <= errN M L (n + 22) + 33 / 1000000000.
+  cos_reg M m (f32_reduce_2pi x) (Rreduce rx) -> -262144 <= rx <= 262144 ->
+  Rabs (B2R (f32_cos x) - cos rx) <= errN M L (n + 22) + 87 / 100000000.
 Proof.
   intros M m L n x rx HM Hamp Hx Hred Hcos Hr.
   destruct (Rs_k_bounds rx Hr) as [[Hk1 Hk2] _].
   assert (Hrd : ok (errN M L (n + 3)) (f32_reduce_2pi x) (Rreduce rx))
     by (apply ok_reduce_2pi with (m := m); try assumption; lia).
   destruct (reduce_vs_true rx Hr) as (Hrr & _ & Hc).
-  pose proof (ok_cos_true M m L (n + 3) x (Rreduce rx) HM Hamp Hrd Hcos Hrr) as H.
+  assert (Hrr' : -3.17 <= Rreduce rx <= 3.17) by lra.
+  pose proof (ok_cos_true M m L (n + 3) x (Rreduce rx) HM Hamp Hrd Hcos Hrr') as H.
   replace (n + 3 + 19)%nat with (n + 22)%nat in H by lia.
   eapply Rle_trans; [apply (abs_split _ (cos (Rreduce rx))) | lra].
 Qed.
