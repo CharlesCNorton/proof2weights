@@ -358,7 +358,11 @@ Each implementation returns the logits of all 16 positions, 4{,}800 next-token
 distributions per model. PyTorch runs with eager attention and with TF32
 disabled, and Qwen3.5's gated DeltaNet runs its PyTorch fallback, a chunked form
 of the delta rule. llama.cpp runs with flash attention disabled and otherwise
-in its default configuration.
+in its default configuration. vLLM \cite{vllm}, which appears in the 64-token
+evaluation of Qwen3.5 below, runs in its default configuration in bfloat16
+with prefix caching off; it scores the last position of a prompt only, so each window is
+sent once per prefix and the logits are read at the sampler, before any
+temperature.
 
 \begin{table}[t]
 \centering
@@ -403,10 +407,10 @@ $64$ tokens for all three models (Table~\ref{tab:long}), and on long windows:
 GPT-2 over the whole of its position table at $1024$, and SmolLM2 at $2048$
 (Table~\ref{tab:longctx}). Both tables carry llama.cpp beside PyTorch
 and bfloat16 beside float32, bfloat16 being the precision deployments use.
-Qwen3.5 has a further row: the gated delta rule through
-flash-linear-attention's fused Triton kernels, which is the path a deployment
-of that architecture takes, in float32 with the depthwise convolution left on
-the torch path.
+Qwen3.5 has two further rows: vLLM in bfloat16, and the gated delta rule
+through flash-linear-attention's fused Triton kernels, which is the path a
+deployment of that architecture takes, in float32 with the depthwise
+convolution left on the torch path.
 
 Top-1 agreement with PyTorch in float32 is unaffected by any of it. At $64$
 tokens PyTorch returns the extracted top-1 token at all $3{,}840$ positions of
@@ -421,16 +425,19 @@ it is six times larger at $1024$ than at $64$, $9.89\times10^{-3}$ against
 $1.68\times10^{-3}$; on SmolLM2 it is five times smaller at $2048$ than at
 $64$, $2.15\times10^{-4}$ against $1.17\times10^{-3}$.
 
-llama.cpp in float32 changes the top-1 token at $1$ to $14$ positions per model,
+llama.cpp in float32 changes the top-1 token at $0$ to $14$ positions per model,
 device and length, which Section~\ref{sec:diff} attributes. bfloat16 is a
-different regime, and the two ways of reaching it separate. On the two models
-measured both ways at $64$ tokens, reading bfloat16 weights and computing in
-float32, as llama.cpp does, changes $26$ and $210$ top-1 tokens; computing in
-bfloat16 as well, as PyTorch does, changes $149$ and $468$, between two and six
-times as many, and moves a logit by $12.5$ against $7.4$. Length widens that gap sharply: at GPT-2's $1024$ positions
-PyTorch in bfloat16 moves a logit by $298$ and leaves the top ten in order at
-$113$ positions of $3{,}072$. The fused float32 kernels sit between the two,
-changing six top-1 tokens where the unfused float32 path changes none.
+different regime, and the two ways of reaching it separate. At $64$ tokens,
+reading bfloat16 weights and computing in float32, as llama.cpp does, changes
+$13$, $26$ and $210$ top-1 tokens on Qwen3.5, SmolLM2 and GPT-2; computing in
+bfloat16 as well, as PyTorch does, changes $84$, $149$ and $468$, between two
+and seven times as many, and moves a logit by $12.5$ against $7.4$. Length
+widens that gap sharply: at GPT-2's $1024$ positions PyTorch in bfloat16 moves
+a logit by $298$ and leaves the top ten in order at $113$ positions of
+$3{,}072$. vLLM in bfloat16 on Qwen3.5 changes $80$ top-1 tokens beside
+PyTorch's $84$, and moves the perplexity by $9\times10^{-4}$ where PyTorch in
+bfloat16 moves it by $0.064$. The fused float32 kernels sit between the two
+regimes, changing six top-1 tokens where the unfused float32 path changes none.
 
 \begin{table}[t]
 \centering
@@ -461,16 +468,21 @@ SmolLM2 & extracted            & ---      & ---                & ---            
 Qwen3.5 & extracted            & ---      & ---                & ---                 & 58.171639 \\
         & PyTorch CPU          & 0/3840   & $4.6\times10^{-6}$ & $1.65\times10^{-4}$ & 58.171641 \\
         & PyTorch GPU          & 0/3840   & $4.7\times10^{-6}$ & $1.61\times10^{-4}$ & 58.171642 \\
+        & llama.cpp CPU        & 0/3840   & $2.7\times10^{-4}$ & $1.96\times10^{-2}$ & 58.171435 \\
+        & llama.cpp GPU        & 2/3840   & $9.3\times10^{-4}$ & $3.04\times10^{-2}$ & 58.171916 \\
         & PyTorch fused, f32   & 6/3840   & $1.5\times10^{-3}$ & $1.14\times10^{-1}$ & 58.169333 \\
+        & llama.cpp CPU bf16   & 13/3840  & $6.8\times10^{-3}$ & $2.44\times10^{-1}$ & 58.178980 \\
+        & llama.cpp GPU bf16   & 13/3840  & $6.8\times10^{-3}$ & $2.08\times10^{-1}$ & 58.176583 \\
+        & vLLM bf16            & 80/3840  & $1.7\times10^{-2}$ & $5.25\times10^{-1}$ & 58.172501 \\
         & PyTorch bf16         & 84/3840  & $1.9\times10^{-2}$ & $5.49\times10^{-1}$ & 58.235540 \\
 \bottomrule
 \end{tabular}
 \caption{Sixty whole blocks of 64 tokens per model, every position compared.
 \emph{top-1 differs} counts the positions whose highest-scoring token differs
-from the extracted pass's. The bf16 rows read bfloat16 weights; the PyTorch one
-computes in bfloat16 as well. The fused row runs the gated delta rule through
-flash-linear-attention's Triton kernels. Perplexity is over the positions with
-a following token in the window.}
+from the extracted pass's. The bf16 rows read bfloat16 weights; the PyTorch and
+vLLM ones compute in bfloat16 as well. The fused row runs the gated delta rule
+through flash-linear-attention's Triton kernels. Perplexity is over the
+positions with a following token in the window.}
 \label{tab:long}
 \end{table}
 
@@ -1135,6 +1147,14 @@ S.~Merity, C.~Xiong, J.~Bradbury, and R.~Socher.
 G.~Gerganov and contributors.
 \newblock llama.cpp.
 \newblock \url{https://github.com/ggml-org/llama.cpp}, commit 8172e65.
+
+\bibitem{vllm}
+W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H.~Yu, J.~E.~Gonzalez,
+  H.~Zhang, and I.~Stoica.
+\newblock Efficient memory management for large language model serving with
+  PagedAttention.
+\newblock \emph{29th ACM Symposium on Operating Systems Principles}, 2023.
+\newblock vLLM 0.19.1.
 
 \bibitem{bitexact}
 N.~Cankaya.

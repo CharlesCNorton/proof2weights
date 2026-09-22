@@ -22,7 +22,6 @@ Annot.v
 AnnExp.v
 RunErr.v
 RoundChk.v
-Receipt.v
 Extract.v
 Llama_inductive.v
 Qwen_inductive.v

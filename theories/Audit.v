@@ -33,7 +33,6 @@ Require Import Series.
 Require Import Truth.
 Require Import Witness.
 Require Import RoundChk.
-Require Import Receipt.
 Require Import Bound64.
 Require Import Annot.
 Require Import AnnExp.
@@ -321,10 +320,3 @@ Print Assumptions round_neg_04.
 Print Assumptions round_neg_06.
 Print Assumptions round_neg_126.
 Print Assumptions round_2p23_differs.
-
-(** * Inference receipts *)
-
-Print Assumptions verify_receipt_sound.
-Print Assumptions verify_receipt_complete.
-Print Assumptions receipt_output_extends_prompt.
-Print Assumptions checksum_detects_single_byte.

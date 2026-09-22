@@ -125,12 +125,9 @@ native build is a number of the inductive build.
 The trusted boundary of the native mode is that the host float is binary64 with
 round-to-nearest-even, with no excess precision and no contraction of a
 multiply and an add, and that `Int32.bits_of_float` rounds to nearest.
-`runners/fp_selftest.ml` decides both on the host that runs it, in thirty-three
-checks covering excess precision, contraction, ties to even at both widths,
-subnormals, overflow to an infinity, NaN propagation and the two signed zeros.
-It exits non-zero on the first failure and is the first thing
-`scripts/check.sh` runs. The elementary functions extract
-structurally in both modes, as the same compositions of the primitives.
+`runners/fp_selftest.ml` decides both on the host that runs it. The elementary
+functions extract structurally in both modes, as the same compositions of the
+primitives.
 
 ## Two runners per model
 
@@ -179,12 +176,6 @@ clock on an i9-12900H, single-threaded.
 | Native forward | 10.3 s, 1.1 GB | 51.3 s, 6.3 GB | 244.6 s, 4.1 GB |
 | Inductive forward | 58.8 min, 7.1 GB | 4.17 h, 2.8 GB | 11.1 h, 3.5 GB |
 
-The inductive runs return top-ten logits identical to the native ones at nine
-significant digits, which determines a binary32 value. On a small GPT-2
-fixture, the verified list-based loader followed by `f32_gpt2_logits`, the
-GPT-2 runner in both modes, and a step-by-step numpy float32 reference all
-return the same fifteen logits.
-
 ## What is proved
 
 Serialization and storage. Decoding the encoding of any 32-bit integer returns
@@ -229,11 +220,12 @@ the float denotes (`Qb`, `Qb_correct`). `Dot.v` gives the sharper running bound 
 dot product (`f32_dot_error_mixed`) and witnesses it on a product that is
 exactly zero.
 
-Backward error. The computed dot product equals the exact inner product of its
-operands with each product scaled by a factor within `(1 + u)^(n+1) - 1` of one
-(`f32_dot_backward`), and the statement lifts to the matrix-vector product and
-the tied-embedding projection of all three models
-(`f32_mat_vec_mul_backward`, `logits_backward`).
+Backward error. If no rounding in a dot product of length `n` overflows, the
+computed value is the exact inner product of its operands with each product
+scaled by a factor within `(1 + u)^(n+1) - 1` of one, plus a displacement of at
+most `2 n eta (1 + u)^n` (`f32_dot_backward_mixed`), and the statement lifts to
+the matrix-vector product and the tied-embedding projection of all three models
+(`f32_mat_vec_mul_backward_mixed`, `logits_backward_mixed`).
 
 A forward pass that carries its bound. `RunErr.v` writes the GPT-2 forward pass
 once over an abstract arithmetic of nine operations and instantiates it at
@@ -299,24 +291,18 @@ evaluation of the whole sequence produces (`decode_stream_correct`, and
 `gpt2_decode_step`, `llama_decode_step`, `qwen_decode_step` at the three
 models).
 
-Runners, generation and receipts. The GPT-2 runners decode each weight matrix
-directly in transposed order, and that decode equals `f32_mat_transpose` of the
-reshape, so their linear layer is `f32_linear_forward`
-(`decode_transposed_correct`, `runner_linear_correct`).
-Greedy generation always extends the prompt
-(`gpt2_generation_preserves_prompt`, `f32_generation_preserves_prompt`). An
-inference receipt is checked by recomputing the weight checksum and
-regenerating the output (`verify_receipt_sound`, `verify_receipt_complete`), and
-the checksum changes whenever a single byte of the weight file changes
-(`checksum_detects_single_byte`).
+Runners and generation. The GPT-2 runners decode each weight matrix directly in
+transposed order, and that decode equals `f32_mat_transpose` of the reshape, so
+their linear layer is `f32_linear_forward` (`decode_transposed_correct`,
+`runner_linear_correct`). Greedy generation always extends the prompt
+(`gpt2_generation_preserves_prompt`, `f32_generation_preserves_prompt`).
 
-`theories/Audit.v` prints the assumptions of 187 of these results. Seventeen
-are closed under the global context. Another 138 rest on the four classical
-axioms of the Rocq real-number library (`classic`,
+`theories/Audit.v` prints the assumptions behind each of these results. Beyond
+the four classical axioms of the Rocq real-number library (`classic`,
 `functional_extensionality_dep`, `sig_forall_dec`, `sig_not_dec`), which Flocq
-inherits. The remaining 32, `gpt2_logits_bounded` among them, use CoqInterval
-and rest in addition on the axiomatization of primitive floats, 63-bit integers
-and primitive arrays that CoqInterval computes with.
+inherits, only the results that call CoqInterval assume anything: the
+axiomatization of primitive floats, 63-bit integers and primitive arrays it
+computes with. `scripts/assumption_table.py` classifies the report.
 
 ## Bounds computed during a forward pass
 
@@ -403,22 +389,10 @@ moving from one layer to eight at width 8 raises it by 1.4.
 The architecture sweep supplies the rotary tables as data, so it does not
 evaluate `f32_sin` or `f32_cos`. `runners/prim_sweep.ml` and
 `scripts/prim_check.py` evaluate the elementary functions themselves on the
-inductive extraction at 40,001 points each and compare them with the
-mathematical functions in double precision, reporting the maximum error and
-the number of sign disagreements. Sine and cosine are swept over the whole
-rotary range, which is the longest context of the three checkpoints:
-
-| primitive | range | max error | sign disagreements |
-|---|---|---|---|
-| sin | [-262144, 262144] | 4.4e-6 abs | 0 |
-| cos | [-262144, 262144] | 4.2e-6 abs | 0 |
-| exp | [-80, 80] | 7.8e-8 rel | 0 |
-| sigmoid | [-40, 40] | 8.8e-8 abs | 0 |
-| tanh | [-20, 20] | 1.8e-7 abs | 0 |
-| GELU | [-20, 20] | 5.1e-7 abs | 0 |
-| log | [1, 2] | 1.0e-7 abs | 0 |
-| softplus | [-30, 30] | 5.4e-7 abs | 0 |
-| sqrt | [0, 1e6] | 6.0e-8 rel | 0 |
+inductive extraction at 40,001 points each against the mathematical functions
+in double precision, sine and cosine over the whole rotary range, and
+`scripts/exhaustive.c` does the same on the native build at every one of the
+2^32 binary32 inputs; `paper/exhaustive.txt` holds that sweep.
 
 On the checkpoints the same reference attributes llama.cpp's divergence to four
 choices: the float16 key/value cache it uses by default, ggml-cpu's float16 GELU
@@ -449,8 +423,7 @@ holds under its side-condition records, which are hypotheses about the inputs;
 they are discharged at specific points, not for a checkpoint. The bound the
 annotated forward pass computes needs no hypothesis, but it propagates
 intervals: it is informative on one- and two-layer models and infinite on GPT-2
-small from the first GELU on, and it is proved for the GPT-2 path only. The
-receipt checksum detects any single-byte change but is not collision resistant.
+small from the first GELU on, and it is proved for the GPT-2 path only.
 
 ## Building and running
 
@@ -518,10 +491,6 @@ python scripts/qwen_setup.py
 # Chat against either model; tokenization runs in the script.
 python scripts/chat.py smollm "What is the capital of France?"
 python scripts/chat.py qwen "What is the capital of France?"
-
-# Emit a receipt for an answer, then verify it by recomputation.
-python scripts/receipt.py emit qwen "What is the capital of France?" 8
-python scripts/receipt.py verify
 ```
 
 The native runners also accept `serve <eos>` in place of the token ids, which
@@ -612,7 +581,11 @@ read a GGUF converted with `--outtype bf16`, which llama.cpp computes from in
 float32, while `agree_torch.py` takes `bf16` as its last argument and computes
 in bfloat16 as well. Qwen3.5's fused row runs `agree_torch.py` from an
 environment with `flash-linear-attention` installed, which routes the gated
-delta rule through its Triton kernels.
+delta rule through its Triton kernels. Its vLLM row runs `agree_vllm.py`, which
+takes the model, windows file, output directory and window range and computes
+in bfloat16, from an environment with `vllm` installed; vLLM scores the last
+position of a prompt only, so the script sends one request per prefix of each
+window and a logits processor keeps the row the sampler receives.
 
 `scripts/run_float_demo.sh` builds the small float drivers and runs the fixture
 comparison against `scripts/tiny_gpt2_ref.py`. The integer export path has its
@@ -634,9 +607,8 @@ library.
 | `runners/*_verified.ml` | Each checkpoint through the extracted forward pass itself rather than a loop rebuilt around it. |
 | `scripts/verified_check.py` | Those runners against the stored PyTorch oracles. |
 | `scripts/exhaustive.c` | Every elementary function at every one of the 2^32 binary32 inputs. |
-| `scripts/settle_undecided.py` | The inputs the binary64 reference cannot decide, settled against a reference at 120 decimal digits. |
 | `theories/Narrow.v` | The widening and narrowing the native build performs, and the proof that narrowing the binary64 result of an operation on widened binary32 operands is the binary32 result, for every input, overflow and infinities and NaNs and signed zeros included. |
-| `runners/fp_selftest.ml` | The assumptions the native build makes about its host, decided on that host in thirty-three checks. |
+| `runners/fp_selftest.ml` | The assumptions the native build makes about its host, decided on that host. |
 | `scripts/check.sh` | Runs the checks and prints the time each takes. |
 | `scripts/provenance.py` | The checkpoint revisions, file digests and tool versions every reported number was produced from. |
 | `scripts/oracle_check.py` | Each checkpoint's extracted forward pass against its stored PyTorch oracle. |
@@ -654,7 +626,6 @@ library.
 | `theories/Loader.v` | What a named load returns, the dtype check, and validation connected to the shape theorems. |
 | `theories/Loadpre.v` | The same load through a byte fetch rather than a list of bytes, and the proof that the record it assembles is the one `f32_load_model` defines. |
 | `theories/RoundChk.v` | Rounding to the nearest integer, checked by computation. |
-| `theories/Receipt.v` | Inference receipts, their checker, and what the checksum detects. |
 | `theories/Extract.v` | The native extraction of the GPT-2, Llama and Qwen3.5 targets and of the annotated GPT-2 forward pass. |
 | `theories/Llama_inductive.v`, `theories/Qwen_inductive.v`, `theories/RunErr_inductive.v` | The inductive extraction of the Llama and Qwen3.5 definitions and of the annotated GPT-2 forward pass. |
 | `theories/Audit.v` | `Print Assumptions` for the headline results. |
@@ -667,13 +638,13 @@ library.
 | `runners/prim_sweep.ml` | The elementary functions on the inductive extraction. |
 | `runners/float_smoke.ml`, `runners/float_load_run.ml`, `runners/test_bplus.ml` | Small drivers for the float path. |
 | `scripts/gpt2_setup.py`, `scripts/smollm_setup.py`, `scripts/qwen_setup.py` | Fetch a model, save f32 weights, print the PyTorch reference. |
-| `scripts/models.py`, `scripts/chat.py`, `scripts/receipt.py` | The model registry, interactive chat, and receipts. |
+| `scripts/models.py`, `scripts/chat.py` | The model registry and interactive chat. |
 | `scripts/tiny_gpt2_ref.py`, `scripts/experiment_gen.py`, `scripts/experiment_cmp.py`, `scripts/run_batch.sh` | The GPT-2 fixture and the GPT-2 sweep. |
 | `scripts/arch_ref.py`, `scripts/experiment_arch.py` | numpy mirrors of the Llama and Qwen3.5 forwards, and their sweep. |
 | `scripts/prim_check.py` | The elementary-function sweep. |
 | `scripts/run_bound_batch.sh`, `scripts/bound_cmp.py` | The annotated forward pass over the GPT-2 sweep, and its bounds against the actual error. |
 | `scripts/layer_gain.py` | The gain each linear layer applies to an absolute error on its input. |
-| `scripts/agree_setup.py`, `scripts/agree_torch.py`, `scripts/llamacpp_logits/`, `scripts/agree_cmp.py` | Held-out windows, PyTorch and llama.cpp logit dumps, and the agreement report. |
+| `scripts/agree_setup.py`, `scripts/agree_torch.py`, `scripts/agree_vllm.py`, `scripts/llamacpp_logits/`, `scripts/agree_cmp.py` | Held-out windows, PyTorch, vLLM and llama.cpp logit dumps, and the agreement report. |
 | `scripts/run_float_demo.sh` | The fixture demonstration. |
 | `tools/` | Export of the integer example networks. |
 | `paper/paper.tex` | The paper. |

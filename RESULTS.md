@@ -44,7 +44,6 @@ Reference: the inductive extraction of `f32_qwen_forward`.
 | 2 | delta/attn | 16 | 2x4 | 3 | 8 | 16 | 2.785e-07 | 2.280e-06 | 0/16 | 0 |
 | 2 | delta/attn | 32 | 4x4 | 3 | 8 | 16 | 5.017e-07 | 3.457e-06 | 0/16 | 0 |
 
-
 ## Verified bound against the actual error (GPT-2 path)
 
 Bounds from `runners/gpt2_bound_ref`, the inductive extraction of the annotated
@@ -231,54 +230,6 @@ constants as stored.
 | GPU, f16 cache, no TF32, no mul_mat_f | 4500 | 213.221885 | 5.95e-03 |
 | GPU, f32 cache, no TF32, no mul_mat_f | 4500 | 213.216583 | 8.14e-05 |
 
-## Agreement on 64-token windows: gpt2
-
-60 windows of 64 tokens from the WikiText-2 raw test split, every position compared. bf16 is the row the float32 comparison does not reach.
-
-| pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
-|------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
-| extracted / PyTorch CPU | 3840/3840 | 3836/3840 | 5.20% | 4.7e-05 | 1.0e-03 | 1.68e-03 | 7.2e-10 | 7.5e-09 | - |
-| extracted / PyTorch CUDA | 3840/3840 | 3838/3840 | 5.53% | 3.9e-05 | 1.1e-03 | 1.56e-03 | 6.4e-10 | 1.1e-08 | - |
-| extracted / PyTorch CUDA bf16 | 3372/3840 | 92/3840 | 0.00% | 3.1e-01 | 8.7e+00 | 1.25e+01 | 1.6e-02 | 8.6e-02 | 7.89e-01 |
-| PyTorch CPU / PyTorch CUDA | 3840/3840 | 3836/3840 | 8.49% | 3.1e-05 | 5.8e-04 | 1.11e-03 | 4.0e-10 | 3.5e-09 | - |
-
-| source | predicted tokens | perplexity | max per-token NLL difference from extracted |
-|--------|------------------|------------|-----------------------|
-| extracted | 3780 | 80.256641 | - |
-| PyTorch CPU | 3780 | 80.256637 | 2.59e-04 |
-| PyTorch CUDA | 3780 | 80.256674 | 2.90e-04 |
-| PyTorch CUDA bf16 | 3780 | 80.495299 | 1.15e+00 |
-
-## Agreement on 64-token windows: smollm
-
-60 windows of 64 tokens from the WikiText-2 raw test split, every position compared. bf16 is the row the float32 comparison does not reach.
-
-| pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
-|------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
-| extracted / PyTorch CPU | 3840/3840 | 3840/3840 | 1.35% | 1.1e-05 | 1.4e-04 | 1.17e-03 | 4.7e-11 | 4.1e-08 | - |
-| extracted / PyTorch CUDA | 3840/3840 | 3840/3840 | 1.35% | 1.1e-05 | 1.4e-04 | 9.61e-04 | 4.1e-11 | 2.7e-08 | - |
-| extracted / PyTorch CUDA bf16 | 3691/3840 | 961/3840 | 0.00% | 8.9e-02 | 1.5e+00 | 7.85e+00 | 1.6e-03 | 2.7e-01 | 3.16e-01 |
-
-| source | predicted tokens | perplexity | max per-token NLL difference from extracted |
-|--------|------------------|------------|-----------------------|
-| extracted | 3780 | 62.922808 | - |
-| PyTorch CPU | 3780 | 62.922790 | 1.83e-04 |
-| PyTorch CUDA | 3780 | 62.922791 | 1.55e-04 |
-| PyTorch CUDA bf16 | 3780 | 63.001049 | 1.31e+00 |
-
-## Agreement on 512-token windows: smollm
-
-3 windows of 512 tokens from the WikiText-2 raw test split, every position compared. The rotary angles here reach 511.
-
-| pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
-|------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
-| extracted / PyTorch CPU | 1536/1536 | 1536/1536 | 1.37% | 1.0e-05 | 7.1e-05 | 1.46e-04 | 2.9e-11 | 2.7e-10 | - |
-
-| source | predicted tokens | perplexity | max per-token NLL difference from extracted |
-|--------|------------------|------------|-----------------------|
-| extracted | 1533 | 26.322307 | - |
-| PyTorch CPU | 1533 | 26.322303 | 3.59e-05 |
-
 ## What the PyTorch residual is made of
 
 The llama.cpp attribution turns one implementation choice off at a time. The
@@ -301,21 +252,11 @@ and the mean by under 1 percent, and PyTorch lands where the substituted numpy
 lands. The residual against PyTorch is therefore reduction order, not the
 elementary functions.
 
-## Whether the difference grows with position
-
-A window's later positions attend over more keys and carry larger rotary
-angles. `scripts/position_growth.py` reports the difference from PyTorch at
-each position. It is flat.
-
-| model | window | first band | last band | last over first |
-|---|---|---|---|---|
-| GPT-2 | 64 tokens, 60 windows | 5.281e-05 | 5.860e-05 | 1.110 |
-| SmolLM2 | 512 tokens, 3 windows | 1.286e-05 | 1.236e-05 | 0.961 |
-
 ## The dumps behind these tables
 
 The logit dumps above are produced by `scripts/agree_setup.py`, the runners'
-dump mode and `scripts/agree_torch.py`. The windows are determined by the split,
+dump mode, `scripts/agree_torch.py`, `scripts/llamacpp_logits` and
+`scripts/agree_vllm.py`. The windows are determined by the split,
 the tokenizer and the three integers the first of those takes, and the dumps
 come back byte for byte on the same host.
 
@@ -371,22 +312,32 @@ come back byte for byte on the same host.
 
 ## Qwen3.5 on whole blocks of 64 tokens: qwen
 
-60 windows of 64 tokens from the WikiText-2 raw test split, every position compared. The fused row runs the gated delta rule through flash-linear-attention's Triton kernels in float32, with the depthwise convolution on the torch path.
+60 windows of 64 tokens from the WikiText-2 raw test split, every position compared. The bf16 rows read bfloat16 weights; the PyTorch and vLLM ones compute in bfloat16 as well. The fused row runs the gated delta rule through flash-linear-attention's Triton kernels in float32, with the depthwise convolution on the torch path.
 
 | pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
 |------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
 | extracted / PyTorch CPU | 3840/3840 | 3840/3840 | 1.49% | 4.6e-06 | 3.5e-05 | 1.65e-04 | 3.7e-11 | 8.3e-10 | - |
 | extracted / PyTorch CUDA | 3840/3840 | 3840/3840 | 1.46% | 4.7e-06 | 3.4e-05 | 1.61e-04 | 3.6e-11 | 8.2e-10 | - |
+| extracted / llama.cpp CPU | 3840/3840 | 3798/3840 | 0.03% | 2.7e-04 | 2.5e-03 | 1.96e-02 | 6.7e-08 | 4.9e-06 | - |
+| extracted / llama.cpp CUDA | 3838/3840 | 3723/3840 | 0.01% | 9.3e-04 | 6.8e-03 | 3.04e-02 | 6.7e-07 | 1.5e-05 | 1.57e-03 |
 | extracted / PyTorch fused | 3834/3840 | 3630/3840 | 0.00% | 1.5e-03 | 1.8e-02 | 1.14e-01 | 2.9e-06 | 1.9e-04 | 1.61e-03 |
+| extracted / llama.cpp CPU bf16 | 3827/3840 | 3084/3840 | 0.00% | 6.8e-03 | 4.9e-02 | 2.44e-01 | 3.6e-05 | 2.1e-03 | 1.10e-02 |
+| extracted / llama.cpp CUDA bf16 | 3827/3840 | 3075/3840 | 0.00% | 6.8e-03 | 4.9e-02 | 2.08e-01 | 3.6e-05 | 1.1e-03 | 1.46e-02 |
 | extracted / PyTorch bf16 | 3756/3840 | 1505/3840 | 0.00% | 1.9e-02 | 1.4e-01 | 5.49e-01 | 5.2e-04 | 8.1e-03 | 1.80e-01 |
+| extracted / vLLM bf16 | 3760/3840 | 1610/3840 | 0.00% | 1.7e-02 | 1.2e-01 | 5.25e-01 | 4.3e-04 | 7.9e-03 | 1.14e-01 |
 
 | source | predicted tokens | perplexity | max per-token NLL difference from extracted |
 |--------|------------------|------------|-----------------------|
 | extracted | 3780 | 58.171639 | - |
 | PyTorch CPU | 3780 | 58.171641 | 6.13e-05 |
 | PyTorch CUDA | 3780 | 58.171642 | 5.10e-05 |
+| llama.cpp CPU | 3780 | 58.171435 | 5.40e-03 |
+| llama.cpp CUDA | 3780 | 58.171916 | 9.83e-03 |
 | PyTorch fused | 3780 | 58.169333 | 5.53e-02 |
+| llama.cpp CPU bf16 | 3780 | 58.178980 | 1.28e-01 |
+| llama.cpp CUDA bf16 | 3780 | 58.176583 | 9.93e-02 |
 | PyTorch bf16 | 3780 | 58.235540 | 2.77e-01 |
+| vLLM bf16 | 3780 | 58.172501 | 2.18e-01 |
 
 ## GPT-2 at its full 1024 positions: gpt2
 

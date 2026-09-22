@@ -21,8 +21,8 @@
 
    In serve mode the weights stay on disk and the process answers queries from
    stdin (one per line: "<comma ids> <max_new>"), streaming "TOK <id>" per token
-   and "END <comma gen ids>" per query, after announcing the weight checksum a
-   receipt binds to. Each query starts from an empty cache.
+   and "END <comma gen ids>" per query, after announcing the checksum of the
+   weight file. Each query starts from an empty cache.
 
    usage:
      qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck <tok,...>
@@ -107,7 +107,8 @@ let () =
   let zerov n = List.init n (fun _ -> f32_zero) in
 
   let b = read_file path in
-  (* The weight checksum a receipt binds its answer to, over the whole file. *)
+  (* A checksum over the whole weight file, printed so a client knows which
+     weights answered. *)
   let cksum =
     let r = ref 0 and n = Bytes.length b in
     for i = 0 to n - 1 do r := (!r * 31 + Char.code (Bytes.get b i)) mod 4294967296 done;
