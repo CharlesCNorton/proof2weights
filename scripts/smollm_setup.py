@@ -79,5 +79,6 @@ for vv, ii in zip(v.tolist(), i.tolist()):
     print(f"  {ii:6d} {tok.decode([ii])!r:14} {vv:8.4f}")
 
 with open(META, "w") as f:
-    json.dump({"ids": ids, "first_top1": int(i[0]), "first_top1_str": tok.decode([int(i[0])])}, f)
+    json.dump({"ids": ids, "first_top1": int(i[0]), "first_top1_str": tok.decode([int(i[0])]),
+               "greedy": [s[0] for s in steps], "continuation": cont}, f)
 print(f"\nwrote {META}")

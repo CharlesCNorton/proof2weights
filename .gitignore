@@ -27,6 +27,7 @@ nul
 /theories/qwen_inductive.ml
 /theories/runerr_native.ml
 /theories/runerr_inductive.ml
+/theories/enc_native.ml
 /*.mli
 /phases1_15_complete.ml
 /phases1_15_native.ml

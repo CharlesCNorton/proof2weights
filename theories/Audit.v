@@ -40,6 +40,7 @@ Require Import Decode.
 Require Import Annot.
 Require Import AnnExp.
 Require Import RunErr.
+Require Enclose EncGPT2 EncExt EncLlama EncQwen ElemTable.
 
 (** * Serialization, quantization and storage *)
 
@@ -337,3 +338,25 @@ Print Assumptions round_neg_04.
 Print Assumptions round_neg_06.
 Print Assumptions round_neg_126.
 Print Assumptions round_2p23_differs.
+
+(** * The elementary functions over every binary32 input of their domains *)
+
+Print Assumptions ElemTable.exp_bound.
+Print Assumptions ElemTable.log_bound.
+Print Assumptions ElemTable.sin_bound.
+Print Assumptions ElemTable.cos_bound.
+Print Assumptions ElemTable.sigmoid_bound.
+Print Assumptions ElemTable.tanh_bound.
+Print Assumptions ElemTable.softplus_bound.
+Print Assumptions ElemTable.gelu_bound.
+
+(** * Enclosures of the reference logits *)
+
+Print Assumptions Enclose.enc_ops_rel.
+Print Assumptions EncExt.enc_ln_in.
+Print Assumptions EncExt.enc_abs_in.
+Print Assumptions EncGPT2.gpt2_logits_enclosed.
+Print Assumptions EncLlama.g_llama_logits_f32.
+Print Assumptions EncLlama.llama_logits_enclosed.
+Print Assumptions EncQwen.g_qwen_logits_f32.
+Print Assumptions EncQwen.qwen_logits_enclosed.

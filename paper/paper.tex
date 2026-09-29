@@ -42,9 +42,10 @@ trusts no floating-point hardware computes, at every operation and for every
 input, the binary32 value the hardware extraction computes; that equality is
 proved at the level of floats, so overflow, infinities, NaNs and signed zeros
 are inside it, and what the hardware extraction assumes of its host is checked
-on that host by a self-test. We further prove that cached
-autoregressive decoding computes exactly the binary32 values
-full recomputation computes, and that the three forward passes are causal. Used
+on that host by a self-test. The runners decode through an extracted step
+function whose state holds the key/value caches, the convolution windows and
+the recurrent state, proved to emit exactly the binary32 rows full
+recomputation computes, and the three forward passes are proved causal. Used
 as a fixed reference, the extracted pass attributes llama.cpp's divergence, top-1
 changes at up to 7 of 4{,}800 positions and logit shifts up to $1.7$, to four
 implementation choices; with all four removed, llama.cpp agrees as closely as
@@ -74,17 +75,18 @@ The contributions are the following.
   SmolLM2-135M-Instruct and Qwen3.5-0.8B checkpoints
   (Section~\ref{sec:exec}), measured against PyTorch and llama.cpp on 300
   WikiText-2 test windows of 16 tokens per model, on sixty whole blocks of 64, and at
-  window lengths to 2048 (Section~\ref{sec:agree}). For each
-  model a runner whose forward pass is the extracted definition rather than a
-  loop rebuilt around it reproduces the same checkpoint's PyTorch oracle.
+  window lengths to 2048 (Section~\ref{sec:agree}). Both runners of each model
+  are extracted definitions: one recomputes the sequence, the other decodes it
+  one token at a time.
 \item Two extraction modes from one source, with a proof at the level of floats
   that they compute the same binary32 value at every operation for every input,
   overflow, infinities, NaNs and signed zeros included, and a self-test that
   checks on the host what the hardware mode assumes of it
   (Section~\ref{sec:tcb}).
-\item Proofs that cached decoding equals full recomputation, as equalities of
-  binary32 values, and that the three forward passes are causal
-  (Section~\ref{sec:cache}).
+\item Decoders for the three models, step functions whose state holds the
+  key/value caches, the convolution windows and the recurrent state, proved to
+  emit exactly the binary32 rows full recomputation computes, and proofs that
+  the three forward passes are causal (Section~\ref{sec:cache}).
 \item A composed rounding-error bound from the primitives to the logits of all
   three architectures, a GPT-2 forward pass that computes a bound on each
   logit's distance from exact real arithmetic while it runs, and a
@@ -95,7 +97,8 @@ The contributions are the following.
   extracted function measured at every binary32 input of its domain
   (Section~\ref{sec:exh}).
 \item A differential oracle for float32 implementations, which separates
-  PyTorch's residual into reduction order and elementary functions
+  PyTorch's residual into contraction and summation order and elementary
+  functions
   (Section~\ref{sec:agree}) and attributes llama.cpp's divergence to four
   implementation choices (Section~\ref{sec:diff}).
 \end{itemize}
@@ -327,21 +330,26 @@ over weights stored that way, proved to return on the transpose of a model what
 take the weights in the order the file holds them, and their rotary tables are
 built inside the extraction.
 
-The second runner caches, where the first recomputes the sequence at every
-step. It writes the layer loop in OCaml around the extracted operators and
-streams weights layer by layer, so its arithmetic is
-verified and its composition is not; the equalities of
-Section~\ref{sec:cache} are what cover its caches. It is the one that decodes
-autoregressively, and the one the measurements of Section~\ref{sec:agree} were
-taken on. The two runners agree: each verified runner reproduces its
-checkpoint's stored PyTorch ranking, and on GPT-2 and SmolLM2 its ten highest
-logits are the cached runner's to every digit printed.
+The second runner decodes, where the first recomputes the sequence at every
+step. It runs the extracted decoder, \code{run} applied to \code{gpt2\_step},
+\code{llama\_step} or \code{qwen\_step} from the matching initial state: a step
+function over a state that holds a key/value cache per head and layer and, for
+Qwen3.5, the convolution window and the recurrent state of each DeltaNet head,
+fed one token at a time. \code{gpt2\_decode\_correct},
+\code{llama\_decode\_correct} and \code{qwen\_decode\_correct}
+(Section~\ref{sec:cache}) state that the rows it emits over a sequence are the
+rows the full forward pass computes. What it does natively is read the file,
+answer the fetch, choose each next token when it generates, and write the rows
+out. It is the runner the measurements of Section~\ref{sec:agree} were taken
+on. On the stored prompts the two runners agree: on GPT-2 and SmolLM2 their
+ten highest logits coincide to every digit printed, and the decoders of
+SmolLM2 and Qwen3.5 reproduce PyTorch's greedy continuation over twelve
+tokens.
 
 Table~\ref{tab:models} gives the three checkpoints and what a forward pass
 costs in each mode. Against PyTorch in float32 on a stored prompt, the largest
 logit difference among the top candidates is $7.3\times10^{-5}$ absolute and
-$1.5\times10^{-6}$ relative, and the greedy continuations of SmolLM2 and
-Qwen3.5 are token-identical over twelve tokens. Timings are single-threaded
+$1.5\times10^{-6}$ relative. Timings are single-threaded
 wall clock on an Intel i9-12900H.
 
 \begin{table}[t]
@@ -353,7 +361,7 @@ wall clock on an Intel i9-12900H.
 \midrule
 Parameters            & 124M            & 135M                  & 0.8B \\
 Layers                & 12              & 30                    & 24 \\
-Mixer                 & MHA             & grouped-query         & 18 DeltaNet / 6 gated MHA \\
+Mixer                 & MHA             & grouped-query         & 18 DeltaNet / 6 gated GQA \\
 Normalization         & LayerNorm       & RMSNorm               & RMSNorm (zero-centred) \\
 Position              & learned         & RoPE                  & partial RoPE \\
 Feed-forward          & GELU            & SwiGLU                & SwiGLU \\
@@ -370,7 +378,7 @@ stored prompt in each extraction mode.}
 \label{tab:models}
 \end{table}
 
-\section{Agreement on held-out text}
+\section{Agreement with other implementations}
 \label{sec:agree}
 
 The development is the specification of what these models compute in binary32,
@@ -378,7 +386,7 @@ and its agreement with other implementations is a measurement. For each
 model, the WikiText-2 raw test split \cite{wikitext}, tokenized by the
 model's own tokenizer, was cut into consecutive blocks of 64 tokens, and the
 first 16 tokens of 300 blocks spread evenly over the split form the windows.
-Each window was run through the native extraction, through PyTorch in float32
+Each window was run through the extracted decoder in the native build, through PyTorch in float32
 on an Intel i9-13900KF and on an RTX 6000 Ada GPU, and through llama.cpp
 \cite{llamacpp} on the same CPU and GPU from a float32 GGUF conversion. The
 conversion preserves the weights. On GPT-2 and SmolLM2 every tensor of the GGUF
@@ -658,6 +666,29 @@ For every causal $F$ and every $x$, $\mathrm{decode}(F)(x) = F(x)$.
 The proof applies causality at each prefix, and the theorem is instantiated at
 the three models. Within a step, the cache theorems above compute the row from
 the state the earlier steps left.
+
+\subsection{The decoders}
+
+The runners do not evaluate $\mathrm{decode}(F)$, which recomputes every
+prefix. They run a step function: \code{run}~$\mathit{step}$~$s$~$x$ feeds the
+elements of $x$ to $\mathit{step}$ one at a time from the state $s$ and
+collects the row each step emits. A step function and an initial state
+\emph{realize} a sequence function $F$ when every step extends the output of
+$F$ by exactly the row it emits from the state the earlier steps left, and a
+decoder that realizes $F$ computes $F$ on every sequence
+(\code{run\_realized}). Realizing decoders are built from combinators for
+row-wise and positional maps, composition, pairing, parallel heads, causal
+attention over a growing key/value cache, the depthwise convolution over a
+sliding window, the gated delta recurrence and a stack of layers; the cache
+theorems above are what the attention, convolution and recurrence combinators
+rest on.
+
+\begin{theorem}[\code{gpt2\_decode\_correct}, \code{llama\_decode\_correct}, \code{qwen\_decode\_correct}]
+For every configuration, model and token sequence, running the model's decoder
+over the sequence emits exactly the binary32 logit rows its forward pass
+computes on the whole sequence; for SmolLM2 and Qwen3.5 whenever the head
+counts are positive and the key/value heads divide the query heads.
+\end{theorem}
 
 \section{Rounding error}
 \label{sec:err}

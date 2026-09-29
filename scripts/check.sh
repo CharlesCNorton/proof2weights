@@ -65,16 +65,18 @@ if [ $have_rocq -eq 1 ]; then
   else
     step "assumption report" make -C theories Audit.vo
   fi
+  step "Z operations of the native build" "$PY" scripts/native_z.py
 else
   skipstep "theories compile" "$why"
   skipstep "assumption report" "$why"
+  skipstep "Z operations of the native build" "$why"
 fi
 
 echo "the host the native build runs on"
 if [ -x "$RUN_DIR/fp_selftest" ]; then
-  step "fp_selftest, 33 checks" "$RUN_DIR/fp_selftest"
+  step "fp_selftest, 54 checks" "$RUN_DIR/fp_selftest"
 else
-  skipstep "fp_selftest, 33 checks" "not built"
+  skipstep "fp_selftest, 54 checks" "not built"
 fi
 
 echo "provenance"
