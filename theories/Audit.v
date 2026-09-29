@@ -34,6 +34,9 @@ Require Import Truth.
 Require Import Witness.
 Require Import RoundChk.
 Require Import Bound64.
+Require Import Native.
+Require Import Machine.
+Require Import Decode.
 Require Import Annot.
 Require Import AnnExp.
 Require Import RunErr.
@@ -71,6 +74,13 @@ Print Assumptions narrow_widen_minus.
 Print Assumptions narrow_widen_mult.
 Print Assumptions narrow_widen_div.
 Print Assumptions narrow_widen_sqrt.
+Print Assumptions widen_neg.
+Print Assumptions widen_abs.
+Print Assumptions widen_lt.
+Print Assumptions widen_le.
+Print Assumptions widen_finite.
+Print Assumptions narrow_of_Z.
+Print Assumptions f32_of_Z_constants.
 
 (** * Backward error with underflow *)
 
@@ -239,6 +249,12 @@ Print Assumptions decode_stream_correct.
 Print Assumptions gpt2_decode_step.
 Print Assumptions llama_decode_step.
 Print Assumptions qwen_decode_step.
+
+(** * Decoders that carry their caches *)
+
+Print Assumptions run_realized.
+Print Assumptions gpt2_decode_correct.
+Print Assumptions llama_decode_correct.
 
 (** * The transposed decode the checkpoint runners perform *)
 

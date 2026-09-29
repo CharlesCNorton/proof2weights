@@ -2,7 +2,8 @@
 
 Each source is a directory of logit dumps for the windows of one windows file
 (agree_setup.py): <dir>/<index>.f32 holds little-endian binary32 logits, one
-row of <vocab> entries for each position of the window, positions in order.
+row of <vocab> entries for each position of the window, positions in order, and
+a float64 reference writes <dir>/<index>.f64 in binary64 instead.
 The first source named is the reference, and the pairs compared are the
 reference with each other source, together with any pair named by --pair.
 
@@ -34,8 +35,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 EDGES = np.round(np.arange(-15.0, 3.0001, 0.01), 2)
 
 
+def dump(d, w):
+    """The dump of window w in directory d: binary64 where the source wrote
+    one, binary32 otherwise."""
+    p = os.path.join(d, f"{w}.f64")
+    return p if os.path.exists(p) else os.path.join(d, f"{w}.f32")
+
+
 def load(path, vocab):
-    a = np.fromfile(path, dtype="<f4")
+    a = np.fromfile(path, dtype="<f8" if path.endswith(".f64") else "<f4")
     return a.reshape(-1, vocab)
 
 
@@ -131,7 +139,7 @@ def main():
     predicted = 0
     used = 0
     for w, toks in enumerate(windows):
-        paths = [os.path.join(d, f"{w}.f32") for d in dirs]
+        paths = [dump(d, w) for d in dirs]
         if not all(os.path.exists(p) for p in paths):
             continue
         xs = [load(p, args.vocab) for p in paths]

@@ -31,16 +31,18 @@ We define the forward passes of GPT-2, SmolLM2-135M-Instruct and Qwen3.5-0.8B,
 whose gated DeltaNet layers carry a state matrix through the sequence, in the
 Rocq prover with all arithmetic in IEEE-754 binary32 through Flocq, and extract
 them to OCaml programs that run the published checkpoints. On 300 windows of
-held-out text per model, 4{,}800 next-token distributions each, the extracted
-forward pass and PyTorch in float32 choose the same top-1 token at every
-position, with every logit within $1.6\times10^{-3}$, and the same holds at
-whole blocks of 64 tokens, at GPT-2's full 1024 positions and at 2048 tokens on
-SmolLM2. A second extraction that
+WikiText-2 test text per model, 4{,}800 next-token distributions each, the
+extracted forward pass and PyTorch in float32 choose the same top-1 token at
+every position, with every logit within $1.6\times10^{-3}$. The top-1 tokens
+also agree at every position of whole blocks of 64 tokens, of GPT-2's full 1024
+positions and of 2048 tokens on SmolLM2, where every logit is within
+$1.7\times10^{-3}$, $9.9\times10^{-3}$ and $2.2\times10^{-4}$ respectively. A
+second extraction that
 trusts no floating-point hardware computes, at every operation and for every
 input, the binary32 value the hardware extraction computes; that equality is
 proved at the level of floats, so overflow, infinities, NaNs and signed zeros
-are inside it, and the two assumptions the hardware extraction makes about its
-host are decided on that host by a self-test. We further prove that cached
+are inside it, and what the hardware extraction assumes of its host is checked
+on that host by a self-test. We further prove that cached
 autoregressive decoding computes exactly the binary32 values
 full recomputation computes, and that the three forward passes are causal. Used
 as a fixed reference, the extracted pass attributes llama.cpp's divergence, top-1
@@ -71,14 +73,14 @@ The contributions are the following.
   recurrence, extracted to programs that run the published GPT-2,
   SmolLM2-135M-Instruct and Qwen3.5-0.8B checkpoints
   (Section~\ref{sec:exec}), measured against PyTorch and llama.cpp on 300
-  held-out windows of 16 tokens per model, on sixty whole blocks of 64, and at
+  WikiText-2 test windows of 16 tokens per model, on sixty whole blocks of 64, and at
   window lengths to 2048 (Section~\ref{sec:agree}). For each
   model a runner whose forward pass is the extracted definition rather than a
   loop rebuilt around it reproduces the same checkpoint's PyTorch oracle.
 \item Two extraction modes from one source, with a proof at the level of floats
   that they compute the same binary32 value at every operation for every input,
   overflow, infinities, NaNs and signed zeros included, and a self-test that
-  decides on the host the two assumptions the hardware mode makes about it
+  checks on the host what the hardware mode assumes of it
   (Section~\ref{sec:tcb}).
 \item Proofs that cached decoding equals full recomputation, as equalities of
   binary32 values, and that the three forward passes are causal
@@ -90,7 +92,7 @@ The contributions are the following.
   nothing overflows (Section~\ref{sec:err}).
 \item Bounds from every elementary function the models evaluate to the
   mathematical function (Section~\ref{sec:elem}), and the error of each
-  measured at every one of the $2^{32}$ binary32 inputs
+  extracted function measured at every binary32 input of its domain
   (Section~\ref{sec:exh}).
 \item A differential oracle for float32 implementations, which separates
   PyTorch's residual into reduction order and elementary functions
@@ -114,14 +116,19 @@ negation, absolute value and comparison are Flocq's \code{Bplus}, \code{Bmult},
 \code{Bdiv}, \code{Bsqrt}, \code{Bopp}, \code{Babs} and \code{Bcompare} under
 round-to-nearest, ties-to-even. Every scalar the networks compute is produced
 by one of these operations, and everything else is list plumbing that performs
-no arithmetic. A weight is decoded from its four little-endian bytes through
+no arithmetic. A dot product is a left fold from zero in index order, each
+product rounded and then added to the running sum and rounded, and every other
+sum is the same fold without the products. A weight is decoded from its four little-endian bytes through
 Flocq's \code{b32\_of\_bits} composed with the single-NaN collapse, so a loaded
 value is the IEEE-754 value its bytes denote.
 
 \subsection{The elementary functions}
 
 Each elementary function is a composition of the primitives, and each constant
-is a quotient of integers that binary32 rounds once.
+is a binary32 quotient of two integers. The numerators of $\pi$ and
+$\sqrt{2/\pi}$ are wider than binary32's 24 bits, so those two are rounded on
+conversion and again at the division, and the bounds of
+Section~\ref{sec:elem} are stated on the stored values.
 
 \paragraph{Exponential.} The argument is saturated to $[-88, 88]$ and written
 as $x = k\log 2 + r$, with $k$ the nearest integer to $x/\log 2$. The reduction
@@ -171,11 +178,11 @@ the GELU feed-forward with SwiGLU.
 The Qwen3.5 path alternates three gated DeltaNet layers \cite{gateddeltanet}
 with one gated full-attention layer. A DeltaNet layer projects its input to a
 fused query/key/value triple, applies a depthwise causal convolution,
-$\ell_2$-normalizes query and key, and runs a recurrence over a per-head state
-matrix $S \in \mathbb{R}^{d_k \times d_v}$:
+$\ell_2$-normalizes query and key, scales the query by $1/\sqrt{d_k}$, and runs
+a recurrence over a per-head state matrix $S \in \mathbb{R}^{d_k \times d_v}$:
 \[
   S_t = e^{g_t}\,S_{t-1}
-        + k_t\big(v_t - S_{t-1}^{\top}k_t\big)^{\!\top}\!\beta_t,
+        + k_t\big(v_t - e^{g_t}S_{t-1}^{\top}k_t\big)^{\!\top}\!\beta_t,
   \qquad
   o_t = S_t^{\top} q_t ,
 \]
@@ -229,22 +236,42 @@ operation's Flocq correctness theorem applies, the binary64 result is the
 correct rounding of the same exact real value the binary32 result rounds; the
 binary64 rounding never overflows, because a binary32 pair produces a quotient
 of magnitude at most $2^{277}$; narrowing that result is correct rounding
-again, and double rounding is harmless, by Flocq's double-rounding development
-\cite{roux2014} instantiated at the two formats, so the two sides
+again, and double rounding is harmless because binary64's 53 bits meet
+Figueroa's condition $p' \ge 2p + 2$ for binary32's 24 \cite{figueroa1995},
+through Flocq's double-rounding development \cite{roux2014} instantiated at the
+two formats, so the two sides
 have the same value, the same finiteness and the same sign, which determines a
 float. The remaining operand shapes are decided by computation on the
 constructors. \code{narrow\_widen} states the special case that narrowing a
 widened binary32 returns it.
 
+The build's other directives are covered at the same level. Negation, absolute
+value, the two comparisons and the finiteness test are the binary64 operations
+of the same names on the widened operands (\code{widen\_neg},
+\code{widen\_abs}, \code{widen\_lt}, \code{widen\_le}, \code{widen\_finite}),
+and narrowing the binary64 conversion of an integer with at most 53
+significant bits is \code{f32\_of\_Z} (\code{narrow\_of\_Z}), which covers every
+literal the development converts (\code{f32\_of\_Z\_constants}). The native
+build holds $\mathbb{Z}$ in machine integers. Extracting its roots with
+$\mathbb{Z}$ left inductive shows that it performs no arithmetic on them: its
+only operation is \code{Z.of\_nat}, on a length, a dimension or a rotary
+position before \code{f32\_of\_Z}, beside the character codes of the header
+parser, so its integers are the literal constants, all below $2^{57}$, and
+values it already holds as machine integers.
+
 The consequence is that the two extraction modes compute the same binary32
 value at every operation for every input, so a number measured on the native
 build is a number of the inductive build. What the native build still assumes
-is that the host's binary64 arithmetic is IEEE-754 round-to-nearest-even with
-no excess precision and no contraction of a multiply and an add, and that
-\code{Int32.bits\_of\_float} rounds to nearest. A self-test shipped with the
-runners decides both on the host that runs it. The elementary functions extract
-structurally in both modes as the same compositions of the primitives.
-Table~\ref{tab:tcb} states the two trusted bases.
+of its host is that binary64 arithmetic is IEEE-754 round-to-nearest-even with
+no excess precision and no contraction of a multiply and an add, that
+\code{Int32.bits\_of\_float} and \code{float\_of\_int} round to nearest and
+\code{Int32.float\_of\_bits} widens exactly, and, for the annotated pass of
+Section~\ref{sec:runerr}, that \code{Float.succ} and \code{Float.pred} return
+the binary64 neighbours and \code{ldexp} builds its constants exactly. A
+self-test shipped with the runners checks each on boundary cases on the host
+that runs it. The elementary functions extract structurally in both modes as
+the same compositions of the primitives. Table~\ref{tab:tcb} states the two
+trusted bases.
 
 \begin{table}[t]
 \centering
@@ -254,12 +281,16 @@ Table~\ref{tab:tcb} states the two trusted bases.
 & \textbf{Inductive mode} & \textbf{Native mode} \\
 \midrule
 binary32 values      & Flocq \code{binary\_float}        & OCaml \code{float} \\
-$\mathbb{Z}$, \code{positive} & inductive datatypes      & machine integers \\
-Arithmetic           & Flocq \code{B}-operations         & binary64, rounded to binary32 \\
-Floating-point hardware & not used for arithmetic        & trusted: binary64, nearest-even \\
-                     &                                   & no excess precision, no contraction \\
-Further assumption   & none                              & \code{bits\_of\_float} rounds to nearest \\
-Value at each operation & \multicolumn{2}{c}{equal on every input (Thm.~\ref{thm:narrow})} \\
+$\mathbb{Z}$, \code{positive} & inductive datatypes      & machine integers, no arithmetic \\
+$+$, $-$, $\times$, $\div$, $\sqrt{\ }$ & Flocq \code{B}-operations & binary64, rounded to binary32 \\
+$-x$, $|x|$, $<$, $\le$, integers & Flocq                & binary64, on the widened value \\
+Weight decoding      & \code{b32\_of\_bits}              & \code{Int32.float\_of\_bits} \\
+Trusted of the host  & nothing for arithmetic            & binary64 nearest-even, no excess \\
+                     &                                   & precision, no contraction; the \\
+                     &                                   & \code{Int32} and integer conversions \\
+Annotated pass       & ---                               & \code{Float.succ}, \code{Float.pred}, \code{ldexp} \\
+Checked by           & ---                               & \code{fp\_selftest}, on boundary cases \\
+Value at each operation & \multicolumn{2}{c}{equal on every input (Thm.~\ref{thm:narrow}, \code{Native.v})} \\
 \bottomrule
 \end{tabular}
 \caption{Trusted computing bases of the two extraction modes.}
@@ -350,10 +381,16 @@ first 16 tokens of 300 blocks spread evenly over the split form the windows.
 Each window was run through the native extraction, through PyTorch in float32
 on an Intel i9-13900KF and on an RTX 6000 Ada GPU, and through llama.cpp
 \cite{llamacpp} on the same CPU and GPU from a float32 GGUF conversion. The
-conversion preserves the weights: on SmolLM2 every tensor of the GGUF holds the
-values of the \code{safetensors} the extracted pass loads, the query and key
-projections up to the row permutation the converter applies for its rotary
-convention, so the deviations reported below are differences in arithmetic.
+conversion preserves the weights. On GPT-2 and SmolLM2 every tensor of the GGUF
+holds the values of the \code{safetensors} the extracted pass loads, SmolLM2's
+query and key projections up to the row permutation the converter applies for
+its rotary convention. On Qwen3.5, 241 of the 320 tensors the forward pass reads
+are identical; the other 79 are the 61 zero-centred normalization weights,
+which the converter stores with one added, the binary32 sum the extracted pass
+forms, and the 18 decay parameters $A_{\log}$, which it replaces by
+$-e^{A_{\log}}$ computed in PyTorch, within one unit in the last place of the
+correctly rounded value. The deviations reported below are differences in
+arithmetic.
 Each implementation returns the logits of all 16 positions, 4{,}800 next-token
 distributions per model. PyTorch runs with eager attention and with TF32
 disabled, and Qwen3.5's gated DeltaNet runs its PyTorch fallback, a chunked form
@@ -407,10 +444,11 @@ $64$ tokens for all three models (Table~\ref{tab:long}), and on long windows:
 GPT-2 over the whole of its position table at $1024$, and SmolLM2 at $2048$
 (Table~\ref{tab:longctx}). Both tables carry llama.cpp beside PyTorch
 and bfloat16 beside float32, bfloat16 being the precision deployments use.
-Qwen3.5 has two further rows: vLLM in bfloat16, and the gated delta rule
-through flash-linear-attention's fused Triton kernels, which is the path a
-deployment of that architecture takes, in float32 with the depthwise
-convolution left on the torch path.
+Qwen3.5 has further rows: vLLM in bfloat16, and the gated delta rule through
+flash-linear-attention's fused Triton kernels, which is the path a deployment
+of that architecture takes, with the depthwise convolution left on the torch
+path, run once with Triton's default for float32 dot products, which is TF32,
+and once with IEEE dot products.
 
 Top-1 agreement with PyTorch in float32 is unaffected by any of it. At $64$
 tokens PyTorch returns the extracted top-1 token at all $3{,}840$ positions of
@@ -420,24 +458,27 @@ SmolLM2 and Qwen3.5 at every length; on GPT-2 between one and four positions
 reorder, of $3{,}840$ at $64$ tokens and $3{,}072$ at $1024$. Perplexity moves
 by less than one part in $10^{6}$ in float32 at every length.
 
-The largest logit difference does not follow the length monotonically. On GPT-2
-it is six times larger at $1024$ than at $64$, $9.89\times10^{-3}$ against
-$1.68\times10^{-3}$; on SmolLM2 it is five times smaller at $2048$ than at
-$64$, $2.15\times10^{-4}$ against $1.17\times10^{-3}$.
-
 llama.cpp in float32 changes the top-1 token at $0$ to $14$ positions per model,
 device and length, which Section~\ref{sec:diff} attributes. bfloat16 is a
-different regime, and the two ways of reaching it separate. At $64$ tokens,
-reading bfloat16 weights and computing in float32, as llama.cpp does, changes
-$13$, $26$ and $210$ top-1 tokens on Qwen3.5, SmolLM2 and GPT-2; computing in
-bfloat16 as well, as PyTorch does, changes $84$, $149$ and $468$, between two
-and seven times as many, and moves a logit by $12.5$ against $7.4$. Length
+different regime, and the two ways of reaching it separate. llama.cpp with
+bfloat16 weights rounds the activations to bfloat16 at every weight product, on
+the CPU through ggml's bfloat16 dot product and on the GPU through cuBLAS with
+bfloat16 operands and float32 accumulation, and keeps the residual stream, the
+normalizations and softmax in float32; at $64$ tokens it changes $13$, $26$ and
+$209$ top-1 tokens on Qwen3.5, SmolLM2 and GPT-2 on the CPU. PyTorch in
+bfloat16 stores every activation between operations in bfloat16, the residual
+stream included, and changes $84$,
+$149$ and $468$, between two and seven times as many, and moves a logit by
+$12.5$ against $6.8$. Length
 widens that gap sharply: at GPT-2's $1024$ positions PyTorch in bfloat16 moves
 a logit by $298$ and leaves the top ten in order at $113$ positions of
 $3{,}072$. vLLM in bfloat16 on Qwen3.5 changes $80$ top-1 tokens beside
 PyTorch's $84$, and moves the perplexity by $9\times10^{-4}$ where PyTorch in
-bfloat16 moves it by $0.064$. The fused float32 kernels sit between the two
-regimes, changing six top-1 tokens where the unfused float32 path changes none.
+bfloat16 moves it by $0.064$. The fused kernels in their default TF32 change
+six top-1 tokens and move a logit by $0.114$; with IEEE dot products they return
+the extracted top-1 token at every position with every logit within
+$1.6\times10^{-4}$, as the unfused path does, so the six changes come from TF32
+and none from fusion.
 
 \begin{table}[t]
 \centering
@@ -468,9 +509,10 @@ SmolLM2 & extracted            & ---      & ---                & ---            
 Qwen3.5 & extracted            & ---      & ---                & ---                 & 58.171639 \\
         & PyTorch CPU          & 0/3840   & $4.6\times10^{-6}$ & $1.65\times10^{-4}$ & 58.171641 \\
         & PyTorch GPU          & 0/3840   & $4.7\times10^{-6}$ & $1.61\times10^{-4}$ & 58.171642 \\
+        & PyTorch fused, f32   & 0/3840   & $4.7\times10^{-6}$ & $1.59\times10^{-4}$ & 58.171642 \\
         & llama.cpp CPU        & 0/3840   & $2.7\times10^{-4}$ & $1.96\times10^{-2}$ & 58.171435 \\
         & llama.cpp GPU        & 2/3840   & $9.3\times10^{-4}$ & $3.04\times10^{-2}$ & 58.171916 \\
-        & PyTorch fused, f32   & 6/3840   & $1.5\times10^{-3}$ & $1.14\times10^{-1}$ & 58.169333 \\
+        & PyTorch fused, TF32  & 6/3840   & $1.5\times10^{-3}$ & $1.14\times10^{-1}$ & 58.169333 \\
         & llama.cpp CPU bf16   & 13/3840  & $6.8\times10^{-3}$ & $2.44\times10^{-1}$ & 58.178980 \\
         & llama.cpp GPU bf16   & 13/3840  & $6.8\times10^{-3}$ & $2.08\times10^{-1}$ & 58.176583 \\
         & vLLM bf16            & 80/3840  & $1.7\times10^{-2}$ & $5.25\times10^{-1}$ & 58.172501 \\
@@ -480,8 +522,9 @@ Qwen3.5 & extracted            & ---      & ---                & ---            
 \caption{Sixty whole blocks of 64 tokens per model, every position compared.
 \emph{top-1 differs} counts the positions whose highest-scoring token differs
 from the extracted pass's. The bf16 rows read bfloat16 weights; the PyTorch and
-vLLM ones compute in bfloat16 as well. The fused row runs the gated delta rule
-through flash-linear-attention's Triton kernels. Perplexity is over the
+vLLM ones compute in bfloat16 as well. The fused rows run the gated delta rule
+through flash-linear-attention's Triton kernels with IEEE or TF32 float32 dot
+products. Perplexity is over the
 positions with a following token in the window.}
 \label{tab:long}
 \end{table}
@@ -519,20 +562,29 @@ those of Table~\ref{tab:long}.}
 
 The residual PyTorch leaves has two possible sources: it evaluates the
 elementary functions with its own implementations rather than the series of
-Section~\ref{sec:elem}, and it accumulates its matrix products in a different
-order. The two are separated on GPT-2 by running the forward pass in numpy
-float32 twice over the same checkpoint and the same windows, once with numpy's
-exp and GELU and once with the extracted ones, against the extracted reference. Over twenty windows of 64 tokens the maximum
-absolute difference moves from $1.766\times10^{-3}$ to $1.678\times10^{-3}$ and
-the mean from $6.159\times10^{-5}$ to $6.112\times10^{-5}$; PyTorch sits at
-$1.678\times10^{-3}$ and $6.199\times10^{-5}$. Substituting the elementary
-functions therefore accounts for five percent of the maximum and under one
-percent of the mean, and what is left, which is nearly all of it, is reduction
-order. Random small models show the same signature: against a numpy float32
-implementation the mean logit error rises by a factor of $12.5$ from width $8$
-to width $64$ at four layers and by $1.4$ from one layer to eight, which is
-what accumulating longer dot products in a different order predicts
-\cite{highammary2019}.
+Section~\ref{sec:elem}, and it accumulates its matrix products differently. The
+two are separated on GPT-2 by running the forward pass in numpy float32 over the
+same checkpoint and the same windows, against the extracted reference. Over
+twenty windows of 64 tokens, replacing numpy's exp and GELU by the extracted ones
+moves the maximum absolute difference from $1.766\times10^{-3}$ to
+$1.678\times10^{-3}$ and the mean from $6.159\times10^{-5}$ to
+$6.112\times10^{-5}$; PyTorch sits at $1.678\times10^{-3}$ and
+$6.199\times10^{-5}$. Substituting the elementary functions therefore accounts
+for five percent of the maximum and under one percent of the mean. What is left
+is the accumulation, and it has two parts. A pass in the development's own
+order, a left fold from zero of rounded products, reproduces the extracted pass
+bit for bit on all twenty windows; fusing each product into its sum moves it to
+a maximum of $1.160\times10^{-3}$ and a mean of $3.32\times10^{-5}$, and summing
+the rounded products as a balanced binary tree moves it to $1.259\times10^{-3}$
+and $6.00\times10^{-5}$, so contraction and summation order each produce a
+residual of PyTorch's size on their own. Random small models behave the same
+way: against a numpy float32 implementation the mean logit error rises by a
+factor of $12.5$ from width $8$ to width $64$ at four layers and by $1.4$ from
+one layer to eight. A first-order model that gives every sum an independent
+rounding error of the size its partial sums set \cite{highammary2019} predicts
+$16.8$ and $1.21$, the growth with width coming from both the length of the
+sums and the size of the activations, which the fixed initialization scale lets
+grow with the width.
 
 \section{Cached decoding and causality}
 \label{sec:cache}
@@ -656,13 +708,27 @@ the two further RMSNorm variants, the convolution, the gated delta step and
 scan, and both Qwen3.5 mixers to the Qwen3.5 logits
 (\code{ok\_qwen\_logits\_full}).
 
+At the scale of the checkpoints these bounds assert nothing. Every budget has
+$L \ge 2$ and $L \ge 2M$, so
+$\mathrm{err}_n \ge uM\,(2M)^{n-1}$, and at the logits $n$ is at least twice the
+width of the model, the length of the final dot product. With $M$ no smaller
+than the largest logit the checkpoints produce on the evaluation windows, $338$
+for GPT-2, $41$ for SmolLM2 and $27$ for Qwen3.5, the bounds exceed
+$10^{4340}$, $10^{2195}$ and $10^{3546}$. An elementary function evaluated from
+an exact input fares no better: each of its stages multiplies or produces a
+magnitude of at least one, so a stage of $d$ operations carries at least
+$(2^d - 1)u$, which is $0.0078$ for the logarithm, $0.125$ for the
+exponential, $0.25$ for cosine, $0.5$ for sine and the sigmoid, $4$ for
+$\tanh$, $512$ for GELU and $65{,}536$ for softplus.
+
 The side conditions of each stage are collected in a record: one overflow
 condition per operation, bounds on the magnitudes it multiplies, and, for the
 exponential, the hypothesis that the float reduction selects the integer $k$
 the real evaluation selects. They are hypotheses about intermediate values; the
 records of the exponential, sigmoid, tanh and GELU are discharged by
 computation at an exact zero, and the exponential's at $-1000$, which saturates
-to $-88$ and whose result is subnormal, as a masked attention score is.
+to $-88$ and whose result is subnormal, as the exponential of an attention
+score more than $87.4$ below its row maximum is.
 
 \subsection{A forward pass that carries its bound}
 \label{sec:runerr}
@@ -764,9 +830,9 @@ The perturbation is set by the length of the one dot product, not by the depth
 of the network. The classical statement \cite{higham2002} is the case
 $\delta = 0$, which needs every product and every partial sum to be zero or at
 least $2^{-126}$ in magnitude, where rounding is relative. That fails where the
-networks compute: a masked attention score is the exponential of a saturated
-argument and is subnormal, and the products a dot product then accumulates are
-subnormal too. The displacement $\delta$, a multiple of half the smallest
+networks compute: the exponential of an attention score more than $87.4$ below
+its row maximum is subnormal, and so are the products the attention's weighted
+sum of values then accumulates. The displacement $\delta$, a multiple of half the smallest
 positive binary32, is what covers those rows. Overflow is the only hypothesis,
 and the statement lifts unchanged to the matrix-vector product and to the
 tied-embedding logit projection of all three models
@@ -827,10 +893,6 @@ from the product formulas, finish the proof. \code{ok\_reduce\_2pi} carries the
 propagation relation through the reduction under the same kind of hypothesis
 as the exponential's, that the float and real evaluations select the same $k$.
 
-The reduction's bound is proved under the hypothesis that the float and real
-reductions select the same $k$; the exhaustive sweep of Section~\ref{sec:exh}
-bounds the error at every input whether or not they do.
-
 \begin{corollary}[\code{ok\_sin\_true\_full}, \code{ok\_cos\_true\_full}]
 Under the reduction's and the polynomial's side conditions, for
 $|x| \le 262144$ the extracted \code{f32\_sin} is within
@@ -887,12 +949,10 @@ saturation.}
 \subsection{Every binary32 input}
 \label{sec:exh}
 
-An exhaustive sweep performs the same compositions, in the same order, with
-each primitive written as the binary64 operation narrowed to binary32, which
-Theorem~\ref{thm:narrow} makes the same function, and evaluates \emph{every}
-binary32 input of each domain against the mathematical function in binary64,
-nineteen billion evaluations in all. The last two columns of
-Table~\ref{tab:elem} report it.
+An exhaustive sweep runs the elementary functions of the native build, the
+extracted definitions themselves, on \emph{every} binary32 input of each domain
+against the mathematical function in binary64, nineteen billion evaluations in
+all. The last two columns of Table~\ref{tab:elem} report it.
 
 Three things follow. Square root is correctly rounded at every input. The
 exponential is within one unit in the last place everywhere, and the logarithm
@@ -963,16 +1023,18 @@ Each choice alone, with the other three removed, changes top-1 tokens on at
 least one model and multiplies the largest logit deviation by about 90 to
 1{,}000 on every model it applies to, the kernel and TF32 by the most.
 
-The counts are not monotone in the number of choices removed, because the
-kernel and the math mode govern the same matrix products. On GPT-2 on the GPU,
-removing \code{mul\_mat\_f} while TF32 remains enabled raises the top-1
-differences from 7 to 11: the products the kernel handled fall to cuBLAS, which
-in TF32 math mode carries a ten-bit significand. The three paths order by
-accuracy as cuBLAS in float32, then the kernel, then cuBLAS in TF32, so
-removing the kernel is an improvement only once TF32 is off. The two choices
-have to be read as a pair, and the row with both removed is the float32 path.
-With all
-four removed, llama.cpp agrees with the extracted forward pass as closely as
+The kernel and the math mode govern the same matrix products. While the kernel
+is in place, the products it handles never reach cuBLAS, and switching TF32 off
+leaves the largest deviation of GPT-2 and SmolLM2 unchanged. Removing the
+kernel sends those products to cuBLAS, which in TF32 math mode carries a
+ten-bit significand, and the largest deviation still falls on all three models,
+from $1.70$ to $0.853$, from $0.225$ to $0.201$ and from $5.55\times10^{-2}$ to
+$3.98\times10^{-2}$ in the default rows, so on that measure the kernel is less
+accurate than cuBLAS in TF32. On GPT-2 the same change raises the top-1 count
+from 7 to 11; every top-1 difference in the GPU rows falls where the two
+highest extracted logits are at most $2.6\times10^{-2}$ apart, while the logits
+themselves move by up to $1.70$. The products run in float32 only with both
+removed. With all four removed, llama.cpp agrees with the extracted forward pass as closely as
 PyTorch does on both backends, with every logit within $1.79\times10^{-3}$; its
 one top-1 difference, on SmolLM2 on the GPU, falls where the two highest
 extracted logits are $3.2\times10^{-5}$ apart.
@@ -987,10 +1049,15 @@ instantiate Roux's development \cite{roux2014}; and Coq's primitive floats
 trusted base. CoqInterval \cite{coqinterval} discharges the series bounds.
 
 TorchLean \cite{torchlean} is a framework for formalizing, executing and
-verifying neural networks in Lean~4, with executable IEEE-style binary32
-components and a rounding model among much else. The development here has a
-narrower operator set and a different object: definitions extracted and
-executed on published checkpoints, with results about that execution. George
+verifying neural networks in Lean~4. Its executable binary32,
+\code{IEEE32Exec}, is refined to a round-on-$\mathbb{R}$ model on finite
+executions, excluding NaNs, infinities and overflow; its fast path through
+Lean's runtime floats and CUDA is tied to \code{IEEE32Exec} by a conformance
+assumption the work leaves undischarged; and its evaluation loads no published
+checkpoint. The development here has a narrower operator set, runs three
+published checkpoints through its definitions, and proves that each arithmetic
+operation its fast path performs returns the binary32 value of the formal
+operation on every input, NaNs, infinities and overflow included. George
 \cite{torchleancheck} reports a Lean layer over TorchLean that checks exported
 checkpoint files and traces against the claim they support. Earlier
 proof-assistant treatments of neural networks work at smaller scale: Certigrad
@@ -1003,7 +1070,9 @@ For mechanized error analysis the closest work is LAProof \cite{laproof}, which
 proves forward and mixed backward bounds for dot products and matrix-vector
 products with underflow handled; the rounding model of Section~\ref{sec:err} is
 the same device. VCFloat \cite{vcfloat} treats approximation as well as
-rounding error. For transformers, Budzinskiy et al.\ \cite{budzinskiy} give a
+rounding error, and VCFloat2 \cite{vcfloat2} computes round-off bounds on
+floating-point expressions automatically, including expressions that call
+external functions. For transformers, Budzinskiy et al.\ \cite{budzinskiy} give a
 mixed-precision stability analysis covering normalization layers, softmax and
 self-attention.
 
@@ -1012,10 +1081,14 @@ nondeterminism by fixing the reduction order in the implementation rather than
 specifying it in a proof assistant, and Cankaya \cite{bitexact} shows that
 bit-exact recomputation is possible across NVIDIA GPU variants by software
 emulation; the reference there is a rerun of the same software, where the
-reference here is a definition. Correctly rounded binary32 elementary
+reference here is a definition. CRADLE \cite{cradle} compares one model's
+outputs across the backends of a deep learning library and localizes the layers
+where they diverge; here each implementation is compared with a formal
+definition, one implementation choice at a time. Correctly rounded binary32 elementary
 functions \cite{rlibm32,coremath} are an alternative to the series used here,
-which would make the reference canonical against mathematics at the cost of
-moving it away from PyTorch, whose backends are not correctly rounded.
+which would make the reference canonical against mathematics and bring it
+closer to PyTorch, whose functions stay within a few units in the last place
+where the compositions of Section~\ref{sec:exh} lose all relative accuracy.
 
 \section*{Availability}
 
@@ -1044,6 +1117,11 @@ P.~Roux.
 \newblock Innocuous double rounding of basic arithmetic operations.
 \newblock \emph{Journal of Formalized Reasoning}, 7(1):131--142, 2014.
 
+\bibitem{figueroa1995}
+S.~A.~Figueroa.
+\newblock When is double rounding innocuous?
+\newblock \emph{ACM SIGNUM Newsletter}, 30(3):21--26, 1995.
+
 \bibitem{primfloats}
 G.~Bertholon, \'E.~Martin-Dorel, and P.~Roux.
 \newblock Primitive floats in Coq.
@@ -1070,6 +1148,12 @@ T.~Ramananandro, P.~Mountcastle, B.~Meister, and R.~Lethin.
 \newblock A unified Coq framework for verifying C programs with floating-point
   computations.
 \newblock \emph{5th ACM SIGPLAN Conference on Certified Programs and Proofs}, 2016.
+
+\bibitem{vcfloat2}
+A.~W.~Appel and A.~E.~Kellison.
+\newblock VCFloat2: Floating-point error analysis in Coq.
+\newblock \emph{13th ACM SIGPLAN International Conference on Certified Programs
+  and Proofs}, 2024.
 
 \bibitem{budzinskiy}
 S.~Budzinskiy, W.~Fang, L.~Zeng, and P.~Petersen.
@@ -1155,6 +1239,13 @@ W.~Kwon, Z.~Li, S.~Zhuang, Y.~Sheng, L.~Zheng, C.~H.~Yu, J.~E.~Gonzalez,
   PagedAttention.
 \newblock \emph{29th ACM Symposium on Operating Systems Principles}, 2023.
 \newblock vLLM 0.19.1.
+
+\bibitem{cradle}
+H.~V.~Pham, T.~Lutellier, W.~Qi, and L.~Tan.
+\newblock CRADLE: Cross-backend validation to detect and localize bugs in deep
+  learning libraries.
+\newblock \emph{41st IEEE/ACM International Conference on Software
+  Engineering}, 2019.
 
 \bibitem{bitexact}
 N.~Cankaya.

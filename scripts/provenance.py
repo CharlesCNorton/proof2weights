@@ -32,7 +32,9 @@ MODELS = {
                "converted": "smollm.safetensors",
                "setup": "scripts/smollm_setup.py", "n_head": 9, "n_kv_head": 3},
     "qwen": {"repo": "Qwen/Qwen3.5-0.8B", "converted": "qwen.safetensors",
-             "setup": "scripts/qwen_setup.py", "n_head": 8, "n_kv_head": 2},
+             "setup": "scripts/qwen_setup.py", "n_head": 8, "n_kv_head": 2,
+             # the multi-token-prediction block, which inference does not run
+             "gguf_skip": "blk.24."},
 }
 
 
@@ -131,25 +133,42 @@ def _unpermute(w, n_head):
              .reshape(w.shape))
 
 
-def gguf_vs_safetensors(gguf_path, st_path, n_head=None, n_kv_head=None):
+def _ulps(a, b):
+    """Largest distance between two float32 arrays in units in the last place."""
+    import numpy as np
+    ia = a.astype(np.float32).view(np.int32).astype(np.int64)
+    ib = b.astype(np.float32).view(np.int32).astype(np.int64)
+    ia = np.where(ia < 0, np.int64(-2**31) - ia, ia)
+    ib = np.where(ib < 0, np.int64(-2**31) - ib, ib)
+    return int(np.abs(ia - ib).max())
+
+
+def gguf_vs_safetensors(gguf_path, st_path, n_head=None, n_kv_head=None,
+                        skip=None):
     """Compare a float32 GGUF against the safetensors it was converted from,
     tensor by tensor, on the values both hold.
 
     A tensor counts as identical when its bytes match, when it matches after a
     transpose, or, for a query or key projection, when it matches after undoing
-    the converter's rotary row permutation. Anything else is reported by name.
+    the converter's rotary row permutation. The two folds the Qwen3.5 converter
+    makes are counted apart: a zero-centred normalization weight stored with one
+    added in binary32, and a decay parameter stored as the negated exponential
+    of itself, within one unit in the last place of the correctly rounded value.
+    Tensors whose names start with `skip` are left out. Anything else is
+    reported by name.
     """
     import numpy as np
     from gguf import GGUFReader
     from safetensors import safe_open
 
     reader = GGUFReader(gguf_path)
-    gg = {t.name: np.array(t.data) for t in reader.tensors}
+    gg = {t.name: np.array(t.data) for t in reader.tensors
+          if not (skip and t.name.startswith(skip))}
     with safe_open(st_path, framework="np") as f:
         st = {k: f.get_tensor(k) for k in f.keys()}
     report = {"gguf_tensors": len(gg), "safetensors_tensors": len(st),
               "compared": 0, "identical": 0, "identical_after_permute": 0,
-              "unmatched": []}
+              "plus_one": 0, "neg_exp": 0, "unmatched": []}
     st_by_shape = {}
     for k, v in st.items():
         st_by_shape.setdefault((v.shape, v.dtype.str), []).append((k, v))
@@ -172,9 +191,16 @@ def gguf_vs_safetensors(gguf_path, st_path, n_head=None, n_kv_head=None):
                          for _, v in cands):
             report["identical_after_permute"] += 1
             continue
+        if any(np.array_equal(g, v + np.float32(1)) for _, v in cands):
+            report["plus_one"] += 1
+            continue
+        if any(_ulps(g, (-np.exp(v.astype(np.float64))).astype(np.float32)) <= 1
+               for _, v in cands):
+            report["neg_exp"] += 1
+            continue
         report["unmatched"].append(name)
 
-    report["all_identical"] = not report["unmatched"]
+    report["all_accounted"] = not report["unmatched"]
     return report
 
 
@@ -210,7 +236,7 @@ def main():
         try:
             entry["gguf"]["identity"] = gguf_vs_safetensors(
                 path, st, MODELS[name].get("n_head"),
-                MODELS[name].get("n_kv_head"))
+                MODELS[name].get("n_kv_head"), MODELS[name].get("gguf_skip"))
         except Exception as exc:
             entry["gguf"]["identity_error"] = str(exc)
 

@@ -2,20 +2,26 @@
 
    Narrow.v proves that narrowing the binary64 result of an operation on
    widened binary32 operands gives the binary32 result Flocq specifies, for
-   every input. That proof is about Flocq's operations. The native extraction
-   replaces them by the host's, so two things have to be true of the host for
-   the proof to transfer:
+   every input, and Native.v that negation, absolute value, comparison, the
+   finiteness test and integer conversion are the binary64 operations on the
+   widened values. Those proofs are about Flocq's operations. The native
+   extraction replaces them by the host's, so these things have to be true of
+   the host for the proofs to transfer:
 
      - its float arithmetic is IEEE-754 binary64, round-to-nearest-even, with
        no excess precision and no contraction of a multiply and an add into a
        fused multiply-add;
      - Int32.bits_of_float rounds to nearest-even, overflows to an infinity,
-       keeps subnormals, and propagates NaNs and signed zeros.
+       keeps subnormals, and propagates NaNs and signed zeros;
+     - Int32.float_of_bits widens a binary32 exactly, which is how a weight is
+       decoded, and float_of_int converts an integer below 2^53 exactly;
+     - Float.succ and Float.pred step to the binary64 neighbours, and
+       ldexp (float_of_int m) e builds m 2^e exactly, which the annotated pass
+       uses for its outward rounding and its constants.
 
-   This program decides both. It exits non-zero on the first failure and is the
-   first thing the referee target runs; a native number produced on a host
-   where it fails means nothing. Everything here is a property of the host and
-   of the extraction directives, not of the development. *)
+   This program checks each on boundary cases and exits non-zero if any check
+   fails. Everything here is a property of the host and of the extraction
+   directives, not of the development. *)
 
 open Phases1_15_native
 
@@ -77,6 +83,48 @@ let () =
   check "NaN narrows to a NaN" (Float.is_nan (narrow nan));
   check "positive zero keeps its sign" (same32 (narrow 0.0) 0.0);
   check "negative zero keeps its sign" (same32 (narrow (-0.0)) (-0.0));
+
+  Printf.printf "Int32 widening, byte decoding and integer conversion\n";
+
+  let w32 b = Int32.float_of_bits b in
+  let mx32 = ldexp (2.0 -. p2 (-23)) 127 in
+  check "smallest subnormal widens exactly" (w32 0x00000001l = p2 (-149));
+  check "largest subnormal widens exactly" (w32 0x007fffffl = p2 (-126) -. p2 (-149));
+  check "smallest normal widens exactly" (w32 0x00800000l = p2 (-126));
+  check "one widens exactly" (w32 0x3f800000l = 1.0);
+  check "largest binary32 widens exactly" (w32 0x7f7fffffl = mx32);
+  check "infinities widen" (w32 0x7f800000l = infinity && w32 0xff800000l = neg_infinity);
+  check "negative zero widens" (same (w32 0x80000000l) (-0.0));
+  check "NaN patterns widen to NaNs"
+    (Float.is_nan (w32 0x7fc00000l) && Float.is_nan (w32 0x7f800001l));
+  check "bytes decode little-endian"
+    (f32_bytes_to_binary32 [0x00; 0x00; 0x80; 0x3f] = 1.0
+     && f32_bytes_to_binary32 [0x01; 0x00; 0x00; 0x00] = p2 (-149)
+     && f32_bytes_to_binary32 [0xff; 0xff; 0x7f; 0x7f] = mx32
+     && f32_bytes_to_binary32 [0x00; 0x00; 0x80; 0xff] = neg_infinity
+     && same (f32_bytes_to_binary32 [0x00; 0x00; 0x00; 0x80]) (-0.0));
+  check "float_of_int is exact below 2^53"
+    (float_of_int ((1 lsl 53) - 1) = p2 53 -. 1.0
+     && float_of_int (- (1 lsl 53) + 1) = 1.0 -. p2 53
+     && float_of_int 121645100408832000 = 1856156927625.0 *. p2 16);
+
+  Printf.printf "binary64 neighbours and constants\n";
+
+  check "succ of one" (Float.succ 1.0 = 1.0 +. p2 (-52));
+  check "pred of one" (Float.pred 1.0 = 1.0 -. p2 (-53));
+  check "succ of zero is the smallest subnormal" (Float.succ 0.0 = ldexp 1.0 (-1074));
+  check "pred of zero is minus the smallest subnormal"
+    (Float.pred 0.0 = -. ldexp 1.0 (-1074));
+  check "succ across a binade" (Float.succ (2.0 -. p2 (-52)) = 2.0);
+  check "succ of the largest is an infinity" (Float.succ max_float = infinity);
+  check "pred of minus the largest is an infinity"
+    (Float.pred (-. max_float) = neg_infinity);
+  let build m e = ldexp (float_of_int m) e in
+  check "2^52 2^-76 is u" (same (build (1 lsl 52) (-76)) (p2 (-24)));
+  check "2^52 2^-202 is eta" (same (build (1 lsl 52) (-202)) (p2 (-150)));
+  check "the largest mantissa at the largest exponent"
+    (same (build ((1 lsl 53) - 1) 971) max_float);
+  check "the smallest subnormal" (same (build 1 (-1074)) (Int64.float_of_bits 1L));
 
   Printf.printf "extracted operations\n";
 

@@ -18,6 +18,9 @@ Series.v
 Truth.v
 Witness.v
 Bound64.v
+Native.v
+Machine.v
+Decode.v
 Annot.v
 AnnExp.v
 RunErr.v

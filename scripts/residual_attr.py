@@ -6,22 +6,35 @@ unattributed, and it has only two sources: PyTorch evaluates the elementary
 functions with its own implementations rather than the series the development
 composes, and it accumulates its matrix products in a different order.
 
-This separates them on GPT-2. It runs the forward pass three times in numpy
-float32, over the same checkpoint and the same windows:
+This separates them on GPT-2. It runs the forward pass in numpy float32, over
+the same checkpoint and the same windows:
 
   numpy      numpy's own reductions and numpy's own exp and GELU
   numpy+ef   numpy's own reductions, the extracted exp and GELU
-  extracted  the reference dump, which fixes both
+  spec       the development's order: every sum a left fold from zero, every
+             product rounded before it is added, the extracted exp and GELU
+  spec+fma   the same order with each product fused into its sum
+  tree       the rounded products, and the layer-norm and softmax terms,
+             summed as a balanced binary tree
+  extracted  the reference dump
 
-The step from numpy to numpy+ef moves only the elementary functions, and what
-is left of numpy+ef against the reference is reduction order alone. PyTorch is
-reported beside them for scale.
+The step from numpy to numpy+ef moves only the elementary functions. spec
+reproduces the reference bit for bit, so spec+fma measures fused multiply-add
+alone and tree the summation order alone, the two things numpy's BLAS changes
+at once. PyTorch is reported beside them for scale.
 
   python residual_attr.py <weights.safetensors> <windows.txt> <ref dir>
-                          [--torch DIR] [--limit N]
+                          [--torch DIR] [--limit N] [--passes numpy,numpy+ef,...]
+
+The three orders' matrix products run in dots.c, compiled on first use with
+gcc into the system temporary directory.
 """
 import argparse
+import ctypes
 import os
+import shutil
+import subprocess
+import tempfile
 
 import numpy as np
 from safetensors import safe_open
@@ -150,6 +163,103 @@ def forward(W, ids, nh, expf, geluf):
     return (h @ W["wte.weight"].T).astype(f32)
 
 
+# --- the development's order, and two changes to it ---------------------------
+
+_DOTS = None
+
+
+def _dots_lib():
+    global _DOTS
+    if _DOTS is None:
+        src = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dots.c")
+        lib = os.path.join(tempfile.gettempdir(),
+                           "p2w_dots" + (".dll" if os.name == "nt" else ".so"))
+        if not os.path.exists(lib) or os.path.getmtime(lib) < os.path.getmtime(src):
+            subprocess.run(["gcc", "-O2", "-mfma", "-ffp-contract=off", "-fopenmp",
+                            "-shared", "-o", lib, src], check=True)
+        if os.name == "nt":
+            os.add_dll_directory(os.path.dirname(shutil.which("gcc")))
+        _DOTS = ctypes.CDLL(lib)
+        for name in ("dots_seq", "dots_fma", "dots_tree"):
+            getattr(_DOTS, name).argtypes = [ctypes.c_void_p] * 3 + [ctypes.c_int] * 3
+    return _DOTS
+
+
+def tree_sum(x, axis=-1):
+    """Sum along an axis in binary32 as a balanced binary tree."""
+    x = np.moveaxis(x, axis, 0)
+    while x.shape[0] > 1:
+        n = x.shape[0] - x.shape[0] % 2
+        pair = (x[0:n:2] + x[1:n:2]).astype(f32)
+        x = np.concatenate([pair, x[n:]]) if n < x.shape[0] else pair
+    return x[0]
+
+
+def total(x, order):
+    """Sum over the last axis, keeping it: a left fold from zero, or a tree."""
+    if order == "tree":
+        return tree_sum(x)[..., None]
+    acc = np.zeros(x.shape[:-1], dtype=f32)
+    for k in range(x.shape[-1]):
+        acc = (acc + x[..., k]).astype(f32)
+    return acc[..., None]
+
+
+def dots(X, W, order):
+    """Y[i, j] = sum_k X[i, k] W[k, j] in binary32: a left fold from zero of the
+    rounded products (seq), of fused products (fma), or a tree of the rounded
+    products (tree)."""
+    X = np.ascontiguousarray(X, dtype=f32)
+    W = np.ascontiguousarray(W, dtype=f32)
+    T, n = X.shape
+    m = W.shape[1]
+    out = np.empty((T, m), dtype=f32)
+    getattr(_dots_lib(), "dots_" + order)(X.ctypes.data, W.ctypes.data,
+                                           out.ctypes.data, T, n, m)
+    return out
+
+
+def spec_forward(W, WTE_T, ids, nh, order):
+    """The development's GPT-2 forward pass, with its sums in the given order."""
+    d = WTE_T.shape[0]
+    hd = d // nh
+    T = len(ids)
+    eps = np.float32(ONE / np.float32(100000.0))
+    scale = np.float32(ONE / np.sqrt(np.float32(hd)))
+    causal = np.tril(np.ones((T, T), dtype=bool))
+
+    def ln(x, p):
+        n = np.float32(x.shape[-1])
+        mu = (total(x, order) / n).astype(f32)
+        c = (x - mu).astype(f32)
+        var = (total((c * c).astype(f32), order) / n).astype(f32)
+        den = np.sqrt((var + eps).astype(f32)).astype(f32)
+        return ((W[p + ".weight"] * (c / den).astype(f32)).astype(f32)
+                + W[p + ".bias"]).astype(f32)
+
+    def lin(x, p):
+        return (dots(x, W[p + ".weight"], order) + W[p + ".bias"]).astype(f32)
+
+    h = (W["wte.weight"][ids] + W["wpe.weight"][:T]).astype(f32)
+    nl = 1 + max(int(k.split(".")[1]) for k in W if k.startswith("h."))
+    for i in range(nl):
+        p = f"h.{i}."
+        qkv = lin(ln(h, p + "ln_1"), p + "attn.c_attn")
+        out = np.empty((T, d), dtype=f32)
+        for hh in range(nh):
+            sl = slice(hh * hd, (hh + 1) * hd)
+            q, k, v = qkv[:, :d][:, sl], qkv[:, d:2 * d][:, sl], qkv[:, 2 * d:][:, sl]
+            s = (dots(q, np.ascontiguousarray(k.T), order) * scale).astype(f32)
+            m = np.where(causal, s, -np.inf).max(axis=1, keepdims=True).astype(f32)
+            e = np.where(causal, f32_exp((s - m).astype(f32)), f32(0)).astype(f32)
+            w = (e / total(e, order)).astype(f32)
+            out[:, sl] = dots(w, np.ascontiguousarray(v), order)
+        h = (h + lin(out, p + "attn.c_proj")).astype(f32)
+        u = f32_gelu(lin(ln(h, p + "ln_2"), p + "mlp.c_fc"))
+        h = (h + lin(u, p + "mlp.c_proj")).astype(f32)
+    return dots(ln(h, "ln_f"), WTE_T, order)
+
+
 def stats(a, b):
     d = np.abs(a.astype(np.float64) - b.astype(np.float64))
     flips = int((a.argmax(axis=1) != b.argmax(axis=1)).sum())
@@ -164,12 +274,23 @@ def main():
     ap.add_argument("--torch", default=None)
     ap.add_argument("--limit", type=int, default=20)
     ap.add_argument("--heads", type=int, default=12)
+    ap.add_argument("--passes", default="numpy,numpy+ef,spec,spec+fma,tree")
     args = ap.parse_args()
+    passes = args.passes.split(",")
 
     with safe_open(args.weights, framework="np") as f:
         W = {k: f.get_tensor(k).astype(f32) for k in f.keys()}
+    WTE_T = np.ascontiguousarray(W["wte.weight"].T)
     lines = [l.strip() for l in open(args.windows) if l.strip()]
     vocab = W["wte.weight"].shape[0]
+    make = {
+        "numpy": lambda ids: forward(W, ids, args.heads,
+                                     lambda z: np.exp(z.astype(np.float64)).astype(f32), np_gelu),
+        "numpy+ef": lambda ids: forward(W, ids, args.heads, f32_exp, f32_gelu),
+        "spec": lambda ids: spec_forward(W, WTE_T, ids, args.heads, "seq"),
+        "spec+fma": lambda ids: spec_forward(W, WTE_T, ids, args.heads, "fma"),
+        "tree": lambda ids: spec_forward(W, WTE_T, ids, args.heads, "tree"),
+    }
 
     acc = {}
     used = 0
@@ -182,8 +303,7 @@ def main():
         if ref.shape[0] != len(ids):
             continue
         used += 1
-        runs = {"numpy": forward(W, ids, args.heads, lambda z: np.exp(z.astype(np.float64)).astype(f32), np_gelu),
-                "numpy+ef": forward(W, ids, args.heads, f32_exp, f32_gelu)}
+        runs = {name: make[name](ids) for name in passes}
         if args.torch:
             tp = os.path.join(args.torch, f"{w}.f32")
             if os.path.exists(tp):
@@ -196,14 +316,11 @@ def main():
     print(f"{used} windows of {len(lines[0].split(','))} tokens, against the "
           f"extracted reference\n")
     print(f"{'source':10s} {'max abs':>12s} {'mean abs':>12s} {'top-1 differs':>14s}")
-    for name in ("numpy", "numpy+ef", "PyTorch"):
+    for name in passes + ["PyTorch"]:
         if name not in acc:
             continue
         mx, sm, n, fl = acc[name]
         print(f"{name:10s} {mx:12.3e} {sm / n:12.3e} {fl:14d}")
-    if "numpy" in acc and "numpy+ef" in acc:
-        print("\nthe step from numpy to numpy+ef is the elementary functions;\n"
-              "what is left of numpy+ef is reduction order.")
 
 
 if __name__ == "__main__":

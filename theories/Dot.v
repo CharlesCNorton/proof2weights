@@ -10,7 +10,7 @@
     imposes no lower bound on any intermediate, so it holds where a weight or
     an activation is exactly zero: the gated DeltaNet recurrence starts from an
     all-zero state matrix, the depthwise convolution zero-pads its window, and
-    causal masking drives attention weights into the subnormal range. Witnesses
+    an attention score far below its row maximum has a subnormal softmax weight. Witnesses
     at an exact zero close the file, for this bound, for the backward-error
     statement and for the composed one. *)
 

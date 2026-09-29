@@ -380,3 +380,18 @@ come back byte for byte on the same host.
 | PyTorch CPU | 6141 | 17.113819 | 7.88e-05 |
 | llama.cpp CPU | 6141 | 17.114370 | 2.39e-02 |
 | llama.cpp CPU bf16 | 6141 | 17.110629 | 3.82e-01 |
+
+## Fused gated delta rule with TF32 and with IEEE dot products: qwen
+
+60 windows of 64 tokens from the WikiText-2 raw test split, every position compared. The fused rows run the gated delta rule through flash-linear-attention 0.5.2's Triton kernels; TF32 is Triton's default for float32 dot products, and the IEEE row runs agree_torch.py with P2W_IEEE_DOTS=1.
+
+| pair | top-1 agrees | top-10 agrees in order | bit-identical logits | median abs diff | 99.9th pct | max abs diff | mean KL | max KL | largest margin at a top-1 difference |
+|------|--------------|------------------------|----------------------|-----------------|------------|--------------|---------|--------|--------------------------------------|
+| extracted / PyTorch fused TF32 | 3834/3840 | 3630/3840 | 0.00% | 1.5e-03 | 1.8e-02 | 1.14e-01 | 2.9e-06 | 1.9e-04 | 1.61e-03 |
+| extracted / PyTorch fused IEEE | 3840/3840 | 3840/3840 | 1.46% | 4.7e-06 | 3.4e-05 | 1.59e-04 | 3.6e-11 | 6.4e-10 | - |
+
+| source | predicted tokens | perplexity | max per-token NLL difference from extracted |
+|--------|------------------|------------|-----------------------|
+| extracted | 3780 | 58.171639 | - |
+| PyTorch fused TF32 | 3780 | 58.169333 | 5.53e-02 |
+| PyTorch fused IEEE | 3780 | 58.171642 | 5.18e-05 |

@@ -25,10 +25,10 @@
     The consequence is that the native and inductive extractions of
     Phases1_15_complete.v compute the same binary32 value at every operation,
     for every input, so a result measured on the native build is a result of
-    the inductive build. What the native build still trusts is that the host's
-    binary64 arithmetic is IEEE-754 round-to-nearest-even and that
-    [Int32.bits_of_float] rounds to nearest; those two assumptions, and no
-    others, stand between these theorems and the running program. *)
+    the inductive build. What the native build still trusts of these five
+    operations is that the host's binary64 arithmetic is IEEE-754
+    round-to-nearest-even and that [Int32.bits_of_float] rounds to nearest.
+    Native.v treats the build's other directives. *)
 
 From Stdlib Require Import ZArith.
 From Stdlib Require Import Reals.

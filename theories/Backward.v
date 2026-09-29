@@ -6,9 +6,9 @@
     [f32_dot_regular], whose [relz] clauses require every product and every
     partial sum to be zero or at least [2^-126] in magnitude, so that rounding
     is relative there. That hypothesis is false where the networks actually
-    compute: a masked attention score is [exp] of a saturated argument and is
-    subnormal, and the products a dot product then accumulates are subnormal
-    too.
+    compute: the [exp] of an attention score more than 87.4 below its row
+    maximum is subnormal, and so are the products the attention's weighted sum
+    of values then accumulates.
 
     This file drops it. The mixed rounding model of Float_error.v,
     [f32_round z = z (1 + d) + e] with [|d| <= u], [|e| <= eta] and [d e = 0],
