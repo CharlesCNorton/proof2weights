@@ -1,28 +1,19 @@
-(* qwen_talk_native.ml - run Qwen3.5 through the verified extracted IEEE-754
-   operators (native build), with greedy generation.
+(* qwen_talk_native.ml - Qwen3.5 through the extracted decode step (native
+   build), with greedy generation and a persistent serve mode.
 
-   Qwen3.5 alternates three gated-DeltaNet layers with one gated full-attention
-   layer. Both mixers are composed here from the verified primitives: the
-   DeltaNet path uses f32_conv_step, f32_l2norm, f32_delta_decay and
-   f32_delta_step, and the attention path uses f32_partial_rope,
-   f32_rmsnorm_zc, f32_softmax and f32_gate_sigmoid. Every float value is
-   produced by a verified operator; only byte addressing and the structural
-   composition are native.
+   f32_load_qwen reads the checkpoint into the weight record, and qwen_step
+   emits the logits of one position per token. Its state holds a key/value cache
+   per head of each gated attention layer, and the convolution window and a
+   recurrent state per head of each DeltaNet layer. qwen_decode_correct says
+   that running it over a sequence gives the rows f32_qwen_logits_of computes
+   for the whole sequence. Generation feeds each argmax back through the same
+   step. What remains native is reading the file, answering the byte fetch the
+   loader reads it through, and choosing the next token.
 
-   Generation carries three caches: the keys and values of the full-attention
-   layers, the recurrent state matrix of each DeltaNet head, and the trailing
-   convolution window. A decode step therefore costs one token of arithmetic
-   rather than a re-run of the prefix.
-
-   The stack is walked layer by layer, so each layer's weights are decoded once
-   per call and dropped, and memory stays well below the size of the model. The
-   embedding is never held: rows are decoded on demand for the lookup and
-   streamed for the logit projection.
-
-   In serve mode the weights stay on disk and the process answers queries from
+   In serve mode the weights stay resident and the process answers queries from
    stdin (one per line: "<comma ids> <max_new>"), streaming "TOK <id>" per token
    and "END <comma gen ids>" per query, after announcing the checksum of the
-   weight file. Each query starts from an empty cache.
+   weight file. Each query starts from the initial state.
 
    usage:
      qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck <tok,...>
@@ -34,7 +25,9 @@
      qwen_talk_native <path> d nl nh nkv hd rd ff vocab lnh lhd ck dump <windows> <outdir> <first> <last>
        -> for each line index in [first, last) of the windows file, writes
           <outdir>/<index>.f32: the logits of every position, as little-endian
-          binary32 bit patterns, positions in order *)
+          binary32 bit patterns, positions in order; the windows are shared
+          among P2W_DOMAINS domains (default one), which read the one weight
+          record, and a window whose file exists is skipped *)
 
 open Qwen_native
 
@@ -47,19 +40,7 @@ let u64_le b off =
   let r = ref 0 in
   for i = 7 downto 0 do r := (!r * 256) + Char.code (Bytes.get b (off + i)) done; !r
 
-let dec1 b o =
-  f32_bytes_to_binary32
-    [ Char.code (Bytes.get b o); Char.code (Bytes.get b (o + 1));
-      Char.code (Bytes.get b (o + 2)); Char.code (Bytes.get b (o + 3)) ]
-
-let dec_vec b start count = List.init count (fun i -> dec1 b (start + 4 * i))
-let dec_mat b start rows cols = List.init rows (fun r -> dec_vec b (start + 4 * r * cols) cols)
-
 let coqstr s = List.init (String.length s) (fun i -> s.[i])
-let rec ftake n l = if n <= 0 then [] else match l with [] -> [] | x :: r -> x :: ftake (n - 1) r
-let rec fdrop n l = if n <= 0 then l else match l with [] -> [] | _ :: r -> fdrop (n - 1) r
-let slice off len row = ftake len (fdrop off row)
-let last_n n l = let k = List.length l in if k <= n then l else fdrop (k - n) l
 
 let write_f32 oc (x : float) =
   let bits = Int32.bits_of_float x in
@@ -73,6 +54,33 @@ let read_lines path =
     | l -> go (if String.trim l = "" then acc else String.trim l :: acc)
     | exception End_of_file -> close_in ic; List.rev acc in
   go []
+
+let argmax row =
+  let a = Array.of_list row in
+  let bi = ref 0 in
+  for j = 1 to Array.length a - 1 do if a.(j) > a.(!bi) then bi := j done; !bi
+
+let dump_windows rows windows outdir first last =
+  (try Unix.mkdir outdir 0o755 with _ -> ());
+  let last = min last (Array.length windows) in
+  let nd = try max 1 (int_of_string (Sys.getenv "P2W_DOMAINS")) with _ -> 1 in
+  let work k =
+    let w = ref (first + k) in
+    while !w < last do
+      let fin = Printf.sprintf "%s/%d.f32" outdir !w in
+      if not (Sys.file_exists fin) then begin
+        let toks = List.map int_of_string (String.split_on_char ',' windows.(!w)) in
+        let oc = open_out_bin (fin ^ ".tmp") in
+        List.iter (List.iter (write_f32 oc)) (rows toks);
+        close_out oc;
+        Sys.rename (fin ^ ".tmp") fin;
+        Printf.eprintf "window %d done\n%!" !w
+      end;
+      w := !w + nd
+    done in
+  let ds = List.init (nd - 1) (fun k -> Domain.spawn (fun () -> work (k + 1))) in
+  work 0;
+  List.iter Domain.join ds
 
 let () =
   let path  = Sys.argv.(1) in
@@ -90,8 +98,6 @@ let () =
   let toks_arg = Sys.argv.(13) in
   let serve = (toks_arg = "serve") in
   let dump = (toks_arg = "dump") in
-  let prompt =
-    if serve || dump then [] else List.map int_of_string (String.split_on_char ',' toks_arg) in
   let max_new =
     if serve || dump then 0
     else (if Array.length Sys.argv > 14 then int_of_string Sys.argv.(14) else 0) in
@@ -100,15 +106,7 @@ let () =
     else if dump then -1
     else (if Array.length Sys.argv > 15 then int_of_string Sys.argv.(15) else -1) in
 
-  let group = nh / nkv in
-  let kvd = nkv * hd in
-  let ldim = lnh * lhd in                      (* 2048: q, k and v each  *)
-  let qkvd = 3 * ldim in                       (* 6144 conv channels     *)
-  let zerov n = List.init n (fun _ -> f32_zero) in
-
   let b = read_file path in
-  (* A checksum over the whole weight file, printed so a client knows which
-     weights answered. *)
   let cksum =
     let r = ref 0 and n = Bytes.length b in
     for i = 0 to n - 1 do r := (!r * 31 + Char.code (Bytes.get b i)) mod 4294967296 done;
@@ -117,184 +115,35 @@ let () =
   let hlen = u64_le b 0 in
   let base = 8 + hlen in
   let header = coqstr (Bytes.sub_string b 8 hlen) in
-  let off name =
-    match json_tensor_offsets header (coqstr name) with
-    | s :: _ :: _ -> base + s
-    | _ -> failwith ("offsets not found for " ^ name) in
-
-  (* rms_norm_eps = 1e-6, and the DeltaNet kernel normalises with the same. *)
+  let rdb o = Char.code (Bytes.get b (base + o)) in
   let eps = f32_div f32_one (f32_of_Z 1000000) in
-  let embed_s = off "embed_tokens.weight" in
-  let emb_row t = dec_vec b (embed_s + 4 * t * d) d in
-  let invf = dec_vec b (off "rope.inv_freq") (rd / 2) in
+  Printf.eprintf "decoding weights...\n%!";
+  let model = f32_load_qwen header rdb d nl nh nkv hd rd ff vocab lnh lhd ck in
+  Printf.eprintf "weights ready.\n%!";
+  let step = qwen_step nh nkv hd rd lnh lhd ck eps model in
+  let init = qwen_init nh nkv hd rd lnh lhd ck eps model in
 
-  (* cos/sin over the rotated prefix, in the half-split convention: entry i and
-     entry i + rd/2 share an angle. The inverse frequencies come from the
-     checkpoint, so the runner never raises theta to a fractional power. *)
-  let rope_cs pos =
-    let pf = f32_of_Z pos in
-    let ang = List.map (fun fj -> f32_mult pf fj) invf in
-    let cosv = List.map f32_cos ang and sinv = List.map f32_sin ang in
-    (cosv @ cosv, sinv @ sinv) in
-
-  let layer_is_full i = (i mod 4) = 3 in
-  let lname i s = Printf.sprintf "layers.%d.%s" i s in
-
-  (* Caches. Attention keeps keys and values per kv head; DeltaNet keeps the
-     per-head recurrent state and the trailing convolution window. *)
-  let kc = Array.make_matrix nl nkv [] in
-  let vc = Array.make_matrix nl nkv [] in
-  let dstate = Array.init nl (fun _ -> Array.make lnh []) in
-  let dconv = Array.make nl [] in
-  (* Every query starts from an empty cache and a zero recurrent state. *)
-  let reset_caches () =
-    for i = 0 to nl - 1 do
-      for c = 0 to nkv - 1 do kc.(i).(c) <- []; vc.(i).(c) <- [] done;
-      dstate.(i) <- Array.init lnh (fun _ -> f32_delta_state0 lhd lhd);
-      dconv.(i) <- []
-    done in
-  reset_caches ();
-
-  (* Run a batch of (position, token) through the whole stack, layer by layer,
-     advancing every cache. Returns the final normalised hidden state of each
-     input position. A prefill passes the whole prompt; a decode step passes a
-     single token. *)
-  let run batch =
-    let hs = ref (List.map (fun (_, t) -> emb_row t) batch) in
-    let poss = List.map fst batch in
-    for i = 0 to nl - 1 do
-      let ln1 = dec_vec b (off (lname i "input_layernorm.weight")) d in
-      let hn = List.map (fun row -> f32_rmsnorm_zc ln1 eps row) !hs in
-      let mixed =
-        if layer_is_full i then begin
-          let qw  = dec_mat b (off (lname i "self_attn.q_proj.weight")) (nh * hd * 2) d in
-          let kw  = dec_mat b (off (lname i "self_attn.k_proj.weight")) kvd d in
-          let vw  = dec_mat b (off (lname i "self_attn.v_proj.weight")) kvd d in
-          let ow  = dec_mat b (off (lname i "self_attn.o_proj.weight")) d (nh * hd) in
-          let qnw = dec_vec b (off (lname i "self_attn.q_norm.weight")) hd in
-          let knw = dec_vec b (off (lname i "self_attn.k_norm.weight")) hd in
-          List.map2 (fun pos h ->
-            let qg = f32_mat_vec_mul qw h in
-            let kraw = f32_mat_vec_mul kw h in
-            let vraw = f32_mat_vec_mul vw h in
-            let (cosv, sinv) = rope_cs pos in
-            for c = 0 to nkv - 1 do
-              let knew = f32_partial_rope rd cosv sinv
-                           (f32_rmsnorm_zc knw eps (slice (c * hd) hd kraw)) in
-              kc.(i).(c) <- kc.(i).(c) @ [knew];
-              vc.(i).(c) <- vc.(i).(c) @ [slice (c * hd) hd vraw]
-            done;
-            let gate = List.concat
-              (List.init nh (fun hh -> slice (hh * hd * 2 + hd) hd qg)) in
-            let heads = List.init nh (fun hh ->
-              let q = f32_partial_rope rd cosv sinv
-                        (f32_rmsnorm_zc qnw eps (slice (hh * hd * 2) hd qg)) in
-              f32_attend q kc.(i).(hh / group) vc.(i).(hh / group) hd) in
-            f32_mat_vec_mul ow (f32_gate_sigmoid gate (List.concat heads)))
-            poss hn
-        end else begin
-          let wqkv = dec_mat b (off (lname i "linear_attn.in_proj_qkv.weight")) qkvd d in
-          let wz   = dec_mat b (off (lname i "linear_attn.in_proj_z.weight")) ldim d in
-          let wa   = dec_mat b (off (lname i "linear_attn.in_proj_a.weight")) lnh d in
-          let wb   = dec_mat b (off (lname i "linear_attn.in_proj_b.weight")) lnh d in
-          let cw   = dec_mat b (off (lname i "linear_attn.conv1d.weight")) qkvd ck in
-          let alog = dec_vec b (off (lname i "linear_attn.A_log")) lnh in
-          let dtb  = dec_vec b (off (lname i "linear_attn.dt_bias")) lnh in
-          let nw   = dec_vec b (off (lname i "linear_attn.norm.weight")) lhd in
-          let dow  = dec_mat b (off (lname i "linear_attn.out_proj.weight")) d ldim in
-          List.map (fun h ->
-            let qkv = f32_mat_vec_mul wqkv h in
-            let hist = dconv.(i) @ [qkv] in
-            let k = List.length hist in
-            let win = if k >= ck then last_n ck hist
-                      else List.init (ck - k) (fun _ -> zerov qkvd) @ hist in
-            dconv.(i) <- last_n (ck - 1) hist;
-            let c = f32_conv_step cw [] win in
-            let z  = f32_mat_vec_mul wz h in
-            let av = f32_mat_vec_mul wa h in
-            let bv = f32_mat_vec_mul wb h in
-            let outs = List.init lnh (fun hh ->
-              let q = f32_delta_prep_q eps lhd (slice (hh * lhd) lhd c) in
-              let kk = f32_l2norm eps (slice (ldim + hh * lhd) lhd c) in
-              let v = slice (2 * ldim + hh * lhd) lhd c in
-              let beta = f32_sigmoid (List.nth bv hh) in
-              let g = f32_delta_decay (List.nth alog hh) (List.nth dtb hh)
-                        (List.nth av hh) in
-              let (st', o) = f32_delta_step beta g q kk v dstate.(i).(hh) in
-              dstate.(i).(hh) <- st';
-              f32_rmsnorm_gated nw eps (slice (hh * lhd) lhd z) o) in
-            f32_mat_vec_mul dow (List.concat outs)) hn
-        end in
-      let hidden2 = List.map2 f32_vec_add !hs mixed in
-      let ln2 = dec_vec b (off (lname i "post_attention_layernorm.weight")) d in
-      let gw = dec_mat b (off (lname i "mlp.gate_proj.weight")) ff d in
-      let uw = dec_mat b (off (lname i "mlp.up_proj.weight")) ff d in
-      let dw = dec_mat b (off (lname i "mlp.down_proj.weight")) d ff in
-      let h2 = List.map (fun row -> f32_rmsnorm_zc ln2 eps row) hidden2 in
-      hs := List.map2 f32_vec_add hidden2
-              (List.map (fun row -> f32_swiglu gw uw dw row) h2);
-      Printf.eprintf "  layer %d/%d (%s)\n%!" (i + 1) nl
-        (if layer_is_full i then "attn" else "delta")
-    done;
-    let normw = dec_vec b (off "norm.weight") d in
-    List.map (fun row -> f32_rmsnorm_zc normw eps row) !hs in
-
-  let logits_of v = Array.init vocab (fun j -> f32_dot v (emb_row j)) in
-  let argmax a =
-    let bi = ref 0 in
-    for j = 1 to Array.length a - 1 do if a.(j) > a.(!bi) then bi := j done; !bi in
-  let rec last = function [] -> failwith "empty" | [x] -> x | _ :: r -> last r in
-
-  (* One query against a fresh cache. Returns (first-position logits, generated
-     ids); streams "TOK <id>" per token when asked. *)
-  let run_query toks mx stream =
-    reset_caches ();
-    Printf.eprintf "prefill over %d tokens...\n%!" (List.length toks);
-    let finals = run (List.mapi (fun p t -> (p, t)) toks) in
-    Printf.eprintf "projecting %d logits...\n%!" vocab;
-    let logits0 = logits_of (last finals) in
-    let gen = ref [] in
-    if mx > 0 then begin
-      let cur = ref (argmax logits0) in
-      let pos = ref (List.length toks) in
-      (try
-        for n = 1 to mx do
-          if !cur = eos then raise Exit;
-          gen := !cur :: !gen;
-          if stream then Printf.printf "TOK %d\n%!" !cur
-          else Printf.printf "%d\n%!" !cur;
-          if n < mx then begin
-            Printf.eprintf "decode %d/%d\n%!" n mx;
-            let f = run [(!pos, !cur)] in
-            incr pos;
-            cur := argmax (logits_of (last f))
-          end
-        done
-      with Exit -> ())
-    end;
-    (logits0, List.rev !gen) in
+  (* Greedy continuation of a prompt: the prompt is read one token at a time,
+     then each argmax is fed back, as run reads a sequence. *)
+  let generate toks mx stream =
+    let rec feed s last = function
+      | [] -> (s, last)
+      | t :: rest -> let (s', row) = step s t in feed s' row rest in
+    let (s, last) = feed init [] toks in
+    let rec go s row n acc =
+      let cur = argmax row in
+      if n = 0 || cur = eos then List.rev acc
+      else begin
+        if stream then Printf.printf "TOK %d\n%!" cur else Printf.printf "%d\n%!" cur;
+        if n = 1 then List.rev (cur :: acc)
+        else let (s', row') = step s cur in go s' row' (n - 1) (cur :: acc)
+      end in
+    go s last mx [] in
 
   if dump then begin
     let windows = Array.of_list (read_lines Sys.argv.(14)) in
-    let outdir = Sys.argv.(15) in
-    let first = int_of_string Sys.argv.(16) and stop = int_of_string Sys.argv.(17) in
-    for w = first to min stop (Array.length windows) - 1 do
-      let toks = List.map int_of_string (String.split_on_char ',' windows.(w)) in
-      reset_caches ();
-      let finals = Array.of_list (run (List.mapi (fun p t -> (p, t)) toks)) in
-      (* Each embedding row is decoded once and projected onto every position. *)
-      let logits = Array.map (fun _ -> Array.make vocab 0.0) finals in
-      for j = 0 to vocab - 1 do
-        let e = emb_row j in
-        Array.iteri (fun p v -> logits.(p).(j) <- f32_dot v e) finals
-      done;
-      let tmp = Printf.sprintf "%s/%d.f32.tmp" outdir w in
-      let oc = open_out_bin tmp in
-      Array.iter (Array.iter (write_f32 oc)) logits;
-      close_out oc;
-      Sys.rename tmp (Printf.sprintf "%s/%d.f32" outdir w);
-      Printf.eprintf "window %d done\n%!" w
-    done
+    dump_windows (run step init) windows Sys.argv.(15)
+      (int_of_string Sys.argv.(16)) (int_of_string Sys.argv.(17))
   end
   else if serve then begin
     Printf.printf "CKSUM %d\nREADY\n%!" cksum;
@@ -305,20 +154,24 @@ let () =
           match String.split_on_char ' ' line with
           | ids_csv :: mn :: _ ->
               let qtoks = List.map int_of_string (String.split_on_char ',' ids_csv) in
-              let (_, g) = run_query qtoks (int_of_string mn) true in
+              let g = generate qtoks (int_of_string mn) true in
               Printf.printf "END %s\n%!" (String.concat "," (List.map string_of_int g))
           | _ -> Printf.printf "END \n%!"
         end
       done
     with End_of_file -> ())
   end
-  else if max_new > 0 then ignore (run_query prompt max_new false)
   else begin
-    let (logits0, _) = run_query prompt 0 false in
-    let idx = Array.init vocab (fun i -> i) in
-    Array.sort (fun i j -> compare logits0.(j) logits0.(i)) idx;
-    Printf.printf "top-10 next-token logits:\n";
-    for r = 0 to 9 do
-      let i = idx.(r) in Printf.printf "  %7d  %.9g\n" i logits0.(i)
-    done
+    let prompt = List.map int_of_string (String.split_on_char ',' toks_arg) in
+    if max_new > 0 then ignore (generate prompt max_new false)
+    else begin
+      let rows = run step init prompt in
+      let a = Array.of_list (List.nth rows (List.length rows - 1)) in
+      let idx = Array.init (Array.length a) (fun i -> i) in
+      Array.sort (fun i j -> compare a.(j) a.(i)) idx;
+      Printf.printf "top-10 next-token logits:\n";
+      for r = 0 to 9 do
+        let i = idx.(r) in Printf.printf "  %7d  %.9g\n" i a.(i)
+      done
+    end
   end

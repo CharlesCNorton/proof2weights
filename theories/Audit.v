@@ -255,6 +255,7 @@ Print Assumptions qwen_decode_step.
 Print Assumptions run_realized.
 Print Assumptions gpt2_decode_correct.
 Print Assumptions llama_decode_correct.
+Print Assumptions qwen_decode_correct.
 
 (** * The transposed decode the checkpoint runners perform *)
 

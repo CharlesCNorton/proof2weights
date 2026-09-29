@@ -689,3 +689,350 @@ Proof.
       rewrite <- (map_mapi (fun x => f32_slice (Nat.div hh (Nat.div nh nkv) * hd) hd (snd x))).
       rewrite !map_map. reflexivity.
 Qed.
+
+(** ** The gated DeltaNet layer
+
+    The fused query/key/value stream passes through the convolution, whose
+    state is the window of the last [ck - 1] rows; the gate and the two
+    per-head rates pass beside it. Each head then carries its own recurrent
+    state and normalizes its read-out against its slice of the gate. *)
+
+Lemma map_zipw_pair_l : forall {B C D : Type} (g : B * C -> D) (f : B -> D) ys zs,
+  List.length ys = List.length zs -> (forall y z, g (y, z) = f y) ->
+  List.map g (zipw pair ys zs) = List.map f ys.
+Proof.
+  intros B C D g f ys. unfold zipw. induction ys as [|y ys IH]; intros zs H E;
+    destruct zs as [|z zs]; cbn in H; try discriminate; [reflexivity|].
+  cbn. rewrite E. f_equal. apply IH; [lia | exact E].
+Qed.
+
+Lemma map_zipw_pair_r : forall {B C D : Type} (g : B * C -> D) (f : C -> D) ys zs,
+  List.length ys = List.length zs -> (forall y z, g (y, z) = f z) ->
+  List.map g (zipw pair ys zs) = List.map f zs.
+Proof.
+  intros B C D g f ys. unfold zipw. induction ys as [|y ys IH]; intros zs H E;
+    destruct zs as [|z zs]; cbn in H; try discriminate; [reflexivity|].
+  cbn. rewrite E. f_equal. apply IH; [lia | exact E].
+Qed.
+
+Definition qd_zab (w : qwen_delta_weights) (h : list binary32)
+    : list binary32 * list binary32 * list binary32 :=
+  (f32_mat_vec_mul (qd_in_z w) h, f32_mat_vec_mul (qd_in_a w) h,
+   f32_mat_vec_mul (qd_in_b w) h).
+
+Definition qd_conv_step (lnh lhd ck : nat) (w : qwen_delta_weights) :=
+  comp_step (map_step (fun h => f32_mat_vec_mul (qd_in_qkv w) h))
+            (conv_state_step (3 * (lnh * lhd)) ck (qd_conv_w w) []).
+
+Definition qd_C (lnh lhd ck : nat) (w : qwen_delta_weights) (hn : list (list binary32))
+    : list (list binary32) :=
+  f32_causal_conv1d (3 * (lnh * lhd)) ck (qd_conv_w w) []
+    (List.map (fun h => f32_mat_vec_mul (qd_in_qkv w) h) hn).
+
+(** What a head reads at a position: the convolved stream, then the gate and
+    the two rates. *)
+Definition qd_row : Type :=
+  (list binary32 * (list binary32 * list binary32 * list binary32))%type.
+
+Definition qd_z (x : qd_row) : list binary32 := fst (fst (snd x)).
+Definition qd_beta (hh : nat) (x : qd_row) : binary32 :=
+  f32_sigmoid (List.nth hh (snd (snd x)) f32_zero).
+Definition qd_gamma (w : qwen_delta_weights) (hh : nat) (x : qd_row) : binary32 :=
+  f32_delta_decay (List.nth hh (qd_a_log w) f32_zero) (List.nth hh (qd_dt_bias w) f32_zero)
+                  (List.nth hh (snd (fst (snd x))) f32_zero).
+Definition qd_q (eps : binary32) (lhd hh : nat) (x : qd_row) : list binary32 :=
+  f32_delta_prep_q eps lhd (f32_slice (hh * lhd) lhd (fst x)).
+Definition qd_k (eps : binary32) (ldim lhd hh : nat) (x : qd_row) : list binary32 :=
+  f32_l2norm eps (f32_slice (ldim + hh * lhd) lhd (fst x)).
+Definition qd_v (ldim lhd hh : nat) (x : qd_row) : list binary32 :=
+  f32_slice (2 * ldim + hh * lhd) lhd (fst x).
+Definition qd_gnorm (eps : binary32) (lhd : nat) (nw : list binary32) (hh : nat)
+    (zr o : list binary32) : list binary32 :=
+  f32_rmsnorm_gated nw eps (f32_slice (hh * lhd) lhd zr) o.
+
+Definition qd_head_step (lnh lhd : nat) (eps : binary32) (w : qwen_delta_weights) (hh : nat) :=
+  zip_step (map_step qd_z)
+    (delta_state_step (qd_beta hh) (qd_gamma w hh) (qd_q eps lhd hh)
+                      (qd_k eps (lnh * lhd) lhd hh) (qd_v (lnh * lhd) lhd hh))
+    (qd_gnorm eps lhd (qd_norm_w w) hh).
+
+Definition qd_head_init (lhd : nat) : unit * list (list binary32) :=
+  (tt, f32_delta_state0 lhd lhd).
+
+Definition qd_head_f (lnh lhd : nat) (eps : binary32) (w : qwen_delta_weights) (hh : nat)
+    (xs : list qd_row) : list (list binary32) :=
+  zipw (qd_gnorm eps lhd (qd_norm_w w) hh) (List.map qd_z xs)
+    (f32_delta_scan (List.map (qd_beta hh) xs) (List.map (qd_gamma w hh) xs)
+       (List.map (qd_q eps lhd hh) xs) (List.map (qd_k eps (lnh * lhd) lhd hh) xs)
+       (List.map (qd_v (lnh * lhd) lhd hh) xs) (f32_delta_state0 lhd lhd)).
+
+Definition qd_heads_f (lnh lhd : nat) (eps : binary32) (w : qwen_delta_weights)
+    (xs : list qd_row) : list (list binary32) :=
+  f32_concat_heads (List.map (fun hh => qd_head_f lnh lhd eps w hh xs) (List.seq 0 lnh)).
+
+Definition qd_mix_step (lnh lhd ck : nat) (eps : binary32) (w : qwen_delta_weights) :=
+  comp_step (zip_step (qd_conv_step lnh lhd ck w) (map_step (qd_zab w)) pair)
+    (comp_step (heads_step lnh (fun _ => qd_head_init lhd) (qd_head_step lnh lhd eps w))
+               (map_step (fun r => f32_mat_vec_mul (qd_out w) r))).
+
+Definition qd_mix_init (lnh lhd : nat) :=
+  (((tt, @nil (list binary32)), tt),
+   (List.map (fun _ : nat => qd_head_init lhd) (List.seq 0 lnh), tt)).
+
+Definition qd_mix_f (lnh lhd ck : nat) (eps : binary32) (w : qwen_delta_weights)
+    (hn : list (list binary32)) : list (list binary32) :=
+  List.map (fun r => f32_mat_vec_mul (qd_out w) r)
+    (qd_heads_f lnh lhd eps w (zipw pair (qd_C lnh lhd ck w hn) (List.map (qd_zab w) hn))).
+
+Lemma realized_qd_conv : forall lnh lhd ck w, (0 < ck)%nat ->
+  realized (tt, @nil (list binary32)) (qd_conv_step lnh lhd ck w) (qd_C lnh lhd ck w).
+Proof.
+  intros lnh lhd ck w Hk. unfold qd_conv_step, qd_C.
+  apply (realized_comp tt (map_step (fun h => f32_mat_vec_mul (qd_in_qkv w) h))
+           (List.map (fun h => f32_mat_vec_mul (qd_in_qkv w) h)) []
+           (conv_state_step (3 * (lnh * lhd)) ck (qd_conv_w w) [])
+           (f32_causal_conv1d (3 * (lnh * lhd)) ck (qd_conv_w w) []));
+    [apply realized_map_step | apply realized_conv; exact Hk].
+Qed.
+
+Lemma realized_qd_head : forall lnh lhd eps w hh,
+  realized (qd_head_init lhd) (qd_head_step lnh lhd eps w hh) (qd_head_f lnh lhd eps w hh).
+Proof.
+  intros lnh lhd eps w hh. unfold qd_head_init, qd_head_step, qd_head_f.
+  apply (realized_zip tt (map_step qd_z) (List.map qd_z) (f32_delta_state0 lhd lhd) _ _
+           (qd_gnorm eps lhd (qd_norm_w w) hh));
+    [apply realized_map_step | apply realized_delta].
+Qed.
+
+Lemma realized_qd_mix_f : forall lnh lhd ck eps w, (0 < lnh)%nat -> (0 < ck)%nat ->
+  realized (qd_mix_init lnh lhd) (qd_mix_step lnh lhd ck eps w) (qd_mix_f lnh lhd ck eps w).
+Proof.
+  intros lnh lhd ck eps w Hn Hk.
+  pose (OUT := fun r => f32_mat_vec_mul (qd_out w) r).
+  pose (XS := fun hn => zipw pair (qd_C lnh lhd ck w hn) (List.map (qd_zab w) hn)).
+  assert (R : realized (qd_mix_init lnh lhd) (qd_mix_step lnh lhd ck eps w)
+                (fun hn => (fun xs => List.map OUT (qd_heads_f lnh lhd eps w xs)) (XS hn))).
+  { unfold qd_mix_init, qd_mix_step.
+    apply (realized_comp ((tt, @nil (list binary32)), tt)
+             (zip_step (qd_conv_step lnh lhd ck w) (map_step (qd_zab w)) pair) XS _ _
+             (fun xs => List.map OUT (qd_heads_f lnh lhd eps w xs))).
+    - apply (realized_zip (tt, @nil (list binary32)) (qd_conv_step lnh lhd ck w)
+               (qd_C lnh lhd ck w) tt (map_step (qd_zab w)) (List.map (qd_zab w)) pair).
+      + apply realized_qd_conv. exact Hk.
+      + apply realized_map_step.
+    - apply (realized_comp _ _ (qd_heads_f lnh lhd eps w) tt (map_step OUT) (List.map OUT));
+        [|apply realized_map_step].
+      unfold qd_heads_f.
+      apply realized_heads; [exact Hn|]. intros hh _. apply realized_qd_head. }
+  eapply realized_ext; [|exact R]. reflexivity.
+Qed.
+
+Lemma qd_head_eq : forall lnh lhd ck eps w hn hh,
+  qd_head_f lnh lhd eps w hh (zipw pair (qd_C lnh lhd ck w hn) (List.map (qd_zab w) hn))
+  = f32_qwen_delta_head_out (lnh * lhd) lhd eps (qd_norm_w w) (qd_a_log w) (qd_dt_bias w) hh
+      (qd_C lnh lhd ck w hn) (List.map (fun h => f32_mat_vec_mul (qd_in_a w) h) hn)
+      (List.map (fun h => f32_mat_vec_mul (qd_in_b w) h) hn)
+      (List.map (fun h => f32_mat_vec_mul (qd_in_z w) h) hn).
+Proof.
+  intros lnh lhd ck eps w hn hh.
+  assert (L : List.length (qd_C lnh lhd ck w hn) = List.length (List.map (qd_zab w) hn))
+    by (unfold qd_C; rewrite f32_causal_conv1d_length, !length_map; reflexivity).
+  unfold qd_head_f, f32_qwen_delta_head_out, f32_qwen_delta_head. cbv zeta.
+  rewrite map_pair_zipw_gen.
+  rewrite (map_zipw_pair_r qd_z (fun t => fst (fst t)))
+    by (first [exact L | intros; reflexivity]).
+  rewrite (map_zipw_pair_r (qd_beta hh) (fun t => f32_sigmoid (List.nth hh (snd t) f32_zero)))
+    by (first [exact L | intros; reflexivity]).
+  rewrite (map_zipw_pair_r (qd_gamma w hh)
+             (fun t => f32_delta_decay (List.nth hh (qd_a_log w) f32_zero)
+                         (List.nth hh (qd_dt_bias w) f32_zero)
+                         (List.nth hh (snd (fst t)) f32_zero)))
+    by (first [exact L | intros; reflexivity]).
+  rewrite (map_zipw_pair_l (qd_q eps lhd hh)
+             (fun c => f32_delta_prep_q eps lhd (f32_slice (hh * lhd) lhd c)))
+    by (first [exact L | intros; reflexivity]).
+  rewrite (map_zipw_pair_l (qd_k eps (lnh * lhd) lhd hh)
+             (fun c => f32_l2norm eps (f32_slice (lnh * lhd + hh * lhd) lhd c)))
+    by (first [exact L | intros; reflexivity]).
+  rewrite (map_zipw_pair_l (qd_v (lnh * lhd) lhd hh)
+             (fun c => f32_slice (2 * (lnh * lhd) + hh * lhd) lhd c))
+    by (first [exact L | intros; reflexivity]).
+  rewrite !map_map. reflexivity.
+Qed.
+
+Lemma qd_mix_eq : forall lnh lhd ck eps w hn, (0 < lnh)%nat ->
+  f32_qwen_delta_mix lnh lhd ck eps w hn = qd_mix_f lnh lhd ck eps w hn.
+Proof.
+  intros lnh lhd ck eps w hn Hn.
+  unfold qd_mix_f, qd_heads_f.
+  set (XS := zipw pair (qd_C lnh lhd ck w hn) (List.map (qd_zab w) hn)).
+  assert (LX : List.length XS = List.length hn).
+  { unfold XS. rewrite zipw_length. unfold qd_C.
+    rewrite f32_causal_conv1d_length, !length_map. apply Nat.min_id. }
+  assert (LH : forall hh, List.length (qd_head_f lnh lhd eps w hh XS) = List.length hn).
+  { intros hh. rewrite (realized_length _ _ _ (realized_qd_head lnh lhd eps w hh) XS).
+    exact LX. }
+  rewrite (concat_heads_seq lnh (fun hh => qd_head_f lnh lhd eps w hh XS) Hn).
+  cbv beta. rewrite LH, map_map.
+  unfold f32_qwen_delta_mix. cbv zeta.
+  apply map_ext. intros t. f_equal. f_equal.
+  rewrite map_map. apply map_ext. intros hh. f_equal.
+  unfold XS. rewrite qd_head_eq. reflexivity.
+Qed.
+
+Lemma realized_qd_mix : forall lnh lhd ck eps w, (0 < lnh)%nat -> (0 < ck)%nat ->
+  realized (qd_mix_init lnh lhd) (qd_mix_step lnh lhd ck eps w)
+           (f32_qwen_delta_mix lnh lhd ck eps w).
+Proof.
+  intros lnh lhd ck eps w Hn Hk.
+  apply (realized_ext _ _ (qd_mix_f lnh lhd ck eps w)).
+  - intros hn. symmetry. apply qd_mix_eq. exact Hn.
+  - apply realized_qd_mix_f; assumption.
+Qed.
+
+(** ** The layers of both kinds, and the model *)
+
+Definition qa_mix_state : Type := (unit * (unit * list attn_state))%type.
+Definition qd_mix_state : Type :=
+  (((unit * list (list binary32)) * unit) * (list (unit * list (list binary32)) * unit))%type.
+Definition qw_wrap_state (M : Type) : Type := ((unit * (unit * M)) * (unit * unit))%type.
+Definition qn_state : Type := (qw_wrap_state qa_mix_state + qw_wrap_state qd_mix_state)%type.
+
+Definition qn_layer (nh nkv hd rd lnh lhd ck : nat) (eps : binary32) (invf : list binary32)
+    (L : qwen_layer_weights)
+    : qn_state * (qn_state -> list binary32 -> qn_state * list binary32) :=
+  match L with
+  | QAttn ln1 ln2 mlp aw =>
+      (inl (qw_wrap_init (qa_mix_init nh)),
+       lift_l (qw_wrap_step eps ln1 ln2 mlp (qa_mix_step nh nkv hd rd eps aw invf)))
+  | QDelta ln1 ln2 mlp dw =>
+      (inr (qw_wrap_init (qd_mix_init lnh lhd)),
+       lift_r (qw_wrap_step eps ln1 ln2 mlp (qd_mix_step lnh lhd ck eps dw)))
+  end.
+
+(** A layer with its rotation given by the formula. *)
+Definition qn_layer_f (nh nkv hd rd lnh lhd ck : nat) (eps : binary32) (invf : list binary32)
+    (L : qwen_layer_weights) : list (list binary32) -> list (list binary32) :=
+  match L with
+  | QAttn ln1 ln2 mlp aw => f32_qwen_wrap eps ln1 ln2 mlp (qa_mix_f nh nkv hd rd eps aw invf)
+  | QDelta ln1 ln2 mlp dw => f32_qwen_wrap eps ln1 ln2 mlp (f32_qwen_delta_mix lnh lhd ck eps dw)
+  end.
+
+(** A layer as the forward pass writes it, with the rotary tables. *)
+Definition qn_layer_tab (nh nkv hd rd lnh lhd ck : nat) (eps : binary32)
+    (cosv sinv : list (list binary32)) (L : qwen_layer_weights)
+    : list (list binary32) -> list (list binary32) :=
+  match L with
+  | QAttn ln1 ln2 mlp aw =>
+      f32_qwen_wrap eps ln1 ln2 mlp (f32_qwen_attn_mix nh nkv hd rd eps aw cosv sinv)
+  | QDelta ln1 ln2 mlp dw => f32_qwen_wrap eps ln1 ln2 mlp (f32_qwen_delta_mix lnh lhd ck eps dw)
+  end.
+
+Lemma realized_qn_layer : forall nh nkv hd rd lnh lhd ck eps invf L,
+  (0 < nh)%nat -> (0 < lnh)%nat -> (0 < ck)%nat ->
+  realized (fst (qn_layer nh nkv hd rd lnh lhd ck eps invf L))
+           (snd (qn_layer nh nkv hd rd lnh lhd ck eps invf L))
+           (qn_layer_f nh nkv hd rd lnh lhd ck eps invf L).
+Proof.
+  intros nh nkv hd rd lnh lhd ck eps invf L Hnh Hn Hk.
+  destruct L as [ln1 ln2 mlp aw | ln1 ln2 mlp dw]; cbn [qn_layer qn_layer_f fst snd].
+  - apply realized_lift_l. apply realized_qw_wrap. apply realized_qa_mix. exact Hnh.
+  - apply realized_lift_r. apply realized_qw_wrap. apply realized_qd_mix; assumption.
+Qed.
+
+Lemma qn_layer_f_length : forall nh nkv hd rd lnh lhd ck eps invf L h,
+  (0 < nh)%nat -> (0 < lnh)%nat -> (0 < ck)%nat ->
+  List.length (qn_layer_f nh nkv hd rd lnh lhd ck eps invf L h) = List.length h.
+Proof.
+  intros nh nkv hd rd lnh lhd ck eps invf L h Hnh Hn Hk.
+  exact (realized_length _ _ _ (realized_qn_layer nh nkv hd rd lnh lhd ck eps invf L Hnh Hn Hk) h).
+Qed.
+
+Lemma qwen_stack_fun : forall fs h, f32_qwen_stack fs h = stack_fun fs h.
+Proof.
+  intros fs. induction fs as [|f fs IH]; intros h; [reflexivity|].
+  cbn [f32_qwen_stack stack_fun]. apply IH.
+Qed.
+
+Lemma qn_stack_eq : forall nh nkv hd rd lnh lhd ck eps invf cosv sinv layers h,
+  (0 < nh)%nat -> (0 < nkv)%nat -> Nat.modulo nh nkv = 0%nat ->
+  (0 < lnh)%nat -> (0 < ck)%nat ->
+  (forall t, (t < List.length h)%nat ->
+     List.nth t cosv [] = rope_cos_at invf t /\ List.nth t sinv [] = rope_sin_at invf t) ->
+  f32_qwen_stack (List.map (qn_layer_tab nh nkv hd rd lnh lhd ck eps cosv sinv) layers) h
+  = stack_fun (List.map (qn_layer_f nh nkv hd rd lnh lhd ck eps invf) layers) h.
+Proof.
+  intros nh nkv hd rd lnh lhd ck eps invf cosv sinv layers.
+  induction layers as [|L layers IH]; intros h Hnh Hnkv Hmod Hn Hk Ht; [reflexivity|].
+  cbn [List.map f32_qwen_stack stack_fun].
+  assert (E : qn_layer_tab nh nkv hd rd lnh lhd ck eps cosv sinv L h
+              = qn_layer_f nh nkv hd rd lnh lhd ck eps invf L h).
+  { destruct L as [ln1 ln2 mlp aw | ln1 ln2 mlp dw]; cbn [qn_layer_tab qn_layer_f];
+      [|reflexivity].
+    unfold f32_qwen_wrap. cbv zeta.
+    rewrite (qwen_attn_eq nh nkv hd rd eps aw cosv sinv invf)
+      by (try assumption; intros t Hl; rewrite length_map in Hl; exact (Ht t Hl)).
+    reflexivity. }
+  rewrite E. apply IH; try assumption.
+  intros t Hl. rewrite qn_layer_f_length in Hl by assumption. exact (Ht t Hl).
+Qed.
+
+Definition qn_final (eps : binary32) (m : qwen_model_weights) (h : list binary32)
+    : list binary32 :=
+  let hn := f32_rmsnorm_zc (qw_norm m) eps h in
+  List.map (fun wrow => f32_dot hn wrow) (qw_emb m).
+
+Definition qn_layers (nh nkv hd rd lnh lhd ck : nat) (eps : binary32) (m : qwen_model_weights) :=
+  List.map (qn_layer nh nkv hd rd lnh lhd ck eps (qw_invf m)) (qw_layers m).
+
+(** The Qwen3.5 decode step, and the state it starts from. *)
+Definition qwen_init (nh nkv hd rd lnh lhd ck : nat) (eps : binary32) (m : qwen_model_weights) :=
+  (tt, (List.map fst (qn_layers nh nkv hd rd lnh lhd ck eps m), tt)).
+
+Definition qwen_step (nh nkv hd rd lnh lhd ck : nat) (eps : binary32) (m : qwen_model_weights) :=
+  comp_step (map_step (f32_lookup_embedding (qw_emb m)))
+    (comp_step (stack_step (List.map snd (qn_layers nh nkv hd rd lnh lhd ck eps m)))
+               (map_step (qn_final eps m))).
+
+(** Decoding Qwen3.5 one token at a time, with a key/value cache per head of
+    each attention layer, and the convolution window and a recurrent state per
+    head of each DeltaNet layer, emits exactly the logit rows
+    [f32_qwen_logits_of] computes. *)
+Theorem qwen_decode_correct : forall nh nkv hd rd lnh lhd ck eps m ids,
+  (0 < nh)%nat -> (0 < nkv)%nat -> Nat.modulo nh nkv = 0%nat ->
+  (0 < lnh)%nat -> (0 < ck)%nat ->
+  run (qwen_step nh nkv hd rd lnh lhd ck eps m) (qwen_init nh nkv hd rd lnh lhd ck eps m) ids
+  = f32_qwen_logits_of nh nkv hd rd lnh lhd ck eps m ids.
+Proof.
+  intros nh nkv hd rd lnh lhd ck eps m ids Hnh Hnkv Hmod Hn Hk.
+  pose (STK := stack_fun (List.map (qn_layer_f nh nkv hd rd lnh lhd ck eps (qw_invf m))
+                                   (qw_layers m))).
+  pose (FIN := List.map (qn_final eps m)).
+  assert (R : realized (qwen_init nh nkv hd rd lnh lhd ck eps m)
+                (qwen_step nh nkv hd rd lnh lhd ck eps m)
+                (fun xs => (fun hs => FIN (STK hs))
+                             (List.map (f32_lookup_embedding (qw_emb m)) xs))).
+  { apply (realized_comp tt (map_step (f32_lookup_embedding (qw_emb m)))
+             (List.map (f32_lookup_embedding (qw_emb m))) _ _ (fun hs => FIN (STK hs)));
+      [apply realized_map_step|].
+    apply (realized_comp _ _ STK tt (map_step (qn_final eps m)) FIN);
+      [|apply realized_map_step].
+    unfold STK, qn_layers. apply realized_stack.
+    induction (qw_layers m) as [|L Ls IH]; constructor; [|exact IH].
+    apply realized_qn_layer; assumption. }
+  rewrite (run_realized _ _ _ R ids).
+  unfold FIN, STK, f32_qwen_logits_of, f32_qwen_logits, f32_qwen_forward, f32_qwen_final,
+    f32_embed_tokens.
+  cbv zeta.
+  rewrite <- (qn_stack_eq nh nkv hd rd lnh lhd ck eps (qw_invf m)
+               (f32_rope_cos (qw_invf m) (List.length ids))
+               (f32_rope_sin (qw_invf m) (List.length ids))
+               (qw_layers m) (List.map (f32_lookup_embedding (qw_emb m)) ids)).
+  - rewrite map_map. reflexivity.
+  - exact Hnh.
+  - exact Hnkv.
+  - exact Hmod.
+  - exact Hn.
+  - exact Hk.
+  - intros t Hl. rewrite length_map in Hl. apply rope_tables_at. exact Hl.
+Qed.

@@ -1,15 +1,20 @@
-(* gpt2_talk_native.ml - identical composition to gpt2_talk.ml, but against the
-   native IEEE-754 extraction (phases1_15_native: binary32 = OCaml float, byte =
-   int). Every float value is still produced by the extracted operators; those
-   operators are now the host's hardware float rounded to binary32, the trusted
-   CompCert-style boundary. About 340 times faster on GPT-2.
+(* gpt2_talk_native.ml - GPT-2 through the extracted decode step (native build).
+
+   f32_load_model_pre reads the checkpoint into the weight record, and gpt2_step
+   emits the logits of one position per token from a key/value cache per head
+   and layer. gpt2_decode_correct says that running it over a sequence gives the
+   rows f32_gpt2_logits_pre computes for the whole sequence. What remains native
+   is reading the file and answering the byte fetch the loader reads it through.
 
    usage: gpt2_talk_native <full|next> <path> d n_head n_layer ff vocab n_pos <tok,...>
           gpt2_talk_native dump <path> d n_head n_layer ff vocab n_pos <windows> <outdir> <first> <last>
 
+   full prints the logits of every position, next the ten highest of the last.
    dump reads one comma-separated window per line and, for each line index in
    [first, last), writes <outdir>/<index>.f32: the logits of every position, as
-   little-endian binary32 bit patterns, positions in order. *)
+   little-endian binary32 bit patterns, positions in order. The windows are
+   shared among P2W_DOMAINS domains (default one), which read the one weight
+   record, and a window whose file exists is skipped. *)
 
 open Phases1_15_native
 
@@ -22,21 +27,7 @@ let u64_le b off =
   let r = ref 0 in
   for i = 7 downto 0 do r := (!r * 256) + Char.code (Bytes.get b (off + i)) done; !r
 
-(* verified per-value decode: 4 little-endian bytes -> binary32 (native) *)
-let dec1 b o =
-  f32_bytes_to_binary32
-    [ Char.code (Bytes.get b o); Char.code (Bytes.get b (o + 1));
-      Char.code (Bytes.get b (o + 2)); Char.code (Bytes.get b (o + 3)) ]
-
-let dec_vec b start count = List.init count (fun i -> dec1 b (start + 4 * i))
-let dec_wt b start in_dim out_dim =
-  List.init out_dim (fun o -> List.init in_dim (fun i -> dec1 b (start + 4 * (i * out_dim + o))))
-
 let coqstr s = List.init (String.length s) (fun i -> s.[i])
-let rec ftake n l = if n <= 0 then [] else match l with [] -> [] | x :: r -> x :: ftake (n - 1) r
-let rec fdrop n l = if n <= 0 then l else match l with [] -> [] | _ :: r -> fdrop (n - 1) r
-let rec map3 f a b c =
-  match a, b, c with x :: a', y :: b', z :: c' -> f x y z :: map3 f a' b' c' | _, _, _ -> []
 
 let write_f32 oc (x : float) =
   let bits = Int32.bits_of_float x in
@@ -51,6 +42,28 @@ let read_lines path =
     | exception End_of_file -> close_in ic; List.rev acc in
   go []
 
+let dump_windows rows windows outdir first last =
+  (try Unix.mkdir outdir 0o755 with _ -> ());
+  let last = min last (Array.length windows) in
+  let nd = try max 1 (int_of_string (Sys.getenv "P2W_DOMAINS")) with _ -> 1 in
+  let work k =
+    let w = ref (first + k) in
+    while !w < last do
+      let fin = Printf.sprintf "%s/%d.f32" outdir !w in
+      if not (Sys.file_exists fin) then begin
+        let toks = List.map int_of_string (String.split_on_char ',' windows.(!w)) in
+        let oc = open_out_bin (fin ^ ".tmp") in
+        List.iter (List.iter (write_f32 oc)) (rows toks);
+        close_out oc;
+        Sys.rename (fin ^ ".tmp") fin;
+        Printf.eprintf "window %d done\n%!" !w
+      end;
+      w := !w + nd
+    done in
+  let ds = List.init (nd - 1) (fun k -> Domain.spawn (fun () -> work (k + 1))) in
+  work 0;
+  List.iter Domain.join ds
+
 let () =
   let mode  = Sys.argv.(1) in
   let path  = Sys.argv.(2) in
@@ -59,99 +72,34 @@ let () =
   let nl    = int_of_string Sys.argv.(5) in
   let ff    = int_of_string Sys.argv.(6) in
   let vocab = int_of_string Sys.argv.(7) in
-  let _npos = int_of_string Sys.argv.(8) in
-  let head_dim = d / nh in
+  let npos  = int_of_string Sys.argv.(8) in
   let b = read_file path in
   let hlen = u64_le b 0 in
   let base = 8 + hlen in
   let header = coqstr (Bytes.sub_string b 8 hlen) in
-  let off name =
-    match json_tensor_offsets header (coqstr name) with
-    | s :: _ :: _ -> base + s
-    | _ -> failwith ("offsets not found for " ^ name) in
-  let lin2d wt bias x = List.map (fun row -> f32_vec_add (f32_mat_vec_mul wt row) bias) x in
-  let wte_s = off "wte.weight" in
-  let wpe_s = off "wpe.weight" in
-
-  let forward toks =
-    let seq = List.length toks in
-    let tok_emb = List.map (fun t -> dec_vec b (wte_s + 4 * t * d) d) toks in
-    let pos_emb = List.init seq (fun p -> dec_vec b (wpe_s + 4 * p * d) d) in
-    let hidden = ref (f32_add_matrices tok_emb pos_emb) in
-    for i = 0 to nl - 1 do
-      let p = Printf.sprintf "h.%d." i in
-      let ln1w = dec_vec b (off (p ^ "ln_1.weight")) d in
-      let ln1b = dec_vec b (off (p ^ "ln_1.bias")) d in
-      let ln2w = dec_vec b (off (p ^ "ln_2.weight")) d in
-      let ln2b = dec_vec b (off (p ^ "ln_2.bias")) d in
-      let caw = dec_wt  b (off (p ^ "attn.c_attn.weight")) d (3 * d) in
-      let cab = dec_vec b (off (p ^ "attn.c_attn.bias")) (3 * d) in
-      let cpw = dec_wt  b (off (p ^ "attn.c_proj.weight")) d d in
-      let cpb = dec_vec b (off (p ^ "attn.c_proj.bias")) d in
-      let fcw = dec_wt  b (off (p ^ "mlp.c_fc.weight")) d ff in
-      let fcb = dec_vec b (off (p ^ "mlp.c_fc.bias")) ff in
-      let mpw = dec_wt  b (off (p ^ "mlp.c_proj.weight")) ff d in
-      let mpb = dec_vec b (off (p ^ "mlp.c_proj.bias")) d in
-      let ln1 = f32_layer_norm_2d ln1w ln1b f32_ln_eps !hidden in
-      let qkv = lin2d caw cab ln1 in
-      let qs = List.map (fun row -> ftake d row) qkv in
-      let ks = List.map (fun row -> ftake d (fdrop d row)) qkv in
-      let vs = List.map (fun row -> fdrop (2 * d) row) qkv in
-      let qh = f32_split_into_heads nh qs in
-      let kh = f32_split_into_heads nh ks in
-      let vh = f32_split_into_heads nh vs in
-      let heads = map3 (fun q k v -> f32_causal_attention q k v head_dim) qh kh vh in
-      let attn = lin2d cpw cpb (f32_concat_heads heads) in
-      let hidden2 = f32_add_matrices !hidden attn in
-      let ln2 = f32_layer_norm_2d ln2w ln2b f32_ln_eps hidden2 in
-      let h = lin2d fcw fcb ln2 in
-      let hg = List.map f32_gelu_vec h in
-      let mlp = lin2d mpw mpb hg in
-      hidden := f32_add_matrices hidden2 mlp;
-      Printf.eprintf "block %d/%d done\n%!" (i + 1) nl
-    done;
-    let lnfw = dec_vec b (off "ln_f.weight") d in
-    let lnfb = dec_vec b (off "ln_f.bias") d in
-    f32_layer_norm_2d lnfw lnfb f32_ln_eps !hidden in
-  let logits_for_row hrow =
-    Array.init vocab (fun j -> f32_dot hrow (dec_vec b (wte_s + 4 * j * d) d)) in
+  let rd o = Char.code (Bytes.get b (base + o)) in
+  let cfg = { gpt2_inf_n_embd = d; gpt2_inf_n_head = nh; gpt2_inf_n_layer = nl;
+              gpt2_inf_n_inner = ff; gpt2_inf_vocab_size = vocab;
+              gpt2_inf_n_positions = npos } in
+  Printf.eprintf "decoding weights...\n%!";
+  let model = f32_load_model_pre header rd cfg in
+  Printf.eprintf "weights ready.\n%!";
+  let rows ids = run (gpt2_step cfg f32_ln_eps model) (gpt2_init cfg f32_ln_eps model) ids in
 
   match mode with
   | "dump" ->
       let windows = Array.of_list (read_lines Sys.argv.(9)) in
-      let outdir = Sys.argv.(10) in
-      let first = int_of_string Sys.argv.(11) and last = int_of_string Sys.argv.(12) in
-      for w = first to min last (Array.length windows) - 1 do
-        let toks = List.map int_of_string (String.split_on_char ',' windows.(w)) in
-        let final = Array.of_list (forward toks) in
-        (* Each wte row is decoded once and projected onto every position. *)
-        let logits = Array.map (fun _ -> Array.make vocab 0.0) final in
-        for j = 0 to vocab - 1 do
-          let e = dec_vec b (wte_s + 4 * j * d) d in
-          Array.iteri (fun p hrow -> logits.(p).(j) <- f32_dot hrow e) final
-        done;
-        let tmp = Printf.sprintf "%s/%d.f32.tmp" outdir w in
-        let oc = open_out_bin tmp in
-        Array.iter (Array.iter (write_f32 oc)) logits;
-        close_out oc;
-        Sys.rename tmp (Printf.sprintf "%s/%d.f32" outdir w);
-        Printf.eprintf "window %d done\n%!" w
-      done
+      dump_windows rows windows Sys.argv.(10)
+        (int_of_string Sys.argv.(11)) (int_of_string Sys.argv.(12))
+  | "full" ->
+      let toks = List.map int_of_string (String.split_on_char ',' Sys.argv.(9)) in
+      List.iter (fun row ->
+        print_string (String.concat " " (List.map (Printf.sprintf "%.9g") row));
+        print_newline ()) (rows toks)
   | _ ->
-    let toks = List.map int_of_string (String.split_on_char ',' Sys.argv.(9)) in
-    let seq = List.length toks in
-    let final = forward toks in
-    match mode with
-    | "full" ->
-        List.iter (fun hrow ->
-          let a = logits_for_row hrow in
-          print_string (String.concat " " (Array.to_list (Array.map (Printf.sprintf "%.9g") a)));
-          print_newline ()) final
-    | _ ->
-        let last = List.nth final (seq - 1) in
-        Printf.eprintf "projecting %d logits...\n%!" vocab;
-        let a = logits_for_row last in
-        let idx = Array.init vocab (fun i -> i) in
-        Array.sort (fun i j -> compare a.(j) a.(i)) idx;
-        Printf.printf "top-10 next-token logits:\n";
-        for r = 0 to 9 do let i = idx.(r) in Printf.printf "  %6d  %.9g\n" i a.(i) done
+      let toks = List.map int_of_string (String.split_on_char ',' Sys.argv.(9)) in
+      let a = Array.of_list (List.nth (rows toks) (List.length toks - 1)) in
+      let idx = Array.init (Array.length a) (fun i -> i) in
+      Array.sort (fun i j -> compare a.(j) a.(i)) idx;
+      Printf.printf "top-10 next-token logits:\n";
+      for r = 0 to 9 do let i = idx.(r) in Printf.printf "  %6d  %.9g\n" i a.(i) done
